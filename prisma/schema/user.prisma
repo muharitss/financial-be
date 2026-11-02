@@ -29,6 +29,7 @@ model User {
   transaction_audits TransactionAudit[]
   idempotency_keys   IdempotencyKey[]
   budgets            Budget[]
+  savings_goals      SavingsGoal[]
 
   @@index([status])
   @@index([email])

@@ -28,6 +28,7 @@ model Account {
   updated_at           DateTime         @updatedAt @db.Timestamptz
   transactions_out     Transaction[]    @relation("FromAccount")
   transactions_in      Transaction[]    @relation("ToAccount")
+  savings_allocations  SavingsAllocation[]
 
   @@unique([financial_profile_id, name])
   @@index([user_id])

@@ -11,6 +11,7 @@ model FinancialProfile {
   tags         Tag[]
   transactions Transaction[]
   budgets      Budget[]
+  savings_goals SavingsGoal[]
 
   @@unique([user_id, name])
   @@index([user_id])

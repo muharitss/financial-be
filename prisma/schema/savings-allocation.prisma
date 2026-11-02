@@ -1,0 +1,21 @@
+enum SavingsAllocationStatus {
+  ACTIVE
+  RELEASED
+}
+
+model SavingsAllocation {
+  id              String                  @id @default(uuid()) @db.Uuid
+  savings_goal_id String                  @db.Uuid
+  savings_goal    SavingsGoal             @relation(fields: [savings_goal_id], references: [id], onDelete: Cascade)
+  account_id      String                  @db.Uuid
+  account         Account                 @relation(fields: [account_id], references: [id], onDelete: Restrict)
+  amount          BigInt
+  status          SavingsAllocationStatus @default(ACTIVE)
+  allocated_at    DateTime                @default(now()) @db.Timestamptz
+  released_at     DateTime?               @db.Timestamptz
+  release_reason  String?
+
+  @@index([savings_goal_id, status])
+  @@index([account_id, status])
+  @@map("savings_allocations")
+}
