@@ -1,0 +1,11 @@
+model TransactionSplit {
+  id             String      @id @default(uuid()) @db.Uuid
+  transaction_id String      @db.Uuid
+  transaction    Transaction @relation(fields: [transaction_id], references: [id], onDelete: Cascade)
+  category_id    String      @db.Uuid
+  category       Category    @relation(fields: [category_id], references: [id], onDelete: Restrict)
+  amount         BigInt
+
+  @@index([transaction_id])
+  @@map("transaction_splits")
+}

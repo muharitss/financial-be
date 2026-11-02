@@ -1,0 +1,18 @@
+model FinancialProfile {
+  id         String   @id @default(uuid()) @db.Uuid
+  user_id    String   @db.Uuid
+  user       User     @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  name       String   @default("Pribadi")
+  is_default Boolean  @default(true)
+  created_at DateTime  @default(now()) @db.Timestamptz
+  updated_at DateTime  @updatedAt @db.Timestamptz
+  accounts     Account[]
+  categories   Category[]
+  tags         Tag[]
+  transactions Transaction[]
+  budgets      Budget[]
+
+  @@unique([user_id, name])
+  @@index([user_id])
+  @@map("financial_profiles")
+}

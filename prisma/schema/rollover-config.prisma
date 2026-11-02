@@ -1,0 +1,12 @@
+model RolloverConfig {
+  id                      String         @id @default(uuid()) @db.Uuid
+  budget_category_id      String         @unique @db.Uuid
+  budget_category         BudgetCategory @relation(fields: [budget_category_id], references: [id], onDelete: Cascade)
+  enabled                 Boolean        @default(false)
+  last_computed_carryover BigInt         @default(0)
+  last_computed_at        DateTime?      @db.Timestamptz
+  created_at              DateTime       @default(now()) @db.Timestamptz
+  updated_at              DateTime       @updatedAt @db.Timestamptz
+
+  @@map("rollover_configs")
+}

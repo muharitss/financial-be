@@ -1,0 +1,33 @@
+enum CategoryType {
+  INCOME
+  EXPENSE
+}
+
+model Category {
+  id                   String           @id @default(uuid()) @db.Uuid
+  financial_profile_id String           @db.Uuid
+  profile              FinancialProfile @relation(fields: [financial_profile_id], references: [id], onDelete: Cascade)
+  user_id              String           @db.Uuid
+  user                 User             @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  type                 CategoryType
+  parent_id            String?          @db.Uuid
+  parent               Category?        @relation("Subcategories", fields: [parent_id], references: [id], onDelete: Restrict)
+  children             Category[]       @relation("Subcategories")
+  name                 String
+  icon                 String?
+  color                String?
+  is_system            Boolean          @default(false)
+  archived             Boolean          @default(false)
+  archived_at          DateTime?        @db.Timestamptz
+  created_at           DateTime         @default(now()) @db.Timestamptz
+  updated_at           DateTime         @updatedAt @db.Timestamptz
+  transactions         Transaction[]
+  splits               TransactionSplit[]
+  budgets              Budget[]
+  budget_categories    BudgetCategory[]
+
+  @@unique([financial_profile_id, parent_id, name])
+  @@index([financial_profile_id, type, archived])
+  @@index([user_id])
+  @@map("categories")
+}

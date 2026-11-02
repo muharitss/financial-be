@@ -1,0 +1,36 @@
+enum Role {
+  USER
+  SUPERADMIN
+}
+
+enum UserStatus {
+  ACTIVE
+  PENDING_DELETION
+}
+
+model User {
+  id                 String             @id @default(uuid()) @db.Uuid
+  email              String             @unique
+  password_hash      String
+  name               String
+  picture_url        String?
+  role               Role               @default(USER)
+  status             UserStatus         @default(ACTIVE)
+  created_at         DateTime           @default(now()) @db.Timestamptz
+  updated_at         DateTime           @updatedAt @db.Timestamptz
+  deleted_at         DateTime?          @db.Timestamptz
+  financial_profiles FinancialProfile[]
+  preferences        UserPreference?
+  refresh_tokens     RefreshToken[]
+  accounts           Account[]
+  categories         Category[]
+  tags               Tag[]
+  transactions       Transaction[]
+  transaction_audits TransactionAudit[]
+  idempotency_keys   IdempotencyKey[]
+  budgets            Budget[]
+
+  @@index([status])
+  @@index([email])
+  @@map("users")
+}

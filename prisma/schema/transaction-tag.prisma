@@ -1,0 +1,10 @@
+model TransactionTag {
+  transaction_id String      @db.Uuid
+  transaction    Transaction @relation(fields: [transaction_id], references: [id], onDelete: Cascade)
+  tag_id         String      @db.Uuid
+  tag            Tag         @relation(fields: [tag_id], references: [id], onDelete: Restrict)
+
+  @@id([transaction_id, tag_id])
+  @@index([tag_id])
+  @@map("transaction_tags")
+}

@@ -1,0 +1,15 @@
+model IdempotencyKey {
+  id              String   @id @default(uuid()) @db.Uuid
+  user_id         String   @db.Uuid
+  user            User     @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  client_tx_id    String   @db.VarChar(64)
+  request_hash    String
+  response_status Int
+  response_body   Json
+  created_at      DateTime @default(now()) @db.Timestamptz
+  ttl_expires_at  DateTime @db.Timestamptz
+
+  @@unique([user_id, client_tx_id])
+  @@index([ttl_expires_at])
+  @@map("idempotency_keys")
+}
