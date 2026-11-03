@@ -10,6 +10,7 @@ import {
   HttpStatus,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse } from '@nestjs/swagger';
+import { SkipThrottle, Throttle } from '@nestjs/throttler';
 import type { Request, Response } from 'express';
 import { AuthService } from './auth.service.js';
 import { registerSchema, loginSchema } from './dto/auth.dto.js';
@@ -31,6 +32,8 @@ function extractRefreshToken(req: Request): string | undefined {
   );
 }
 
+@SkipThrottle()
+@Throttle({ auth: { limit: 10, ttl: 60000 } })
 @ApiTags('auth')
 @Controller('auth')
 export class AuthController {

@@ -1,14 +1,23 @@
-import { Module } from '@nestjs/common';
+import { Module, NestModule, MiddlewareConsumer } from '@nestjs/common';
+import { APP_FILTER, APP_GUARD } from '@nestjs/core';
 import { PassportModule } from '@nestjs/passport';
 import { createObserveModule } from '@nestjs/observe';
+import { ThrottlerModule } from '@nestjs/throttler';
 import { PrismaModule } from './prisma/prisma.module.js';
 import { HealthModule } from './modules/health/health.module.js';
 import { AuthModule } from './modules/auth/auth.module.js';
+import { LoggerModule } from './common/logger/logger.module.js';
+import { TraceMiddleware } from './common/logger/trace.middleware.js';
+import { throttlerConfig } from './common/throttler/throttler.config.js';
+import { ThrottlerGuard } from './common/throttler/throttler.guard.js';
+import { AllExceptionsFilter } from './common/filters/all-exceptions.filter.js';
 
 export const { ObserveModule, ObserveInstrument } = createObserveModule();
 
 @Module({
   imports: [
+    LoggerModule,
+    ThrottlerModule.forRoot(throttlerConfig),
     PrismaModule,
     PassportModule.register({ defaultStrategy: 'jwt' }),
     AuthModule,
@@ -20,6 +29,19 @@ export const { ObserveModule, ObserveInstrument } = createObserveModule();
     }),
   ],
   controllers: [],
-  providers: [],
+  providers: [
+    {
+      provide: APP_GUARD,
+      useClass: ThrottlerGuard,
+    },
+    {
+      provide: APP_FILTER,
+      useClass: AllExceptionsFilter,
+    },
+  ],
 })
-export class AppModule {}
+export class AppModule implements NestModule {
+  configure(consumer: MiddlewareConsumer) {
+    consumer.apply(TraceMiddleware).forRoutes('*');
+  }
+}

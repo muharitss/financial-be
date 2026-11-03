@@ -3,70 +3,22 @@ import {
   UnauthorizedException,
   ConflictException,
   ForbiddenException,
-  HttpException,
-  HttpStatus,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import * as argon2 from '@node-rs/argon2';
 import { randomBytes, createHash } from 'node:crypto';
+import { LoginCooldownTracker } from '../../common/throttler/throttler.config.js';
 import { PrismaService } from '../../prisma/prisma.service.js';
 import type { RegisterDto, LoginDto } from './dto/auth.dto.js';
 
-interface CooldownEntry {
-  failures: number;
-  firstAttempt: number;
-  lockedUntil?: number;
-}
-
 @Injectable()
 export class AuthService {
-  // In-memory brute force tracker for failed login attempts
-  private readonly loginAttempts = new Map<string, CooldownEntry>();
+  private readonly cooldown = new LoginCooldownTracker();
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly jwtService: JwtService,
   ) {}
-
-  private checkCooldown(key: string): void {
-    const record = this.loginAttempts.get(key);
-    if (!record) return;
-
-    const now = Date.now();
-    if (record.lockedUntil && now < record.lockedUntil) {
-      const waitSeconds = Math.ceil((record.lockedUntil - now) / 1000);
-      throw new HttpException(
-        {
-          code: 'LOGIN_COOLDOWN',
-          message: `Terlalu banyak percobaan login gagal. Coba lagi dalam ${waitSeconds} detik.`,
-        },
-        HttpStatus.TOO_MANY_REQUESTS,
-      );
-    }
-
-    if (now - record.firstAttempt > 15 * 60 * 1000) {
-      this.loginAttempts.delete(key);
-    }
-  }
-
-  private recordLoginFailure(key: string): void {
-    const now = Date.now();
-    const record = this.loginAttempts.get(key);
-
-    if (!record || now - record.firstAttempt > 15 * 60 * 1000) {
-      this.loginAttempts.set(key, { failures: 1, firstAttempt: now });
-      return;
-    }
-
-    record.failures += 1;
-    if (record.failures >= 5) {
-      record.lockedUntil = now + 15 * 60 * 1000;
-    }
-  }
-
-  private clearLoginAttempts(key: string): void {
-    this.loginAttempts.delete(key);
-  }
 
   async register(dto: RegisterDto) {
     const existing = await this.prisma.user.findUnique({
@@ -124,14 +76,14 @@ export class AuthService {
 
   async login(dto: LoginDto, clientIp: string) {
     const rateLimitKey = `${clientIp}:${dto.email}`;
-    this.checkCooldown(rateLimitKey);
+    this.cooldown.check(rateLimitKey);
 
     const user = await this.prisma.user.findUnique({
       where: { email: dto.email },
     });
 
     if (!user) {
-      this.recordLoginFailure(rateLimitKey);
+      this.cooldown.recordFailure(rateLimitKey);
       throw new UnauthorizedException({
         code: 'INVALID_CREDENTIALS',
         message: 'Email atau password salah',
@@ -140,7 +92,7 @@ export class AuthService {
 
     const isMatch = await argon2.verify(user.password_hash, dto.password);
     if (!isMatch) {
-      this.recordLoginFailure(rateLimitKey);
+      this.cooldown.recordFailure(rateLimitKey);
       throw new UnauthorizedException({
         code: 'INVALID_CREDENTIALS',
         message: 'Email atau password salah',
@@ -154,7 +106,7 @@ export class AuthService {
       });
     }
 
-    this.clearLoginAttempts(rateLimitKey);
+    this.cooldown.clear(rateLimitKey);
     this.onLoginPostProcess(user.id);
 
     const tokens = await this.issueTokens(user.id, user.role);
