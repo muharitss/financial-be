@@ -1,7 +1,7 @@
 import { jest, describe, it, expect, beforeEach } from '@jest/globals';
 import { Test, TestingModule } from '@nestjs/testing';
 import { JwtService } from '@nestjs/jwt';
-import { UnauthorizedException, ConflictException, HttpException } from '@nestjs/common';
+import { UnauthorizedException, ConflictException, HttpException, ForbiddenException } from '@nestjs/common';
 import * as argon2 from '@node-rs/argon2';
 import { AuthService } from './auth.service.js';
 import { PrismaService } from '../../prisma/prisma.service.js';
@@ -164,9 +164,37 @@ describe('AuthService (Manual Auth)', () => {
         ),
       ).rejects.toThrow(HttpException);
     });
+
+    it('menolak login dengan 403 ACCOUNT_PENDING_DELETION jika user berstatus PENDING_DELETION', async () => {
+      const passwordHash = await argon2.hash('passwordBenar');
+      prisma.user.findUnique.mockResolvedValue({
+        id: 'user-uuid-1',
+        email: 'budi@example.com',
+        password_hash: passwordHash,
+        role: 'USER',
+        status: 'PENDING_DELETION',
+      });
+
+      await expect(
+        service.login(
+          { email: 'budi@example.com', password: 'passwordBenar' },
+          '127.0.0.1',
+        ),
+      ).rejects.toThrow(ForbiddenException);
+    });
   });
 
   describe('refresh', () => {
+    it('menolak refresh jika token CSRF tidak cocok atau tidak ada', async () => {
+      await expect(
+        service.refresh('rawToken', 'cookieToken', 'mismatchedToken'),
+      ).rejects.toThrow(ForbiddenException);
+
+      await expect(
+        service.refresh('rawToken', undefined, 'headerToken'),
+      ).rejects.toThrow(ForbiddenException);
+    });
+
     it('mendeteksi token reuse dan mencabut semua token user', async () => {
       prisma.refreshToken.findUnique.mockResolvedValue({
         id: 'rt-old',
@@ -182,6 +210,34 @@ describe('AuthService (Manual Auth)', () => {
       expect(prisma.refreshToken.updateMany).toHaveBeenCalledWith({
         where: { user_id: 'user-uuid-1' },
         data: expect.objectContaining({ revoked_at: expect.any(Date) }),
+      });
+    });
+
+    it('berhasil merotasi refresh token dan session token jika valid', async () => {
+      prisma.refreshToken.findUnique.mockResolvedValue({
+        id: 'rt-old',
+        user_id: 'user-uuid-1',
+        revoked_at: null,
+        expires_at: new Date(Date.now() + 100000),
+      });
+      prisma.user.findUnique.mockResolvedValue({
+        id: 'user-uuid-1',
+        role: 'USER',
+        status: 'ACTIVE',
+      });
+
+      const result = await service.refresh('validRawToken', 'csrf123', 'csrf123');
+
+      expect(result.sessionToken).toBe('mock-jwt-token');
+      expect(result.refreshToken).toBeDefined();
+      expect(result.csrfToken).toBeDefined();
+      expect(prisma.refreshToken.create).toHaveBeenCalled();
+      expect(prisma.refreshToken.update).toHaveBeenCalledWith({
+        where: { id: 'rt-old' },
+        data: expect.objectContaining({
+          revoked_at: expect.any(Date),
+          replaced_by_id: 'rt-1',
+        }),
       });
     });
   });

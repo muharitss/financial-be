@@ -10,6 +10,7 @@ import { LoggerModule } from './common/logger/logger.module.js';
 import { TraceMiddleware } from './common/logger/trace.middleware.js';
 import { throttlerConfig } from './common/throttler/throttler.config.js';
 import { ThrottlerGuard } from './common/throttler/throttler.guard.js';
+import { CsrfOriginGuard } from './common/guards/csrf-origin.guard.js';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter.js';
 
 export const { ObserveModule, ObserveInstrument } = createObserveModule();
@@ -33,6 +34,10 @@ export const { ObserveModule, ObserveInstrument } = createObserveModule();
     {
       provide: APP_GUARD,
       useClass: ThrottlerGuard,
+    },
+    {
+      provide: APP_GUARD,
+      useClass: CsrfOriginGuard,
     },
     {
       provide: APP_FILTER,
