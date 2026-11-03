@@ -19,7 +19,9 @@
     "start:prod": "node dist/main",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
+    "prisma:seed": "node prisma/seed.ts",
     "prisma:studio": "prisma studio",
+    "db:reset": "node -e \"if (process.env.NODE_ENV === 'production') { console.error('Cannot reset DB in production'); process.exit(1); }\" && prisma migrate reset --force",
     "lint": "oxlint --type-aware src/ test/",
     "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js --passWithNoTests",
     "test:watch": "node --experimental-vm-modules node_modules/jest/bin/jest.js --watch",
@@ -69,5 +71,9 @@
     "supertest": "^7.0.0",
     "ts-jest": "^29.4.15",
     "typescript": "^6.0.2"
+  },
+  "prisma": {
+    "schema": "prisma/schema",
+    "seed": "node prisma/seed.ts"
   }
 }

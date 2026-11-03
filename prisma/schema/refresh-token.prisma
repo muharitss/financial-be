@@ -1,0 +1,14 @@
+model RefreshToken {
+  id             String    @id @default(uuid()) @db.Uuid
+  user_id        String    @db.Uuid
+  user           User      @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  token_hash     String    @unique
+  expires_at     DateTime  @db.Timestamptz
+  revoked_at     DateTime? @db.Timestamptz
+  replaced_by_id String?   @db.Uuid
+  created_at     DateTime  @default(now()) @db.Timestamptz
+
+  @@index([user_id, revoked_at])
+  @@index([expires_at])
+  @@map("refresh_tokens")
+}
