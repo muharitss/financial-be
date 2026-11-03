@@ -1,0 +1,27 @@
+enum NotificationType {
+  BUDGET_WARNING_80
+  BUDGET_WARNING_100
+  SCHEDULED_REMINDER
+  SYNC_FAILED
+  SAVINGS_ACHIEVED
+  WEEKLY_SUMMARY
+  MONTHLY_SUMMARY
+  SECURITY_ALERT
+}
+
+model Notification {
+  id            String           @id @default(uuid()) @db.Uuid
+  user_id       String           @db.Uuid
+  user          User             @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  type          NotificationType
+  title         String
+  body          String
+  data          Json?
+  read_at       DateTime?        @db.Timestamptz
+  delivered_at  DateTime?        @db.Timestamptz
+  created_at    DateTime         @default(now()) @db.Timestamptz
+
+  @@index([user_id, created_at])
+  @@index([user_id, read_at])
+  @@map("notifications")
+}

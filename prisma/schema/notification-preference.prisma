@@ -1,0 +1,19 @@
+model NotificationPreference {
+  id                    String   @id @default(uuid()) @db.Uuid
+  user_id               String   @unique @db.Uuid
+  user                  User     @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  budget_warning_80     Boolean  @default(true)
+  budget_warning_100    Boolean  @default(true)
+  scheduled_reminder    Boolean  @default(true)
+  sync_failed           Boolean  @default(true)
+  savings_achieved      Boolean  @default(true)
+  weekly_summary        Boolean  @default(false)
+  monthly_summary       Boolean  @default(true)
+  quiet_hours_start     String   @default("22:00")
+  quiet_hours_end       String   @default("07:00")
+  quiet_hours_enabled   Boolean  @default(true)
+  created_at            DateTime @default(now()) @db.Timestamptz
+  updated_at            DateTime @updatedAt @db.Timestamptz
+
+  @@map("notification_preferences")
+}
