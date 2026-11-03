@@ -1,0 +1,18 @@
+model AuditLog {
+  id            String   @id @default(uuid()) @db.Uuid
+  actor_user_id String?
+  actor_role    String?
+  action        String
+  resource_type String
+  resource_id   String?
+  before        Json?
+  after         Json?
+  ip_address    String?
+  user_agent    String?
+  created_at    DateTime @default(now()) @db.Timestamptz
+
+  @@index([actor_user_id, created_at])
+  @@index([resource_type, resource_id])
+  @@index([created_at])
+  @@map("audit_logs")
+}

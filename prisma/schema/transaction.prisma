@@ -52,6 +52,7 @@ model Transaction {
   splits                TransactionSplit[]
   tags                  TransactionTag[]
   audits                TransactionAudit[]
+  attachments           FileAttachment[]
 
   @@unique([user_id, client_tx_id])
   @@index([user_id, date, created_at])

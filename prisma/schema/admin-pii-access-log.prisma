@@ -1,0 +1,17 @@
+model AdminPiiAccessLog {
+  id             String    @id @default(uuid()) @db.Uuid
+  admin_user_id  String    @db.Uuid
+  target_user_id String    @db.Uuid
+  reason         String
+  approved_by    String
+  scope          String
+  granted_at     DateTime  @db.Timestamptz
+  expires_at     DateTime  @db.Timestamptz
+  revoked_at     DateTime? @db.Timestamptz
+  created_at     DateTime  @default(now()) @db.Timestamptz
+
+  @@index([admin_user_id, created_at])
+  @@index([target_user_id, created_at])
+  @@index([expires_at])
+  @@map("admin_pii_access_logs")
+}
