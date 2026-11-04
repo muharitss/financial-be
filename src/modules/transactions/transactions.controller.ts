@@ -30,7 +30,7 @@ export class TransactionsController {
   @Post()
   @HttpCode(HttpStatus.CREATED)
   @Throttle({ transaction: { limit: 60, ttl: 60000 } })
-  @ApiOperation({ summary: 'Membuat transaksi baru (INCOME, EXPENSE, TRANSFER)' })
+  @ApiOperation({ summary: 'Membuat transaksi baru (INCOME, EXPENSE, TRANSFER, ADJUSTMENT)' })
   @ApiResponse({ status: 201, description: 'Transaksi berhasil dibuat' })
   @ApiResponse({ status: 400, description: 'Data tidak valid atau kategori salah tipe' })
   @ApiResponse({ status: 401, description: 'Sesi tidak valid' })

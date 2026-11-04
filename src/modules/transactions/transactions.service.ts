@@ -15,6 +15,7 @@ import {
   type CreateIncomeDto,
   type CreateExpenseDto,
   type CreateTransferDto,
+  type CreateAdjustmentDto,
 } from './dto/transaction.dto.js';
 
 export interface TransactionResponse {
@@ -147,6 +148,9 @@ export class TransactionsService {
     }
     if (dto.type === 'TRANSFER') {
       return this.createTransfer(user, dto, headerIdempotencyKey);
+    }
+    if (dto.type === 'ADJUSTMENT') {
+      return this.createAdjustment(user, dto, undefined, headerIdempotencyKey);
     }
 
     throw new BadRequestException({
@@ -800,6 +804,156 @@ export class TransactionsService {
 
         return response;
       });
+    } catch (error: any) {
+      if (
+        error instanceof Prisma.PrismaClientKnownRequestError &&
+        error.code === 'P2002'
+      ) {
+        throw new ConflictException({
+          code: 'CLIENT_TX_ID_DUPLICATE',
+          message: 'client_tx_id sudah pernah digunakan',
+        });
+      }
+      throw error;
+    }
+  }
+
+  async createAdjustment(
+    user: { userId: string; role?: string },
+    dto: CreateAdjustmentDto,
+    existingTx?: Prisma.TransactionClient,
+    headerIdempotencyKey?: string,
+  ): Promise<TransactionResponse> {
+    if (dto.reason.trim().length < 10) {
+      throw new UnprocessableEntityException({
+        code: 'REASON_TOO_SHORT',
+        message: 'Alasan penyesuaian minimal 10 karakter',
+      });
+    }
+
+    if (dto.amount === 0) {
+      throw new UnprocessableEntityException({
+        code: 'VALIDATION_ERROR',
+        message: 'Nominal penyesuaian tidak boleh 0',
+      });
+    }
+
+    const clientTxId = resolveClientTxId(dto.client_tx_id, headerIdempotencyKey);
+
+    const client = existingTx ?? this.prisma;
+    const pref = await client.userPreference.findFirst({
+      where: { user_id: user.userId },
+    });
+    const tz = pref?.timezone ?? 'Asia/Jakarta';
+    const today = todayInTz(tz);
+
+    if (dto.date > today) {
+      throw new UnprocessableEntityException({
+        code: 'VALIDATION_ERROR',
+        message: 'Tanggal penyesuaian tidak boleh di masa depan',
+      });
+    }
+
+    const executeInTx = async (tx: Prisma.TransactionClient): Promise<TransactionResponse> => {
+      // 1. Kunci baris akun dengan SELECT ... FOR UPDATE (user_id wajib)
+      const accounts = await tx.$queryRaw<
+        Array<{
+          id: string;
+          financial_profile_id: string;
+          balance: bigint;
+          allow_negative: boolean;
+          archived: boolean;
+        }>
+      >`SELECT id, financial_profile_id, balance, allow_negative, archived FROM accounts WHERE id = ${dto.account_id}::uuid AND user_id = ${user.userId}::uuid FOR UPDATE`;
+
+      const account = accounts[0];
+      if (!account) {
+        throw new NotFoundException({
+          code: 'ACCOUNT_NOT_FOUND',
+          message: 'Akun tidak ditemukan',
+        });
+      }
+
+      if (account.archived) {
+        throw new ConflictException({
+          code: 'ACCOUNT_ARCHIVED',
+          message: 'Akun telah diarsipkan',
+        });
+      }
+
+      // 2. Hitung newBalance = account.balance + BigInt(dto.amount)
+      const newBalance = account.balance + BigInt(dto.amount);
+
+      // 3. Cek saldo negatif
+      const reserved = await getAccountReserved(tx, account.id);
+      const available = account.balance - reserved;
+
+      if (newBalance < 0n && !account.allow_negative) {
+        throw new ConflictException({
+          code: 'INSUFFICIENT_BALANCE',
+          message:
+            'Penyesuaian membuat saldo negatif pada akun yang tidak mengizinkannya',
+          details: {
+            available: Number(available),
+            needed: Math.abs(dto.amount),
+            account_id: account.id,
+          },
+        });
+      }
+
+      // 4. Simpan Transaction
+      const created = await tx.transaction.create({
+        data: {
+          user_id: user.userId,
+          financial_profile_id: account.financial_profile_id,
+          account_id: account.id,
+          type: 'ADJUSTMENT',
+          status: 'POSTED',
+          category_id: null,
+          amount: BigInt(dto.amount),
+          date: new Date(`${dto.date}T00:00:00.000Z`),
+          reason: dto.reason.trim(),
+          note: dto.note ?? null,
+          client_tx_id: clientTxId,
+        },
+      });
+
+      // 5. Update account.balance = newBalance
+      await tx.account.update({
+        where: { id: account.id, user_id: user.userId },
+        data: { balance: newBalance },
+      });
+
+      let warning: string | undefined;
+      if (newBalance < 0n) {
+        warning = 'NEGATIVE_BALANCE';
+      }
+
+      // 6. Simpan TransactionAudit
+      const response = toTransactionResponse(created, warning);
+
+      await tx.transactionAudit.create({
+        data: {
+          transaction_id: created.id,
+          action: 'CREATE',
+          reason: dto.reason.trim(),
+          before: { account_balance: Number(account.balance) },
+          after: {
+            ...response,
+            account_balance: Number(newBalance),
+          },
+          actor_user_id: user.userId,
+        },
+      });
+
+      return response;
+    };
+
+    try {
+      if (existingTx) {
+        return await executeInTx(existingTx);
+      }
+      return await this.prisma.$transaction(async (tx) => executeInTx(tx));
     } catch (error: any) {
       if (
         error instanceof Prisma.PrismaClientKnownRequestError &&

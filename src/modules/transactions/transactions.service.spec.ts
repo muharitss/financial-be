@@ -1053,4 +1053,334 @@ describe('TransactionsService', () => {
       });
     });
   });
+
+  describe('createAdjustment', () => {
+    it('AC-1 & AC-2: berhasil membuat adjustment, saldo berkurang, audit log before/after tercatat', async () => {
+      const mockAcc = {
+        id: mockAccount.id,
+        financial_profile_id: mockAccount.financial_profile_id,
+        balance: 1000000n,
+        allow_negative: false,
+        archived: false,
+      };
+      prisma.$queryRaw.mockResolvedValue([mockAcc]);
+      prisma.savingsAllocation.groupBy.mockResolvedValue([]);
+      prisma.transaction.create.mockImplementation((args: any) => ({
+        id: 'tx-adj-1',
+        ...args.data,
+        created_at: new Date(),
+        updated_at: new Date(),
+      }));
+
+      const dto = {
+        type: 'ADJUSTMENT' as const,
+        account_id: mockAcc.id,
+        amount: -50000,
+        date: '2026-11-01',
+        reason: 'Selisih hitung kas dompet',
+        client_tx_id: validUlid,
+      };
+
+      const result = await service.create(user, dto);
+
+      expect(result.amount).toBe(-50000);
+      expect(result.status).toBe('POSTED');
+      expect(result.category_id).toBeNull();
+      expect(result.reason).toBe('Selisih hitung kas dompet');
+      expect(prisma.account.update).toHaveBeenCalledWith({
+        where: { id: mockAcc.id, user_id: user.userId },
+        data: { balance: 950000n },
+      });
+      expect(prisma.transactionAudit.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          transaction_id: 'tx-adj-1',
+          action: 'CREATE',
+          reason: 'Selisih hitung kas dompet',
+          before: { account_balance: 1000000 },
+          after: expect.objectContaining({
+            account_balance: 950000,
+            amount: -50000,
+          }),
+          actor_user_id: user.userId,
+        }),
+      });
+    });
+
+    it('berhasil membuat adjustment positif yang menambah saldo', async () => {
+      const mockAcc = {
+        id: mockAccount.id,
+        financial_profile_id: mockAccount.financial_profile_id,
+        balance: 1000000n,
+        allow_negative: false,
+        archived: false,
+      };
+      prisma.$queryRaw.mockResolvedValue([mockAcc]);
+      prisma.savingsAllocation.groupBy.mockResolvedValue([]);
+      prisma.transaction.create.mockImplementation((args: any) => ({
+        id: 'tx-adj-pos',
+        ...args.data,
+        created_at: new Date(),
+        updated_at: new Date(),
+      }));
+
+      const dto = {
+        type: 'ADJUSTMENT' as const,
+        account_id: mockAcc.id,
+        amount: 50000,
+        date: '2026-11-01',
+        reason: 'Koreksi penambahan kas fisik',
+        client_tx_id: validUlid,
+      };
+
+      const result = await service.createAdjustment(user, dto);
+
+      expect(result.amount).toBe(50000);
+      expect(prisma.account.update).toHaveBeenCalledWith({
+        where: { id: mockAcc.id, user_id: user.userId },
+        data: { balance: 1050000n },
+      });
+    });
+
+    it('AC-3: melempar 422 REASON_TOO_SHORT jika reason kurang dari 10 karakter', async () => {
+      const dto = {
+        type: 'ADJUSTMENT' as const,
+        account_id: mockAccount.id,
+        amount: -50000,
+        date: '2026-11-01',
+        reason: 'koreksi',
+        client_tx_id: validUlid,
+      };
+
+      await expect(service.createAdjustment(user, dto)).rejects.toThrow(
+        UnprocessableEntityException,
+      );
+      await expect(service.createAdjustment(user, dto)).rejects.toMatchObject({
+        response: { code: 'REASON_TOO_SHORT' },
+      });
+    });
+
+    it('AC-4: melempar 422 VALIDATION_ERROR jika amount = 0', async () => {
+      const dto = {
+        type: 'ADJUSTMENT' as const,
+        account_id: mockAccount.id,
+        amount: 0,
+        date: '2026-11-01',
+        reason: 'Selisih hitung kas dompet',
+        client_tx_id: validUlid,
+      };
+
+      await expect(service.createAdjustment(user, dto)).rejects.toThrow(
+        UnprocessableEntityException,
+      );
+      await expect(service.createAdjustment(user, dto)).rejects.toMatchObject({
+        response: { code: 'VALIDATION_ERROR' },
+      });
+    });
+
+    it('AC-5: tolak 409 INSUFFICIENT_BALANCE jika newBalance < 0 pada allow_negative = false', async () => {
+      const mockAcc = {
+        id: mockAccount.id,
+        financial_profile_id: mockAccount.financial_profile_id,
+        balance: 100000n,
+        allow_negative: false,
+        archived: false,
+      };
+      prisma.$queryRaw.mockResolvedValue([mockAcc]);
+      prisma.savingsAllocation.groupBy.mockResolvedValue([]);
+
+      const dto = {
+        type: 'ADJUSTMENT' as const,
+        account_id: mockAcc.id,
+        amount: -200000,
+        date: '2026-11-01',
+        reason: 'Penyesuaian kas hilang besar',
+        client_tx_id: validUlid,
+      };
+
+      await expect(service.createAdjustment(user, dto)).rejects.toThrow(
+        ConflictException,
+      );
+      await expect(service.createAdjustment(user, dto)).rejects.toMatchObject({
+        response: {
+          code: 'INSUFFICIENT_BALANCE',
+          details: {
+            available: 100000,
+            needed: 200000,
+            account_id: mockAcc.id,
+          },
+        },
+      });
+    });
+
+    it('AC-5: allow_negative = true berhasil dan menghasilkan warning NEGATIVE_BALANCE jika newBalance < 0', async () => {
+      const mockAcc = {
+        id: mockAccount.id,
+        financial_profile_id: mockAccount.financial_profile_id,
+        balance: 100000n,
+        allow_negative: true,
+        archived: false,
+      };
+      prisma.$queryRaw.mockResolvedValue([mockAcc]);
+      prisma.savingsAllocation.groupBy.mockResolvedValue([]);
+      prisma.transaction.create.mockImplementation((args: any) => ({
+        id: 'tx-adj-neg',
+        ...args.data,
+        created_at: new Date(),
+        updated_at: new Date(),
+      }));
+
+      const dto = {
+        type: 'ADJUSTMENT' as const,
+        account_id: mockAcc.id,
+        amount: -200000,
+        date: '2026-11-01',
+        reason: 'Penyesuaian kas minus diizinkan',
+        client_tx_id: validUlid,
+      };
+
+      const result = await service.createAdjustment(user, dto);
+
+      expect(result.status).toBe('POSTED');
+      expect(result.warning).toBe('NEGATIVE_BALANCE');
+      expect(prisma.account.update).toHaveBeenCalledWith({
+        where: { id: mockAcc.id, user_id: user.userId },
+        data: { balance: -100000n },
+      });
+    });
+
+    it('AC-6: melempar 404 ACCOUNT_NOT_FOUND jika akun tidak ditemukan / milik user lain', async () => {
+      prisma.$queryRaw.mockResolvedValue([]);
+
+      const dto = {
+        type: 'ADJUSTMENT' as const,
+        account_id: mockAccount.id,
+        amount: -50000,
+        date: '2026-11-01',
+        reason: 'Selisih hitung kas dompet',
+        client_tx_id: validUlid,
+      };
+
+      await expect(service.createAdjustment(user, dto)).rejects.toThrow(
+        NotFoundException,
+      );
+      await expect(service.createAdjustment(user, dto)).rejects.toMatchObject({
+        response: { code: 'ACCOUNT_NOT_FOUND' },
+      });
+    });
+
+    it('melempar 409 ACCOUNT_ARCHIVED jika akun diarsipkan', async () => {
+      prisma.$queryRaw.mockResolvedValue([{ ...mockAccount, archived: true }]);
+
+      const dto = {
+        type: 'ADJUSTMENT' as const,
+        account_id: mockAccount.id,
+        amount: -50000,
+        date: '2026-11-01',
+        reason: 'Selisih hitung kas dompet',
+        client_tx_id: validUlid,
+      };
+
+      await expect(service.createAdjustment(user, dto)).rejects.toThrow(
+        ConflictException,
+      );
+      await expect(service.createAdjustment(user, dto)).rejects.toMatchObject({
+        response: { code: 'ACCOUNT_ARCHIVED' },
+      });
+    });
+
+    it('melempar 422 VALIDATION_ERROR jika date > today (koreksi aktual tidak boleh terjadwal)', async () => {
+      const dto = {
+        type: 'ADJUSTMENT' as const,
+        account_id: mockAccount.id,
+        amount: -50000,
+        date: '2099-12-31',
+        reason: 'Selisih hitung kas dompet',
+        client_tx_id: validUlid,
+      };
+
+      await expect(service.createAdjustment(user, dto)).rejects.toThrow(
+        UnprocessableEntityException,
+      );
+      await expect(service.createAdjustment(user, dto)).rejects.toMatchObject({
+        response: { code: 'VALIDATION_ERROR' },
+      });
+    });
+
+    it('mendukung eksekusi dengan existingTx tanpa membuka nested transaction', async () => {
+      const mockAcc = {
+        id: mockAccount.id,
+        financial_profile_id: mockAccount.financial_profile_id,
+        balance: 1000000n,
+        allow_negative: false,
+        archived: false,
+      };
+      const mockTx: any = {
+        userPreference: {
+          findFirst: jest.fn<any>().mockResolvedValue({ timezone: 'Asia/Jakarta' }),
+        },
+        $queryRaw: jest.fn<any>().mockResolvedValue([mockAcc]),
+        savingsAllocation: {
+          groupBy: jest.fn<any>().mockResolvedValue([]),
+        },
+        transaction: {
+          create: jest.fn<any>().mockImplementation((args: any) => ({
+            id: 'tx-adj-tx',
+            ...args.data,
+            created_at: new Date(),
+            updated_at: new Date(),
+          })),
+        },
+        account: {
+          update: jest.fn<any>(),
+        },
+        transactionAudit: {
+          create: jest.fn<any>(),
+        },
+      };
+
+      const dto = {
+        type: 'ADJUSTMENT' as const,
+        account_id: mockAcc.id,
+        amount: -50000,
+        date: '2026-11-01',
+        reason: 'Selisih hitung kas dompet',
+        client_tx_id: validUlid,
+      };
+
+      const result = await service.createAdjustment(user, dto, mockTx);
+
+      expect(result.id).toBe('tx-adj-tx');
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+      expect(mockTx.account.update).toHaveBeenCalledWith({
+        where: { id: mockAcc.id, user_id: user.userId },
+        data: { balance: 950000n },
+      });
+    });
+
+    it('melempar 409 CLIENT_TX_ID_DUPLICATE jika client_tx_id sudah dipakai', async () => {
+      prisma.$queryRaw.mockResolvedValue([mockAccount]);
+      prisma.savingsAllocation.groupBy.mockResolvedValue([]);
+      const p2002Error = new Prisma.PrismaClientKnownRequestError(
+        'Unique constraint failed',
+        { code: 'P2002', clientVersion: '5.x' },
+      );
+      prisma.transaction.create.mockRejectedValue(p2002Error);
+
+      const dto = {
+        type: 'ADJUSTMENT' as const,
+        account_id: mockAccount.id,
+        amount: -50000,
+        date: '2026-11-01',
+        reason: 'Selisih hitung kas dompet',
+        client_tx_id: validUlid,
+      };
+
+      await expect(service.createAdjustment(user, dto)).rejects.toThrow(
+        ConflictException,
+      );
+      await expect(service.createAdjustment(user, dto)).rejects.toMatchObject({
+        response: { code: 'CLIENT_TX_ID_DUPLICATE' },
+      });
+    });
+  });
 });

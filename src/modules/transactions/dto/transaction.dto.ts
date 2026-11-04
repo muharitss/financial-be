@@ -104,10 +104,28 @@ export const createTransferSchema = z
 
 export type CreateTransferDto = z.infer<typeof createTransferSchema>;
 
+export const createAdjustmentSchema = z
+  .object({
+    type: z.literal('ADJUSTMENT'),
+    account_id: z.uuid(),
+    amount: z
+      .number()
+      .int()
+      .refine((v) => v !== 0, { message: 'Nominal penyesuaian tidak boleh 0' }),
+    date: z.iso.date(),
+    reason: z.string().trim().max(500),
+    note: z.string().trim().max(500).optional(),
+    client_tx_id: z.string().regex(ULID_REGEX).optional(),
+  })
+  .strict();
+
+export type CreateAdjustmentDto = z.infer<typeof createAdjustmentSchema>;
+
 export const createTransactionSchema = z.discriminatedUnion('type', [
   createIncomeSchema,
   createExpenseSchema,
   createTransferSchema,
+  createAdjustmentSchema,
 ]);
 
 export type CreateTransactionDto = z.infer<typeof createTransactionSchema>;

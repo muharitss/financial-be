@@ -1206,4 +1206,224 @@ describe('Transactions E2E Test Suite (Supertest)', () => {
       expect(res.body.code).toBe('VALIDATION_ERROR');
     });
   });
+
+  describe('ADJUSTMENT Endpoints (TASK-043)', () => {
+    it('AC-1 & AC-2: Akun balance = 1000000 -> POST adjustment -50000 -> 201, balance = 950000, category_id = null, dan audit log tercatat', async () => {
+      const acc = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Dompet Kas AC-1',
+          type: 'CASH',
+          opening_balance: 1000000n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 1000000n,
+        },
+      });
+
+      const clientTxId = generateTestUlid();
+      const res = await request(app.getHttpServer())
+        .post('/transactions')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          type: 'ADJUSTMENT',
+          account_id: acc.id,
+          amount: -50000,
+          date: '2026-11-01',
+          reason: 'Selisih hitung kas dompet',
+          client_tx_id: clientTxId,
+        });
+
+      expect(res.status).toBe(201);
+      expect(res.body.type).toBe('ADJUSTMENT');
+      expect(res.body.amount).toBe(-50000);
+      expect(res.body.category_id).toBeNull();
+      expect(res.body.reason).toBe('Selisih hitung kas dompet');
+      expect(res.body.status).toBe('POSTED');
+
+      const updatedAcc = await prisma.account.findFirst({
+        where: { id: acc.id, user_id: userAId },
+      });
+      expect(updatedAcc!.balance).toBe(950000n);
+
+      const audits = await prisma.asSystem().transactionAudit.findMany({
+        where: { transaction_id: res.body.id },
+      });
+      expect(audits).toHaveLength(1);
+      expect(audits[0].action).toBe('CREATE');
+      expect(audits[0].reason).toBe('Selisih hitung kas dompet');
+      expect(audits[0].before).toEqual({ account_balance: 1000000 });
+      expect(audits[0].after).toMatchObject({
+        account_balance: 950000,
+        amount: -50000,
+      });
+    });
+
+    it('AC-3: reason kurang dari 10 karakter ("koreksi") -> 422 REASON_TOO_SHORT', async () => {
+      const res = await request(app.getHttpServer())
+        .post('/transactions')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          type: 'ADJUSTMENT',
+          account_id: userAAccount.id,
+          amount: -50000,
+          date: '2026-11-01',
+          reason: 'koreksi',
+          client_tx_id: generateTestUlid(),
+        });
+
+      expect(res.status).toBe(422);
+      expect(res.body.code).toBe('REASON_TOO_SHORT');
+    });
+
+    it('AC-4: amount = 0 -> 400/422 VALIDATION_ERROR', async () => {
+      const res = await request(app.getHttpServer())
+        .post('/transactions')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          type: 'ADJUSTMENT',
+          account_id: userAAccount.id,
+          amount: 0,
+          date: '2026-11-01',
+          reason: 'Penyesuaian nominal nol',
+          client_tx_id: generateTestUlid(),
+        });
+
+      expect([400, 422]).toContain(res.status);
+      expect(res.body.code).toBe('VALIDATION_ERROR');
+    });
+
+    it('AC-5: amount = -200000 pada akun balance = 100000, allow_negative = false -> 409 INSUFFICIENT_BALANCE', async () => {
+      const acc = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Kas No Negative',
+          type: 'CASH',
+          opening_balance: 100000n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 100000n,
+          allow_negative: false,
+        },
+      });
+
+      const res = await request(app.getHttpServer())
+        .post('/transactions')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          type: 'ADJUSTMENT',
+          account_id: acc.id,
+          amount: -200000,
+          date: '2026-11-01',
+          reason: 'Penyesuaian kas hilang besar',
+          client_tx_id: generateTestUlid(),
+        });
+
+      expect(res.status).toBe(409);
+      expect(res.body.code).toBe('INSUFFICIENT_BALANCE');
+      expect(res.body.details).toEqual({
+        available: 100000,
+        needed: 200000,
+        account_id: acc.id,
+      });
+
+      const accAfter = await prisma.account.findFirst({
+        where: { id: acc.id, user_id: userAId },
+      });
+      expect(accAfter!.balance).toBe(100000n);
+    });
+
+    it('AC-5: amount = -200000 pada akun balance = 100000, allow_negative = true -> 201 dengan warning NEGATIVE_BALANCE dan balance = -100000', async () => {
+      const acc = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Kas Allow Negative',
+          type: 'CASH',
+          opening_balance: 100000n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 100000n,
+          allow_negative: true,
+        },
+      });
+
+      const res = await request(app.getHttpServer())
+        .post('/transactions')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          type: 'ADJUSTMENT',
+          account_id: acc.id,
+          amount: -200000,
+          date: '2026-11-01',
+          reason: 'Penyesuaian kas negatif yang diizinkan',
+          client_tx_id: generateTestUlid(),
+        });
+
+      expect(res.status).toBe(201);
+      expect(res.body.warning).toBe('NEGATIVE_BALANCE');
+      expect(res.body.amount).toBe(-200000);
+
+      const accAfter = await prisma.account.findFirst({
+        where: { id: acc.id, user_id: userAId },
+      });
+      expect(accAfter!.balance).toBe(-100000n);
+    });
+
+    it('AC-6 (isolasi): Adjustment pada account_id milik user lain -> 404 ACCOUNT_NOT_FOUND', async () => {
+      const res = await request(app.getHttpServer())
+        .post('/transactions')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          type: 'ADJUSTMENT',
+          account_id: userBAccount.id,
+          amount: -50000,
+          date: '2026-11-01',
+          reason: 'Mencoba adjust akun user lain',
+          client_tx_id: generateTestUlid(),
+        });
+
+      expect(res.status).toBe(404);
+      expect(res.body.code).toBe('ACCOUNT_NOT_FOUND');
+
+      const userBAcc = await prisma.account.findFirst({
+        where: { id: userBAccount.id, user_id: userBId },
+      });
+      expect(userBAcc!.balance).toBe(500000n);
+    });
+
+    it('Tolak 422 VALIDATION_ERROR jika date > today', async () => {
+      const res = await request(app.getHttpServer())
+        .post('/transactions')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          type: 'ADJUSTMENT',
+          account_id: userAAccount.id,
+          amount: 50000,
+          date: '2099-12-31',
+          reason: 'Koreksi masa depan tidak valid',
+          client_tx_id: generateTestUlid(),
+        });
+
+      expect(res.status).toBe(422);
+      expect(res.body.code).toBe('VALIDATION_ERROR');
+    });
+
+    it('Dapat menggunakan header Idempotency-Key jika client_tx_id di body ditiadakan', async () => {
+      const key = generateTestUlid();
+      const res = await request(app.getHttpServer())
+        .post('/transactions')
+        .set('Cookie', userAHeaders.cookie)
+        .set('Idempotency-Key', key)
+        .send({
+          type: 'ADJUSTMENT',
+          account_id: userAAccount.id,
+          amount: 10000,
+          date: '2026-11-01',
+          reason: 'Koreksi via Idempotency-Key header',
+        });
+
+      expect(res.status).toBe(201);
+      expect(res.body.client_tx_id).toBe(key);
+    });
+  });
 });
