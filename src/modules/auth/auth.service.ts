@@ -208,18 +208,45 @@ export class AuthService {
     };
   }
 
-  async logout(rawRefreshToken?: string) {
+  async logout(rawRefreshToken?: string, clientIp?: string, userAgent?: string) {
     if (rawRefreshToken) {
       const tokenHash = createHash('sha256').update(rawRefreshToken).digest('hex');
-      await this.prisma
+      const token = await this.prisma
         .asSystem()
-        .refreshToken.update({
+        .refreshToken.findUnique({
           where: { token_hash: tokenHash },
-          data: { revoked_at: new Date() },
         })
-        .catch(() => {
-          // shortcut: silent catch if token already deleted or missing, clean logout is goal
-        });
+        .catch(() => null);
+
+      if (token && !token.revoked_at) {
+        const hashedIp = clientIp
+          ? createHash('sha256').update(clientIp).digest('hex')
+          : null;
+        const truncatedUserAgent = userAgent ? userAgent.slice(0, 255) : null;
+
+        await this.prisma
+          .asSystem()
+          .$transaction(async (tx) => {
+            await tx.refreshToken.update({
+              where: { id: token.id },
+              data: { revoked_at: new Date() },
+            });
+
+            await tx.auditLog.create({
+              data: {
+                action: 'AUTH_LOGOUT',
+                actor_user_id: token.user_id,
+                resource_type: 'session',
+                resource_id: token.id,
+                ip_address: hashedIp,
+                user_agent: truncatedUserAgent,
+              },
+            });
+          })
+          .catch(() => {
+            // shortcut: silent catch if revocation/audit fails, clean logout is goal
+          });
+      }
     }
     return { ok: true };
   }

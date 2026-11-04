@@ -2,6 +2,7 @@ import { jest, describe, it, expect, beforeEach } from '@jest/globals';
 import { Test, TestingModule } from '@nestjs/testing';
 import { JwtService } from '@nestjs/jwt';
 import { UnauthorizedException, ConflictException, HttpException, ForbiddenException } from '@nestjs/common';
+import { createHash } from 'node:crypto';
 import * as argon2 from '@node-rs/argon2';
 import { AuthService } from './auth.service.js';
 import { PrismaService } from '../../prisma/prisma.service.js';
@@ -28,6 +29,9 @@ describe('AuthService (Manual Auth)', () => {
         findUnique: jest.fn(),
         update: jest.fn().mockResolvedValue({ id: 'rt-1' }),
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+      },
+      auditLog: {
+        create: jest.fn().mockResolvedValue({ id: 'audit-1' }),
       },
       $transaction: jest.fn(async (callback) => callback(prisma)),
       asSystem: jest.fn(() => prisma),
@@ -240,6 +244,73 @@ describe('AuthService (Manual Auth)', () => {
           replaced_by_id: 'rt-1',
         }),
       });
+    });
+  });
+
+  describe('logout', () => {
+    it('mengembalikan { ok: true } jika dipanggil tanpa refresh token', async () => {
+      const result = await service.logout();
+      expect(result).toEqual({ ok: true });
+      expect(prisma.refreshToken.findUnique).not.toHaveBeenCalled();
+      expect(prisma.auditLog.create).not.toHaveBeenCalled();
+    });
+
+    it('mencabut token dan mencatat AuditLog dengan hashed IP dan user agent', async () => {
+      const rawToken = 'my-refresh-token';
+      const tokenHash = createHash('sha256').update(rawToken).digest('hex');
+      const clientIp = '192.168.1.1';
+      const expectedHashedIp = createHash('sha256').update(clientIp).digest('hex');
+      const userAgent = 'Mozilla/5.0 TestBrowser';
+
+      prisma.refreshToken.findUnique.mockResolvedValue({
+        id: 'token-uuid-1',
+        user_id: 'user-uuid-1',
+        token_hash: tokenHash,
+        revoked_at: null,
+      });
+
+      const result = await service.logout(rawToken, clientIp, userAgent);
+      expect(result).toEqual({ ok: true });
+      expect(prisma.refreshToken.update).toHaveBeenCalledWith({
+        where: { id: 'token-uuid-1' },
+        data: expect.objectContaining({ revoked_at: expect.any(Date) }),
+      });
+      expect(prisma.auditLog.create).toHaveBeenCalledWith({
+        data: {
+          action: 'AUTH_LOGOUT',
+          actor_user_id: 'user-uuid-1',
+          resource_type: 'session',
+          resource_id: 'token-uuid-1',
+          ip_address: expectedHashedIp,
+          user_agent: userAgent,
+        },
+      });
+    });
+
+    it('tidak mencatat audit log ganda jika token sudah di-revoke sebelumnya', async () => {
+      const rawToken = 'my-revoked-token';
+      const tokenHash = createHash('sha256').update(rawToken).digest('hex');
+
+      prisma.refreshToken.findUnique.mockResolvedValue({
+        id: 'token-uuid-1',
+        user_id: 'user-uuid-1',
+        token_hash: tokenHash,
+        revoked_at: new Date(),
+      });
+
+      const result = await service.logout(rawToken, '127.0.0.1');
+      expect(result).toEqual({ ok: true });
+      expect(prisma.refreshToken.update).not.toHaveBeenCalled();
+      expect(prisma.auditLog.create).not.toHaveBeenCalled();
+    });
+
+    it('tetap idempoten mengembalikan { ok: true } jika token tidak ditemukan di DB', async () => {
+      prisma.refreshToken.findUnique.mockResolvedValue(null);
+
+      const result = await service.logout('unknown-token', '127.0.0.1');
+      expect(result).toEqual({ ok: true });
+      expect(prisma.refreshToken.update).not.toHaveBeenCalled();
+      expect(prisma.auditLog.create).not.toHaveBeenCalled();
     });
   });
 });

@@ -151,7 +151,13 @@ export class AuthController {
   @ApiOperation({ summary: 'Keluar dan mencabut refresh token' })
   async logout(@Req() req: Request, @Res({ passthrough: true }) res: Response) {
     const rawRefreshToken = extractRefreshToken(req);
-    await this.authService.logout(rawRefreshToken);
+    const clientIp = req.ip || req.socket.remoteAddress || '127.0.0.1';
+    const userAgent =
+      typeof req.headers['user-agent'] === 'string'
+        ? req.headers['user-agent']
+        : undefined;
+
+    await this.authService.logout(rawRefreshToken, clientIp, userAgent);
     this.clearAuthCookies(res);
 
     return { ok: true };
