@@ -30,13 +30,13 @@ export class TransactionsController {
   @Post()
   @HttpCode(HttpStatus.CREATED)
   @Throttle({ transaction: { limit: 60, ttl: 60000 } })
-  @ApiOperation({ summary: 'Membuat transaksi baru (INCOME)' })
+  @ApiOperation({ summary: 'Membuat transaksi baru (INCOME, EXPENSE, TRANSFER)' })
   @ApiResponse({ status: 201, description: 'Transaksi berhasil dibuat' })
   @ApiResponse({ status: 400, description: 'Data tidak valid atau kategori salah tipe' })
   @ApiResponse({ status: 401, description: 'Sesi tidak valid' })
   @ApiResponse({ status: 404, description: 'Akun, kategori, atau tag tidak ditemukan' })
-  @ApiResponse({ status: 409, description: 'Akun diarsipkan atau idempotency conflict' })
-  @ApiResponse({ status: 422, description: 'Kategori/tag diarsipkan atau client_tx_id hilang' })
+  @ApiResponse({ status: 409, description: 'Akun diarsipkan, saldo tidak mencukupi, atau idempotency conflict' })
+  @ApiResponse({ status: 422, description: 'Kategori/tag diarsipkan, transfer ke akun sama, atau client_tx_id hilang' })
   async create(
     @CurrentUser() user: { userId: string; role?: string },
     @Body(new CreateTransactionPipe()) dto: CreateTransactionDto,

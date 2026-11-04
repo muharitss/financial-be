@@ -70,9 +70,44 @@ export const createExpenseSchema = z
 
 export type CreateExpenseDto = z.infer<typeof createExpenseSchema>;
 
+export const createTransferSchema = z
+  .object({
+    type: z.literal('TRANSFER'),
+    account_id: z.uuid().optional(),
+    from_account_id: z.uuid().optional(),
+    to_account_id: z.uuid(),
+    amount: z.number().int().positive(),
+    fee: z.number().int().nonnegative().default(0),
+    fee_mode: z.enum(['SEPARATE', 'BUNDLED']).default('SEPARATE'),
+    fee_category_id: z.uuid().optional(),
+    date: z.iso.date(),
+    note: z.string().trim().max(500).optional(),
+    tags: z.array(z.uuid()).max(10).optional(),
+    client_tx_id: z.string().regex(ULID_REGEX).optional(),
+  })
+  .strict()
+  .transform((val, ctx) => {
+    const account_id = val.account_id ?? val.from_account_id;
+    if (!account_id) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'account_id atau from_account_id wajib disertakan',
+        path: ['account_id'],
+      });
+      return z.NEVER;
+    }
+    return {
+      ...val,
+      account_id,
+    };
+  });
+
+export type CreateTransferDto = z.infer<typeof createTransferSchema>;
+
 export const createTransactionSchema = z.discriminatedUnion('type', [
   createIncomeSchema,
   createExpenseSchema,
+  createTransferSchema,
 ]);
 
 export type CreateTransactionDto = z.infer<typeof createTransactionSchema>;

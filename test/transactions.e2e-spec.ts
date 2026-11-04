@@ -821,4 +821,389 @@ describe('Transactions E2E Test Suite (Supertest)', () => {
       expect(resCat.body.code).toBe('CATEGORY_NOT_FOUND');
     });
   });
+
+  describe('TRANSFER Endpoints (TASK-042)', () => {
+    it('AC-1 (Metode A SEPARATE): BCA 1000000, GoPay 0 -> transfer amount: 500000, fee: 6500, fee_mode: SEPARATE -> 201, BCA 493500, GoPay 500000, 2 baris transactions ber-transfer_group_id sama', async () => {
+      const bca = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'BCA AC1 ' + Date.now(),
+          type: 'BANK',
+          opening_balance: 1000000n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 1000000n,
+          allow_negative: false,
+        },
+      });
+      const gopay = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'GoPay AC1 ' + Date.now(),
+          type: 'EWALLET',
+          opening_balance: 0n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 0n,
+          allow_negative: false,
+        },
+      });
+      const clientTxId = generateTestUlid();
+
+      const res = await request(app.getHttpServer())
+        .post('/transactions')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          type: 'TRANSFER',
+          account_id: bca.id,
+          to_account_id: gopay.id,
+          amount: 500000,
+          fee: 6500,
+          fee_mode: 'SEPARATE',
+          date: '2026-11-01',
+          client_tx_id: clientTxId,
+        });
+
+      expect(res.status).toBe(201);
+      expect(res.body.amount).toBe(500000);
+      expect(res.body.transfer_fee).toBe(6500);
+      expect(res.body.fee_mode).toBe('SEPARATE');
+      expect(res.body.transfer_group_id).toBeTruthy();
+
+      const bcaUpdated = await prisma.account.findFirst({ where: { id: bca.id, user_id: userAId } });
+      const gopayUpdated = await prisma.account.findFirst({ where: { id: gopay.id, user_id: userAId } });
+      expect(bcaUpdated?.balance).toBe(493500n);
+      expect(gopayUpdated?.balance).toBe(500000n);
+
+      const txs = await prisma.transaction.findMany({
+        where: { transfer_group_id: res.body.transfer_group_id, user_id: userAId },
+      });
+      expect(txs).toHaveLength(2);
+
+      const transferTx = txs.find((t) => t.type === 'TRANSFER');
+      const expenseTx = txs.find((t) => t.type === 'EXPENSE');
+
+      expect(transferTx).toBeDefined();
+      expect(transferTx?.amount).toBe(500000n);
+      expect(transferTx?.transfer_fee).toBe(6500n);
+      expect(transferTx?.account_id).toBe(bca.id);
+      expect(transferTx?.to_account_id).toBe(gopay.id);
+
+      expect(expenseTx).toBeDefined();
+      expect(expenseTx?.amount).toBe(6500n);
+      expect(expenseTx?.account_id).toBe(bca.id);
+      expect(expenseTx?.to_account_id).toBeNull();
+      expect(expenseTx?.client_tx_id).toBe(`${clientTxId}:fee`);
+
+      const cat = await prisma.category.findFirst({ where: { id: expenseTx?.category_id ?? '', user_id: userAId } });
+      expect(cat?.name).toBe('Biaya Transfer');
+
+      const audits = await prisma.asSystem().transactionAudit.findMany({
+        where: { transaction_id: { in: [transferTx!.id, expenseTx!.id] } },
+      });
+      expect(audits).toHaveLength(2);
+    });
+
+    it('AC-2 (Metode B BUNDLED): BCA 1000000, GoPay 0 -> transfer amount: 500000, fee: 6500, fee_mode: BUNDLED -> 201, BCA 500000, GoPay 493500, hanya 1 baris TRANSFER tanpa EXPENSE', async () => {
+      const bca = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'BCA AC2 ' + Date.now(),
+          type: 'BANK',
+          opening_balance: 1000000n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 1000000n,
+          allow_negative: false,
+        },
+      });
+      const gopay = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'GoPay AC2 ' + Date.now(),
+          type: 'EWALLET',
+          opening_balance: 0n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 0n,
+          allow_negative: false,
+        },
+      });
+
+      const res = await request(app.getHttpServer())
+        .post('/transactions')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          type: 'TRANSFER',
+          account_id: bca.id,
+          to_account_id: gopay.id,
+          amount: 500000,
+          fee: 6500,
+          fee_mode: 'BUNDLED',
+          date: '2026-11-01',
+          client_tx_id: generateTestUlid(),
+        });
+
+      expect(res.status).toBe(201);
+      expect(res.body.amount).toBe(493500);
+      expect(res.body.transfer_fee).toBe(6500);
+      expect(res.body.fee_mode).toBe('BUNDLED');
+      expect(res.body.transfer_group_id).toBeNull();
+
+      const bcaUpdated = await prisma.account.findFirst({ where: { id: bca.id, user_id: userAId } });
+      const gopayUpdated = await prisma.account.findFirst({ where: { id: gopay.id, user_id: userAId } });
+      expect(bcaUpdated?.balance).toBe(500000n);
+      expect(gopayUpdated?.balance).toBe(493500n);
+
+      const tx = await prisma.transaction.findFirst({
+        where: { id: res.body.id, user_id: userAId },
+      });
+      expect(tx?.amount).toBe(493500n);
+      expect(tx?.transfer_fee).toBe(6500n);
+      expect(tx?.fee_mode).toBe('BUNDLED');
+      expect(tx?.transfer_group_id).toBeNull();
+
+      const expenseTxs = await prisma.transaction.findMany({
+        where: { account_id: bca.id, type: 'EXPENSE', user_id: userAId },
+      });
+      expect(expenseTxs).toHaveLength(0);
+
+      const audits = await prisma.asSystem().transactionAudit.findMany({
+        where: { transaction_id: res.body.id },
+      });
+      expect(audits).toHaveLength(1);
+    });
+
+    it('AC-3: fee = 0 -> hanya 1 baris TRANSFER dibuat, fee_mode null, tanpa baris EXPENSE 0', async () => {
+      const bca = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'BCA AC3 ' + Date.now(),
+          type: 'BANK',
+          opening_balance: 1000000n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 1000000n,
+          allow_negative: false,
+        },
+      });
+      const gopay = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'GoPay AC3 ' + Date.now(),
+          type: 'EWALLET',
+          opening_balance: 0n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 0n,
+          allow_negative: false,
+        },
+      });
+
+      const res = await request(app.getHttpServer())
+        .post('/transactions')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          type: 'TRANSFER',
+          account_id: bca.id,
+          to_account_id: gopay.id,
+          amount: 500000,
+          fee: 0,
+          date: '2026-11-01',
+          client_tx_id: generateTestUlid(),
+        });
+
+      expect(res.status).toBe(201);
+      expect(res.body.amount).toBe(500000);
+      expect(res.body.transfer_fee).toBe(0);
+      expect(res.body.fee_mode).toBeNull();
+      expect(res.body.transfer_group_id).toBeNull();
+
+      const bcaUpdated = await prisma.account.findFirst({ where: { id: bca.id, user_id: userAId } });
+      const gopayUpdated = await prisma.account.findFirst({ where: { id: gopay.id, user_id: userAId } });
+      expect(bcaUpdated?.balance).toBe(500000n);
+      expect(gopayUpdated?.balance).toBe(500000n);
+
+      const expenseTxs = await prisma.transaction.findMany({
+        where: { account_id: bca.id, type: 'EXPENSE', user_id: userAId },
+      });
+      expect(expenseTxs).toHaveLength(0);
+    });
+
+    it('AC-4: account_id === to_account_id -> 422 SAME_ACCOUNT_TRANSFER', async () => {
+      const res = await request(app.getHttpServer())
+        .post('/transactions')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          type: 'TRANSFER',
+          account_id: userAAccount.id,
+          to_account_id: userAAccount.id,
+          amount: 100000,
+          fee: 0,
+          date: '2026-11-01',
+          client_tx_id: generateTestUlid(),
+        });
+
+      expect(res.status).toBe(422);
+      expect(res.body.code).toBe('SAME_ACCOUNT_TRANSFER');
+    });
+
+    it('AC-5: available akun sumber 100000, transfer amount: 95000, fee: 10000 (allow_negative = false) -> 409 INSUFFICIENT_BALANCE, kedua saldo tidak berubah', async () => {
+      const bca = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'BCA AC5 ' + Date.now(),
+          type: 'BANK',
+          opening_balance: 100000n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 100000n,
+          allow_negative: false,
+        },
+      });
+      const gopay = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'GoPay AC5 ' + Date.now(),
+          type: 'EWALLET',
+          opening_balance: 0n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 0n,
+          allow_negative: false,
+        },
+      });
+
+      const res = await request(app.getHttpServer())
+        .post('/transactions')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          type: 'TRANSFER',
+          account_id: bca.id,
+          to_account_id: gopay.id,
+          amount: 95000,
+          fee: 10000,
+          fee_mode: 'SEPARATE',
+          date: '2026-11-01',
+          client_tx_id: generateTestUlid(),
+        });
+
+      expect(res.status).toBe(409);
+      expect(res.body.code).toBe('INSUFFICIENT_BALANCE');
+
+      const bcaAfter = await prisma.account.findFirst({ where: { id: bca.id, user_id: userAId } });
+      const gopayAfter = await prisma.account.findFirst({ where: { id: gopay.id, user_id: userAId } });
+      expect(bcaAfter?.balance).toBe(100000n);
+      expect(gopayAfter?.balance).toBe(0n);
+    });
+
+    it('AC-6 (isolasi): transfer dari/ke akun milik user lain -> 404 ACCOUNT_NOT_FOUND', async () => {
+      // 1. Akun tujuan milik user B
+      const resToB = await request(app.getHttpServer())
+        .post('/transactions')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          type: 'TRANSFER',
+          account_id: userAAccount.id,
+          to_account_id: userBAccount.id,
+          amount: 50000,
+          fee: 0,
+          date: '2026-11-01',
+          client_tx_id: generateTestUlid(),
+        });
+
+      expect(resToB.status).toBe(404);
+      expect(resToB.body.code).toBe('ACCOUNT_NOT_FOUND');
+
+      // 2. Akun sumber milik user B
+      const resFromB = await request(app.getHttpServer())
+        .post('/transactions')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          type: 'TRANSFER',
+          account_id: userBAccount.id,
+          to_account_id: userAAccount.id,
+          amount: 50000,
+          fee: 0,
+          date: '2026-11-01',
+          client_tx_id: generateTestUlid(),
+        });
+
+      expect(resFromB.status).toBe(404);
+      expect(resFromB.body.code).toBe('ACCOUNT_NOT_FOUND');
+    });
+
+    it('Mendukung alias from_account_id sebagai pengganti account_id', async () => {
+      const bca = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'BCA Alias ' + Date.now(),
+          type: 'BANK',
+          opening_balance: 500000n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 500000n,
+          allow_negative: false,
+        },
+      });
+      const gopay = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'GoPay Alias ' + Date.now(),
+          type: 'EWALLET',
+          opening_balance: 0n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 0n,
+          allow_negative: false,
+        },
+      });
+
+      const res = await request(app.getHttpServer())
+        .post('/transactions')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          type: 'TRANSFER',
+          from_account_id: bca.id,
+          to_account_id: gopay.id,
+          amount: 100000,
+          fee: 0,
+          date: '2026-11-01',
+          client_tx_id: generateTestUlid(),
+        });
+
+      expect(res.status).toBe(201);
+      expect(res.body.account_id).toBe(bca.id);
+      expect(res.body.to_account_id).toBe(gopay.id);
+    });
+
+    it('Metode B BUNDLED: tolak 422 VALIDATION_ERROR jika amount <= fee', async () => {
+      const res = await request(app.getHttpServer())
+        .post('/transactions')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          type: 'TRANSFER',
+          account_id: userAAccount.id,
+          to_account_id: (await prisma.account.create({
+            data: {
+              user_id: userAId,
+              financial_profile_id: profileAId,
+              name: 'Dummy Dest ' + Date.now(),
+              type: 'BANK',
+              opening_balance: 0n,
+              opening_date: new Date('2026-11-01T00:00:00.000Z'),
+              balance: 0n,
+            },
+          })).id,
+          amount: 5000,
+          fee: 6500,
+          fee_mode: 'BUNDLED',
+          date: '2026-11-01',
+          client_tx_id: generateTestUlid(),
+        });
+
+      expect(res.status).toBe(422);
+      expect(res.body.code).toBe('VALIDATION_ERROR');
+    });
+  });
 });

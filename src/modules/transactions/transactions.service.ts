@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import {
   Injectable,
   NotFoundException,
@@ -13,6 +14,7 @@ import {
   type CreateTransactionDto,
   type CreateIncomeDto,
   type CreateExpenseDto,
+  type CreateTransferDto,
 } from './dto/transaction.dto.js';
 
 export interface TransactionResponse {
@@ -142,6 +144,9 @@ export class TransactionsService {
     }
     if (dto.type === 'EXPENSE') {
       return this.createExpense(user, dto, headerIdempotencyKey);
+    }
+    if (dto.type === 'TRANSFER') {
+      return this.createTransfer(user, dto, headerIdempotencyKey);
     }
 
     throw new BadRequestException({
@@ -489,6 +494,303 @@ export class TransactionsService {
         await tx.transactionAudit.create({
           data: {
             transaction_id: created.id,
+            action: 'CREATE',
+            before: Prisma.DbNull,
+            after: response as unknown as Prisma.InputJsonValue,
+            actor_user_id: user.userId,
+          },
+        });
+
+        return response;
+      });
+    } catch (error: any) {
+      if (
+        error instanceof Prisma.PrismaClientKnownRequestError &&
+        error.code === 'P2002'
+      ) {
+        throw new ConflictException({
+          code: 'CLIENT_TX_ID_DUPLICATE',
+          message: 'client_tx_id sudah pernah digunakan',
+        });
+      }
+      throw error;
+    }
+  }
+
+  private async createTransfer(
+    user: { userId: string; role?: string },
+    dto: CreateTransferDto,
+    headerIdempotencyKey?: string,
+  ): Promise<TransactionResponse> {
+    if (dto.account_id === dto.to_account_id) {
+      throw new UnprocessableEntityException({
+        code: 'SAME_ACCOUNT_TRANSFER',
+        message: 'Akun sumber dan tujuan tidak boleh sama',
+      });
+    }
+
+    const fee = dto.fee ?? 0;
+    if (dto.fee_mode === 'BUNDLED' && fee > 0) {
+      const amountReceived = dto.amount - fee;
+      if (amountReceived <= 0) {
+        throw new UnprocessableEntityException({
+          code: 'VALIDATION_ERROR',
+          message: 'Nominal diterima (amount - fee) harus lebih besar dari 0',
+        });
+      }
+    }
+
+    const clientTxId = resolveClientTxId(dto.client_tx_id, headerIdempotencyKey);
+
+    const pref = await this.prisma.userPreference.findFirst({
+      where: { user_id: user.userId },
+    });
+    const tz = pref?.timezone ?? 'Asia/Jakarta';
+    const today = todayInTz(tz);
+
+    try {
+      return await this.prisma.$transaction(async (tx) => {
+        // 1. Kunci kedua akun dengan urutan anti-deadlock (ORDER BY id ASC)
+        const accounts = await tx.$queryRaw<
+          Array<{
+            id: string;
+            financial_profile_id: string;
+            balance: bigint;
+            allow_negative: boolean;
+            archived: boolean;
+          }>
+        >`SELECT id, financial_profile_id, balance, allow_negative, archived FROM accounts WHERE id IN (${dto.account_id}::uuid, ${dto.to_account_id}::uuid) AND user_id = ${user.userId}::uuid ORDER BY id ASC FOR UPDATE`;
+
+        const fromAccount = accounts.find((a) => a.id === dto.account_id);
+        const toAccount = accounts.find((a) => a.id === dto.to_account_id);
+
+        if (!fromAccount || !toAccount) {
+          throw new NotFoundException({
+            code: 'ACCOUNT_NOT_FOUND',
+            message: 'Akun tidak ditemukan',
+          });
+        }
+
+        if (fromAccount.archived || toAccount.archived) {
+          throw new ConflictException({
+            code: 'ACCOUNT_ARCHIVED',
+            message: 'Akun telah diarsipkan',
+          });
+        }
+
+        // 2. Kategori biaya jika Metode A dengan fee > 0
+        const isSeparateFee = fee > 0 && dto.fee_mode === 'SEPARATE';
+        let feeCategory: { id: string; archived: boolean; type: string } | null = null;
+
+        if (isSeparateFee) {
+          if (dto.fee_category_id) {
+            feeCategory = await tx.category.findFirst({
+              where: { id: dto.fee_category_id, user_id: user.userId },
+            });
+
+            if (!feeCategory) {
+              throw new NotFoundException({
+                code: 'CATEGORY_NOT_FOUND',
+                message: 'Kategori tidak ditemukan',
+              });
+            }
+
+            if (feeCategory.archived) {
+              throw new UnprocessableEntityException({
+                code: 'CATEGORY_ARCHIVED',
+                message: 'Kategori telah diarsipkan',
+              });
+            }
+
+            if (feeCategory.type !== 'EXPENSE') {
+              throw new BadRequestException({
+                code: 'INVALID_CATEGORY_TYPE',
+                message: 'Kategori harus bertipe EXPENSE',
+              });
+            }
+          } else {
+            // Default: kategori sistem 'Biaya Transfer' milik user
+            feeCategory = await tx.category.findFirst({
+              where: {
+                user_id: user.userId,
+                name: 'Biaya Transfer',
+              },
+            });
+
+            if (!feeCategory) {
+              feeCategory = await tx.category.create({
+                data: {
+                  user_id: user.userId,
+                  financial_profile_id: fromAccount.financial_profile_id,
+                  name: 'Biaya Transfer',
+                  type: 'EXPENSE',
+                  is_system: true,
+                },
+              });
+            } else if (feeCategory.archived) {
+              // Auto-unarchive sesuai Edge Case #17
+              feeCategory = await tx.category.update({
+                where: { id: feeCategory.id },
+                data: { archived: false, archived_at: null },
+              });
+            }
+          }
+        }
+
+        // 3. Cek tags jika ada
+        let tagIds: string[] = [];
+        if (dto.tags && dto.tags.length > 0) {
+          tagIds = Array.from(new Set(dto.tags));
+          const tags = await tx.tag.findMany({
+            where: { id: { in: tagIds }, user_id: user.userId },
+          });
+
+          if (tags.length !== tagIds.length) {
+            throw new NotFoundException({
+              code: 'TAG_NOT_FOUND',
+              message: 'Tag tidak ditemukan',
+            });
+          }
+
+          if (tags.some((t) => t.archived)) {
+            throw new UnprocessableEntityException({
+              code: 'TAG_ARCHIVED',
+              message: 'Tag telah diarsipkan',
+            });
+          }
+        }
+
+        // 4. Hitung status: scheduled vs posted (C-04)
+        const isScheduled = dto.date > today;
+        const status: TransactionStatus = isScheduled ? 'SCHEDULED' : 'POSTED';
+
+        // 5. Hitung nominal keluar dan diterima
+        const amountReceived = dto.fee_mode === 'BUNDLED' && fee > 0 ? dto.amount - fee : dto.amount;
+        const totalOut = isSeparateFee ? BigInt(dto.amount) + BigInt(fee) : BigInt(dto.amount);
+        const amountReceivedBigInt = BigInt(amountReceived);
+
+        // Pengecekan saldo sumber hanya untuk transaksi efektif (status === POSTED)
+        if (status === 'POSTED') {
+          const fromReserved = await getAccountReserved(tx, fromAccount.id);
+          const fromAvailable = fromAccount.balance - fromReserved;
+
+          if (
+            !fromAccount.allow_negative &&
+            (fromAccount.balance < 0n || totalOut > fromAvailable || fromAccount.balance - totalOut < 0n)
+          ) {
+            throw new ConflictException({
+              code: 'INSUFFICIENT_BALANCE',
+              message: 'Saldo tersedia tidak mencukupi',
+              details: {
+                available: Number(fromAvailable),
+                needed: Number(totalOut),
+                account_id: fromAccount.id,
+              },
+            });
+          }
+        }
+
+        const transferGroupId = isSeparateFee ? randomUUID() : null;
+        const feeMode = fee > 0 ? dto.fee_mode : null;
+
+        // 6. Buat baris TRANSFER
+        const transferTx = await tx.transaction.create({
+          data: {
+            user_id: user.userId,
+            financial_profile_id: fromAccount.financial_profile_id,
+            account_id: fromAccount.id,
+            to_account_id: toAccount.id,
+            type: 'TRANSFER',
+            amount: amountReceivedBigInt,
+            date: new Date(`${dto.date}T00:00:00.000Z`),
+            status,
+            transfer_group_id: transferGroupId,
+            transfer_fee: BigInt(fee),
+            fee_mode: feeMode,
+            note: dto.note ?? null,
+            client_tx_id: clientTxId,
+          },
+        });
+
+        // 7. Relasi tag pada baris TRANSFER
+        if (tagIds.length > 0) {
+          await tx.transactionTag.createMany({
+            data: tagIds.map((tag_id) => ({
+              transaction_id: transferTx.id,
+              tag_id,
+            })),
+          });
+        }
+
+        // 8. Buat baris EXPENSE jika Metode A dengan fee > 0
+        if (isSeparateFee && feeCategory) {
+          const feeTx = await tx.transaction.create({
+            data: {
+              user_id: user.userId,
+              financial_profile_id: fromAccount.financial_profile_id,
+              account_id: fromAccount.id,
+              to_account_id: null,
+              type: 'EXPENSE',
+              amount: BigInt(fee),
+              date: new Date(`${dto.date}T00:00:00.000Z`),
+              status,
+              category_id: feeCategory.id,
+              transfer_group_id: transferGroupId,
+              transfer_fee: 0n,
+              fee_mode: null,
+              note: dto.note ? `Biaya transfer: ${dto.note}` : 'Biaya transfer',
+              client_tx_id: `${clientTxId}:fee`,
+            },
+          });
+
+          const feeResponse = toTransactionResponse(feeTx);
+          await tx.transactionAudit.create({
+            data: {
+              transaction_id: feeTx.id,
+              action: 'CREATE',
+              before: Prisma.DbNull,
+              after: feeResponse as unknown as Prisma.InputJsonValue,
+              actor_user_id: user.userId,
+            },
+          });
+        }
+
+        // 9. Update saldo kedua akun jika POSTED
+        let fromFinalBalance = fromAccount.balance;
+        let toFinalBalance = toAccount.balance;
+
+        if (status === 'POSTED') {
+          fromFinalBalance = fromAccount.balance - totalOut;
+          toFinalBalance = toAccount.balance + amountReceivedBigInt;
+
+          await tx.account.update({
+            where: { id: fromAccount.id, user_id: user.userId },
+            data: { balance: fromFinalBalance },
+          });
+
+          await tx.account.update({
+            where: { id: toAccount.id, user_id: user.userId },
+            data: { balance: toFinalBalance },
+          });
+        }
+
+        let warning: string | undefined;
+        if (status === 'POSTED' && fromFinalBalance < 0n) {
+          warning = 'NEGATIVE_BALANCE';
+        }
+
+        // 10. Buat TransactionAudit untuk baris TRANSFER
+        const response = toTransactionResponse(
+          {
+            ...transferTx,
+            tags: tagIds,
+          },
+          warning,
+        );
+
+        await tx.transactionAudit.create({
+          data: {
+            transaction_id: transferTx.id,
             action: 'CREATE',
             before: Prisma.DbNull,
             after: response as unknown as Prisma.InputJsonValue,

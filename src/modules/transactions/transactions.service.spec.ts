@@ -43,6 +43,8 @@ describe('TransactionsService', () => {
       },
       category: {
         findFirst: jest.fn<any>(),
+        update: jest.fn<any>(),
+        create: jest.fn<any>(),
       },
       tag: {
         findMany: jest.fn<any>(),
@@ -627,6 +629,428 @@ describe('TransactionsService', () => {
 
       expect(result.status).toBe('SCHEDULED');
       expect(prisma.account.update).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('createTransfer', () => {
+    const mockFromAccount = {
+      id: '22222222-2222-2222-2222-222222222222',
+      financial_profile_id: '33333333-3333-3333-3333-333333333333',
+      balance: 1000000n,
+      allow_negative: false,
+      archived: false,
+    };
+    const mockToAccount = {
+      id: '55555555-5555-5555-5555-555555555555',
+      financial_profile_id: '33333333-3333-3333-3333-333333333333',
+      balance: 0n,
+      allow_negative: false,
+      archived: false,
+    };
+    const mockFeeCategory = {
+      id: '66666666-6666-6666-6666-666666666666',
+      name: 'Biaya Transfer',
+      type: 'EXPENSE',
+      is_system: true,
+      archived: false,
+    };
+
+    it('AC-1 (Metode A SEPARATE): transfer amount: 500000, fee: 6500, fee_mode: SEPARATE -> BCA 493500, GoPay 500000, 2 baris transaksi ber-transfer_group_id sama', async () => {
+      prisma.$queryRaw.mockResolvedValue([mockFromAccount, mockToAccount]);
+      prisma.category.findFirst.mockResolvedValue(mockFeeCategory);
+      prisma.savingsAllocation.groupBy.mockResolvedValue([]);
+
+      const createdTxs: any[] = [];
+      prisma.transaction.create.mockImplementation((args: any) => {
+        const item = {
+          id: 'tx-' + (createdTxs.length + 1),
+          ...args.data,
+          created_at: new Date(),
+          updated_at: new Date(),
+        };
+        createdTxs.push(item);
+        return item;
+      });
+
+      const dto = {
+        type: 'TRANSFER' as const,
+        account_id: mockFromAccount.id,
+        to_account_id: mockToAccount.id,
+        amount: 500000,
+        fee: 6500,
+        fee_mode: 'SEPARATE' as const,
+        date: '2026-11-01',
+        client_tx_id: validUlid,
+      };
+
+      const result = await service.create(user, dto);
+
+      expect(result.status).toBe('POSTED');
+      expect(result.amount).toBe(500000);
+      expect(result.transfer_fee).toBe(6500);
+      expect(result.fee_mode).toBe('SEPARATE');
+      expect(result.transfer_group_id).toBeDefined();
+
+      // Memastikan 2 transaksi dibuat
+      expect(createdTxs).toHaveLength(2);
+      const [transferTx, expenseTx] = createdTxs;
+
+      expect(transferTx.type).toBe('TRANSFER');
+      expect(transferTx.amount).toBe(500000n);
+      expect(transferTx.transfer_fee).toBe(6500n);
+      expect(transferTx.fee_mode).toBe('SEPARATE');
+      expect(transferTx.account_id).toBe(mockFromAccount.id);
+      expect(transferTx.to_account_id).toBe(mockToAccount.id);
+
+      expect(expenseTx.type).toBe('EXPENSE');
+      expect(expenseTx.amount).toBe(6500n);
+      expect(expenseTx.category_id).toBe(mockFeeCategory.id);
+      expect(expenseTx.account_id).toBe(mockFromAccount.id);
+      expect(expenseTx.to_account_id).toBeNull();
+      expect(expenseTx.client_tx_id).toBe(`${validUlid}:fee`);
+      expect(expenseTx.transfer_group_id).toBe(transferTx.transfer_group_id);
+
+      // Memastikan saldo kedua akun diupdate dengan benar
+      expect(prisma.account.update).toHaveBeenCalledWith({
+        where: { id: mockFromAccount.id, user_id: user.userId },
+        data: { balance: 493500n }, // 1000000 - (500000 + 6500)
+      });
+      expect(prisma.account.update).toHaveBeenCalledWith({
+        where: { id: mockToAccount.id, user_id: user.userId },
+        data: { balance: 500000n }, // 0 + 500000
+      });
+
+      // 2 audit log dibuat
+      expect(prisma.transactionAudit.create).toHaveBeenCalledTimes(2);
+    });
+
+    it('AC-2 (Metode B BUNDLED): transfer amount: 500000, fee: 6500, fee_mode: BUNDLED -> BCA 500000, GoPay 493500, 1 baris TRANSFER tanpa EXPENSE', async () => {
+      prisma.$queryRaw.mockResolvedValue([mockFromAccount, mockToAccount]);
+      prisma.savingsAllocation.groupBy.mockResolvedValue([]);
+
+      const createdTxs: any[] = [];
+      prisma.transaction.create.mockImplementation((args: any) => {
+        const item = {
+          id: 'tx-bundled',
+          ...args.data,
+          created_at: new Date(),
+          updated_at: new Date(),
+        };
+        createdTxs.push(item);
+        return item;
+      });
+
+      const dto = {
+        type: 'TRANSFER' as const,
+        account_id: mockFromAccount.id,
+        to_account_id: mockToAccount.id,
+        amount: 500000,
+        fee: 6500,
+        fee_mode: 'BUNDLED' as const,
+        date: '2026-11-01',
+        client_tx_id: validUlid,
+      };
+
+      const result = await service.create(user, dto);
+
+      expect(result.status).toBe('POSTED');
+      expect(result.amount).toBe(493500); // amountReceived
+      expect(result.transfer_fee).toBe(6500);
+      expect(result.fee_mode).toBe('BUNDLED');
+      expect(result.transfer_group_id).toBeNull();
+
+      expect(createdTxs).toHaveLength(1);
+      expect(createdTxs[0].type).toBe('TRANSFER');
+      expect(createdTxs[0].amount).toBe(493500n);
+      expect(createdTxs[0].transfer_fee).toBe(6500n);
+      expect(createdTxs[0].fee_mode).toBe('BUNDLED');
+      expect(createdTxs[0].transfer_group_id).toBeNull();
+
+      expect(prisma.account.update).toHaveBeenCalledWith({
+        where: { id: mockFromAccount.id, user_id: user.userId },
+        data: { balance: 500000n }, // 1000000 - 500000
+      });
+      expect(prisma.account.update).toHaveBeenCalledWith({
+        where: { id: mockToAccount.id, user_id: user.userId },
+        data: { balance: 493500n }, // 0 + 493500
+      });
+
+      expect(prisma.transactionAudit.create).toHaveBeenCalledTimes(1);
+    });
+
+    it('AC-3: fee = 0 -> hanya 1 baris TRANSFER dibuat, fee_mode null, tanpa baris EXPENSE 0', async () => {
+      prisma.$queryRaw.mockResolvedValue([mockFromAccount, mockToAccount]);
+      prisma.savingsAllocation.groupBy.mockResolvedValue([]);
+
+      const createdTxs: any[] = [];
+      prisma.transaction.create.mockImplementation((args: any) => {
+        const item = {
+          id: 'tx-no-fee',
+          ...args.data,
+          created_at: new Date(),
+          updated_at: new Date(),
+        };
+        createdTxs.push(item);
+        return item;
+      });
+
+      const dto = {
+        type: 'TRANSFER' as const,
+        account_id: mockFromAccount.id,
+        to_account_id: mockToAccount.id,
+        amount: 500000,
+        fee: 0,
+        fee_mode: 'SEPARATE' as const,
+        date: '2026-11-01',
+        client_tx_id: validUlid,
+      };
+
+      const result = await service.create(user, dto);
+
+      expect(result.status).toBe('POSTED');
+      expect(result.amount).toBe(500000);
+      expect(result.transfer_fee).toBe(0);
+      expect(result.fee_mode).toBeNull();
+      expect(result.transfer_group_id).toBeNull();
+
+      expect(createdTxs).toHaveLength(1);
+      expect(createdTxs[0].type).toBe('TRANSFER');
+      expect(createdTxs[0].amount).toBe(500000n);
+      expect(createdTxs[0].transfer_fee).toBe(0n);
+      expect(createdTxs[0].fee_mode).toBeNull();
+      expect(createdTxs[0].transfer_group_id).toBeNull();
+
+      expect(prisma.account.update).toHaveBeenCalledWith({
+        where: { id: mockFromAccount.id, user_id: user.userId },
+        data: { balance: 500000n },
+      });
+      expect(prisma.account.update).toHaveBeenCalledWith({
+        where: { id: mockToAccount.id, user_id: user.userId },
+        data: { balance: 500000n },
+      });
+
+      expect(prisma.transactionAudit.create).toHaveBeenCalledTimes(1);
+    });
+
+    it('AC-4: account_id === to_account_id -> 422 SAME_ACCOUNT_TRANSFER', async () => {
+      const dto = {
+        type: 'TRANSFER' as const,
+        account_id: mockFromAccount.id,
+        to_account_id: mockFromAccount.id,
+        amount: 100000,
+        fee: 0,
+        date: '2026-11-01',
+        client_tx_id: validUlid,
+      };
+
+      await expect(service.create(user, dto)).rejects.toThrow(
+        UnprocessableEntityException,
+      );
+    });
+
+    it('AC-5: available akun sumber 100000, transfer amount: 95000, fee: 10000 (allow_negative = false) -> 409 INSUFFICIENT_BALANCE', async () => {
+      prisma.$queryRaw.mockResolvedValue([
+        { ...mockFromAccount, balance: 100000n },
+        mockToAccount,
+      ]);
+      prisma.savingsAllocation.groupBy.mockResolvedValue([]);
+
+      const dto = {
+        type: 'TRANSFER' as const,
+        account_id: mockFromAccount.id,
+        to_account_id: mockToAccount.id,
+        amount: 95000,
+        fee: 10000,
+        fee_mode: 'SEPARATE' as const,
+        date: '2026-11-01',
+        client_tx_id: validUlid,
+      };
+
+      await expect(service.create(user, dto)).rejects.toThrow(
+        ConflictException,
+      );
+      expect(prisma.account.update).not.toHaveBeenCalled();
+    });
+
+    it('AC-6 (isolasi): transfer dari/ke akun milik user lain -> 404 ACCOUNT_NOT_FOUND', async () => {
+      // Hanya 1 akun ditemukan (akun kedua milik user lain atau tidak ada)
+      prisma.$queryRaw.mockResolvedValue([mockFromAccount]);
+
+      const dto = {
+        type: 'TRANSFER' as const,
+        account_id: mockFromAccount.id,
+        to_account_id: '99999999-9999-9999-9999-999999999999',
+        amount: 50000,
+        fee: 0,
+        date: '2026-11-01',
+        client_tx_id: validUlid,
+      };
+
+      await expect(service.create(user, dto)).rejects.toThrow(
+        NotFoundException,
+      );
+    });
+
+    it('Tolak 409 ACCOUNT_ARCHIVED jika salah satu akun diarsipkan', async () => {
+      prisma.$queryRaw.mockResolvedValue([
+        mockFromAccount,
+        { ...mockToAccount, archived: true },
+      ]);
+
+      const dto = {
+        type: 'TRANSFER' as const,
+        account_id: mockFromAccount.id,
+        to_account_id: mockToAccount.id,
+        amount: 50000,
+        fee: 0,
+        date: '2026-11-01',
+        client_tx_id: validUlid,
+      };
+
+      await expect(service.create(user, dto)).rejects.toThrow(
+        ConflictException,
+      );
+    });
+
+    it('Metode B BUNDLED: tolak 422 VALIDATION_ERROR jika amount <= fee', async () => {
+      const dto = {
+        type: 'TRANSFER' as const,
+        account_id: mockFromAccount.id,
+        to_account_id: mockToAccount.id,
+        amount: 5000,
+        fee: 6500, // 5000 - 6500 = -1500 <= 0
+        fee_mode: 'BUNDLED' as const,
+        date: '2026-11-01',
+        client_tx_id: validUlid,
+      };
+
+      await expect(service.create(user, dto)).rejects.toThrow(
+        UnprocessableEntityException,
+      );
+    });
+
+    it('Metode A SEPARATE: auto-unarchive kategori sistem Biaya Transfer jika terarsip', async () => {
+      prisma.$queryRaw.mockResolvedValue([mockFromAccount, mockToAccount]);
+      prisma.category.findFirst.mockResolvedValue({
+        ...mockFeeCategory,
+        archived: true,
+      });
+      prisma.category.update.mockResolvedValue({
+        ...mockFeeCategory,
+        archived: false,
+      });
+      prisma.savingsAllocation.groupBy.mockResolvedValue([]);
+      prisma.transaction.create.mockImplementation((args: any) => ({
+        id: 'tx-unarchive',
+        ...args.data,
+        created_at: new Date(),
+        updated_at: new Date(),
+      }));
+
+      const dto = {
+        type: 'TRANSFER' as const,
+        account_id: mockFromAccount.id,
+        to_account_id: mockToAccount.id,
+        amount: 50000,
+        fee: 2500,
+        fee_mode: 'SEPARATE' as const,
+        date: '2026-11-01',
+        client_tx_id: validUlid,
+      };
+
+      await service.create(user, dto);
+
+      expect(prisma.category.update).toHaveBeenCalledWith({
+        where: { id: mockFeeCategory.id },
+        data: { archived: false, archived_at: null },
+      });
+    });
+
+    it('Metode A SEPARATE: tolak 422 CATEGORY_ARCHIVED jika custom fee_category_id diarsipkan', async () => {
+      prisma.$queryRaw.mockResolvedValue([mockFromAccount, mockToAccount]);
+      prisma.category.findFirst.mockResolvedValue({
+        id: 'custom-fee-cat',
+        type: 'EXPENSE',
+        archived: true,
+      });
+
+      const dto = {
+        type: 'TRANSFER' as const,
+        account_id: mockFromAccount.id,
+        to_account_id: mockToAccount.id,
+        amount: 50000,
+        fee: 2500,
+        fee_mode: 'SEPARATE' as const,
+        fee_category_id: 'custom-fee-cat',
+        date: '2026-11-01',
+        client_tx_id: validUlid,
+      };
+
+      await expect(service.create(user, dto)).rejects.toThrow(
+        UnprocessableEntityException,
+      );
+    });
+
+    it('Transfer date > today berstatus SCHEDULED dan saldo akun TIDAK berubah', async () => {
+      prisma.$queryRaw.mockResolvedValue([
+        { ...mockFromAccount, balance: 0n },
+        mockToAccount,
+      ]);
+      prisma.savingsAllocation.groupBy.mockResolvedValue([]);
+      prisma.transaction.create.mockImplementation((args: any) => ({
+        id: 'tx-sched',
+        ...args.data,
+        created_at: new Date(),
+        updated_at: new Date(),
+      }));
+
+      const dto = {
+        type: 'TRANSFER' as const,
+        account_id: mockFromAccount.id,
+        to_account_id: mockToAccount.id,
+        amount: 50000,
+        fee: 0,
+        date: '2099-12-31', // date > today
+        client_tx_id: validUlid,
+      };
+
+      const result = await service.create(user, dto);
+
+      expect(result.status).toBe('SCHEDULED');
+      expect(prisma.account.update).not.toHaveBeenCalled();
+    });
+
+    it('Transfer akun allow_negative = true berhasil dan menghasilkan warning NEGATIVE_BALANCE jika saldo akhir < 0', async () => {
+      prisma.$queryRaw.mockResolvedValue([
+        { ...mockFromAccount, balance: 30000n, allow_negative: true },
+        mockToAccount,
+      ]);
+      prisma.savingsAllocation.groupBy.mockResolvedValue([]);
+      prisma.transaction.create.mockImplementation((args: any) => ({
+        id: 'tx-neg',
+        ...args.data,
+        created_at: new Date(),
+        updated_at: new Date(),
+      }));
+
+      const dto = {
+        type: 'TRANSFER' as const,
+        account_id: mockFromAccount.id,
+        to_account_id: mockToAccount.id,
+        amount: 50000, // 30000 - 50000 = -20000 (< 0)
+        fee: 0,
+        date: '2026-11-01',
+        client_tx_id: validUlid,
+      };
+
+      const result = await service.create(user, dto);
+
+      expect(result.status).toBe('POSTED');
+      expect(result.warning).toBe('NEGATIVE_BALANCE');
+      expect(prisma.account.update).toHaveBeenCalledWith({
+        where: { id: mockFromAccount.id, user_id: user.userId },
+        data: { balance: -20000n },
+      });
     });
   });
 });
