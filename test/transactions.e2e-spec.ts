@@ -589,4 +589,236 @@ describe('Transactions E2E Test Suite (Supertest)', () => {
     expect(res.status).toBe(201);
     expect(res.body.warning).toBe('NEGATIVE_BALANCE');
   });
+
+  describe('EXPENSE Endpoints (TASK-041)', () => {
+    it('AC-1: Akun balance = 100000, reserved = 0, allow_negative = false -> POST expense 40000 -> 201, status POSTED, balance 60000, 1 audit log', async () => {
+      const acc = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Akun Expense AC1 ' + Date.now(),
+          type: 'BANK',
+          opening_balance: 100000n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 100000n,
+          allow_negative: false,
+        },
+      });
+
+      const clientTxId = generateTestUlid();
+      const res = await request(app.getHttpServer())
+        .post('/transactions')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          type: 'EXPENSE',
+          amount: 40000,
+          account_id: acc.id,
+          category_id: expenseCategoryA.id,
+          date: '2026-11-01',
+          client_tx_id: clientTxId,
+        });
+
+      expect(res.status).toBe(201);
+      expect(res.body.id).toBeDefined();
+      expect(res.body.status).toBe('POSTED');
+      expect(res.body.amount).toBe(40000);
+      expect(res.body.client_tx_id).toBe(clientTxId);
+
+      // Cek saldo akhir = 60000
+      const updatedAcc = await prisma.account.findFirst({
+        where: { id: acc.id, user_id: userAId },
+      });
+      expect(updatedAcc?.balance).toBe(60000n);
+
+      // Cek 1 baris TransactionAudit
+      const audits = await prisma.asSystem().transactionAudit.findMany({
+        where: { transaction_id: res.body.id },
+      });
+      expect(audits).toHaveLength(1);
+      expect(audits[0].action).toBe('CREATE');
+      expect(audits[0].before).toBeNull();
+      expect((audits[0].after as any).amount).toBe(40000);
+    });
+
+    it('AC-2: Akun balance = 100000 dengan alokasi tabungan ACTIVE 70000 (available = 30000, allow_negative = false) -> POST expense 50000 -> 409 INSUFFICIENT_BALANCE', async () => {
+      const acc = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Akun Expense AC2 ' + Date.now(),
+          type: 'BANK',
+          opening_balance: 100000n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 100000n,
+          allow_negative: false,
+        },
+      });
+
+      const goal = await prisma.savingsGoal.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Target Tabungan ' + Date.now(),
+          target_amount: 500000n,
+        },
+      });
+
+      await prisma.savingsAllocation.create({
+        data: {
+          savings_goal_id: goal.id,
+          account_id: acc.id,
+          amount: 70000n,
+          status: 'ACTIVE',
+        },
+      });
+
+      const res = await request(app.getHttpServer())
+        .post('/transactions')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          type: 'EXPENSE',
+          amount: 50000,
+          account_id: acc.id,
+          category_id: expenseCategoryA.id,
+          date: '2026-11-01',
+          client_tx_id: generateTestUlid(),
+        });
+
+      expect(res.status).toBe(409);
+      expect(res.body.code).toBe('INSUFFICIENT_BALANCE');
+      expect(res.body.details).toEqual({
+        available: 30000,
+        needed: 50000,
+        account_id: acc.id,
+      });
+
+      // Saldo akun tidak berubah
+      const unchangedAcc = await prisma.account.findFirst({
+        where: { id: acc.id, user_id: userAId },
+      });
+      expect(unchangedAcc?.balance).toBe(100000n);
+    });
+
+    it('AC-3: Akun balance = 30000, allow_negative = true -> POST expense 50000 -> 201 dengan warning NEGATIVE_BALANCE, balance menjadi -20000', async () => {
+      const acc = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Akun Expense AC3 ' + Date.now(),
+          type: 'BANK',
+          opening_balance: 30000n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 30000n,
+          allow_negative: true,
+        },
+      });
+
+      const res = await request(app.getHttpServer())
+        .post('/transactions')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          type: 'EXPENSE',
+          amount: 50000,
+          account_id: acc.id,
+          category_id: expenseCategoryA.id,
+          date: '2026-11-01',
+          client_tx_id: generateTestUlid(),
+        });
+
+      expect(res.status).toBe(201);
+      expect(res.body.warning).toBe('NEGATIVE_BALANCE');
+
+      const updatedAcc = await prisma.account.findFirst({
+        where: { id: acc.id, user_id: userAId },
+      });
+      expect(updatedAcc?.balance).toBe(-20000n);
+    });
+
+    it('AC-4: category_id bertipe INCOME -> 400 INVALID_CATEGORY_TYPE', async () => {
+      const res = await request(app.getHttpServer())
+        .post('/transactions')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          type: 'EXPENSE',
+          amount: 50000,
+          account_id: userAAccount.id,
+          category_id: incomeCategoryA.id,
+          date: '2026-11-01',
+          client_tx_id: generateTestUlid(),
+        });
+
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe('INVALID_CATEGORY_TYPE');
+    });
+
+    it('AC-5: date > today pada akun bersaldo 0 (allow_negative = false) -> 201, status SCHEDULED, saldo tetap 0', async () => {
+      const acc = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Akun Expense AC5 ' + Date.now(),
+          type: 'BANK',
+          opening_balance: 0n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 0n,
+          allow_negative: false,
+        },
+      });
+
+      const res = await request(app.getHttpServer())
+        .post('/transactions')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          type: 'EXPENSE',
+          amount: 50000,
+          account_id: acc.id,
+          category_id: expenseCategoryA.id,
+          date: '2099-12-31',
+          client_tx_id: generateTestUlid(),
+        });
+
+      expect(res.status).toBe(201);
+      expect(res.body.status).toBe('SCHEDULED');
+
+      const unchangedAcc = await prisma.account.findFirst({
+        where: { id: acc.id, user_id: userAId },
+      });
+      expect(unchangedAcc?.balance).toBe(0n);
+    });
+
+    it('AC-6 (isolasi): Expense menggunakan account_id atau category_id milik user lain -> 404', async () => {
+      // 1. account milik User B
+      const resAcc = await request(app.getHttpServer())
+        .post('/transactions')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          type: 'EXPENSE',
+          amount: 10000,
+          account_id: userBAccount.id,
+          category_id: expenseCategoryA.id,
+          date: '2026-11-01',
+          client_tx_id: generateTestUlid(),
+        });
+      expect(resAcc.status).toBe(404);
+      expect(resAcc.body.code).toBe('ACCOUNT_NOT_FOUND');
+
+      // 2. category milik User B
+      const catB = await prisma.category.findFirst({
+        where: { user_id: userBId, type: 'EXPENSE' },
+      });
+      const resCat = await request(app.getHttpServer())
+        .post('/transactions')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          type: 'EXPENSE',
+          amount: 10000,
+          account_id: userAAccount.id,
+          category_id: catB!.id,
+          date: '2026-11-01',
+          client_tx_id: generateTestUlid(),
+        });
+      expect(resCat.status).toBe(404);
+      expect(resCat.body.code).toBe('CATEGORY_NOT_FOUND');
+    });
+  });
 });

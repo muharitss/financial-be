@@ -10,6 +10,7 @@ import { Prisma } from '@prisma/client';
 import {
   TransactionsService,
   toTransactionResponse,
+  getAccountReserved,
 } from './transactions.service.js';
 import {
   resolveClientTxId,
@@ -57,6 +58,9 @@ describe('TransactionsService', () => {
       },
       transactionAudit: {
         create: jest.fn<any>(),
+      },
+      savingsAllocation: {
+        groupBy: jest.fn<any>().mockResolvedValue([]),
       },
       $queryRaw: jest.fn<any>(),
       $transaction: jest.fn(async (cb: any) => cb(prisma)),
@@ -433,6 +437,196 @@ describe('TransactionsService', () => {
       await expect(service.create(user, dto)).rejects.toThrow(
         ConflictException,
       );
+    });
+  });
+
+  describe('getAccountReserved', () => {
+    it('mengembalikan jumlah amount aktif dari savings_allocations', async () => {
+      prisma.savingsAllocation.groupBy.mockResolvedValue([
+        { _sum: { amount: 75000n } },
+      ]);
+      const res = await getAccountReserved(prisma, 'acc-1');
+      expect(res).toBe(75000n);
+    });
+
+    it('mengembalikan 0n jika tidak ada alokasi aktif', async () => {
+      prisma.savingsAllocation.groupBy.mockResolvedValue([]);
+      const res = await getAccountReserved(prisma, 'acc-1');
+      expect(res).toBe(0n);
+    });
+  });
+
+  describe('createExpense', () => {
+    const expenseCategory = {
+      id: '55555555-5555-5555-5555-555555555555',
+      type: 'EXPENSE',
+      archived: false,
+    };
+
+    it('AC-1: berhasil membuat expense posted, saldo berkurang, audit log tercatat', async () => {
+      prisma.$queryRaw.mockResolvedValue([mockAccount]); // balance: 100000n
+      prisma.category.findFirst.mockResolvedValue(expenseCategory);
+      prisma.savingsAllocation.groupBy.mockResolvedValue([]); // reserved: 0n
+      prisma.transaction.create.mockImplementation((args: any) => ({
+        id: 'tx-exp-1',
+        ...args.data,
+        created_at: new Date(),
+        updated_at: new Date(),
+      }));
+
+      const dto = {
+        type: 'EXPENSE' as const,
+        amount: 40000,
+        account_id: mockAccount.id,
+        category_id: expenseCategory.id,
+        date: '2026-11-01',
+        client_tx_id: validUlid,
+      };
+
+      const result = await service.create(user, dto);
+
+      expect(result.status).toBe('POSTED');
+      expect(result.amount).toBe(40000);
+      expect(prisma.account.update).toHaveBeenCalledWith({
+        where: { id: mockAccount.id, user_id: user.userId },
+        data: { balance: 60000n }, // 100000n - 40000n
+      });
+
+      expect(prisma.transactionAudit.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            transaction_id: 'tx-exp-1',
+            action: 'CREATE',
+            before: Prisma.DbNull,
+          }),
+        }),
+      );
+    });
+
+    it('AC-2: tolak 409 INSUFFICIENT_BALANCE jika amount > available_balance (allow_negative = false)', async () => {
+      prisma.$queryRaw.mockResolvedValue([mockAccount]); // balance: 100000n
+      prisma.category.findFirst.mockResolvedValue(expenseCategory);
+      prisma.savingsAllocation.groupBy.mockResolvedValue([
+        { _sum: { amount: 70000n } }, // reserved: 70000n -> available: 30000n
+      ]);
+
+      const dto = {
+        type: 'EXPENSE' as const,
+        amount: 50000, // 50000 > available (30000)
+        account_id: mockAccount.id,
+        category_id: expenseCategory.id,
+        date: '2026-11-01',
+        client_tx_id: validUlid,
+      };
+
+      await expect(service.create(user, dto)).rejects.toThrow(
+        ConflictException,
+      );
+
+      try {
+        await service.create(user, dto);
+      } catch (err: any) {
+        expect(err.getResponse()).toEqual({
+          code: 'INSUFFICIENT_BALANCE',
+          message: 'Saldo tersedia tidak mencukupi',
+          details: {
+            available: 30000,
+            needed: 50000,
+            account_id: mockAccount.id,
+          },
+        });
+      }
+
+      expect(prisma.account.update).not.toHaveBeenCalled();
+    });
+
+    it('AC-3: akun allow_negative = true berhasil dan menghasilkan warning NEGATIVE_BALANCE', async () => {
+      prisma.$queryRaw.mockResolvedValue([
+        {
+          ...mockAccount,
+          balance: 30000n,
+          allow_negative: true,
+        },
+      ]);
+      prisma.category.findFirst.mockResolvedValue(expenseCategory);
+      prisma.savingsAllocation.groupBy.mockResolvedValue([]);
+      prisma.transaction.create.mockImplementation((args: any) => ({
+        id: 'tx-exp-neg',
+        ...args.data,
+        created_at: new Date(),
+        updated_at: new Date(),
+      }));
+
+      const dto = {
+        type: 'EXPENSE' as const,
+        amount: 50000, // 30000 - 50000 = -20000 (< 0)
+        account_id: mockAccount.id,
+        category_id: expenseCategory.id,
+        date: '2026-11-01',
+        client_tx_id: validUlid,
+      };
+
+      const result = await service.create(user, dto);
+
+      expect(result.status).toBe('POSTED');
+      expect(result.warning).toBe('NEGATIVE_BALANCE');
+      expect(prisma.account.update).toHaveBeenCalledWith({
+        where: { id: mockAccount.id, user_id: user.userId },
+        data: { balance: -20000n },
+      });
+    });
+
+    it('AC-4: tolak 400 INVALID_CATEGORY_TYPE jika kategori bertipe INCOME', async () => {
+      prisma.$queryRaw.mockResolvedValue([mockAccount]);
+      prisma.category.findFirst.mockResolvedValue({
+        id: 'cat-income',
+        type: 'INCOME',
+        archived: false,
+      });
+
+      const dto = {
+        type: 'EXPENSE' as const,
+        amount: 10000,
+        account_id: mockAccount.id,
+        category_id: 'cat-income',
+        date: '2026-11-01',
+        client_tx_id: validUlid,
+      };
+
+      await expect(service.create(user, dto)).rejects.toThrow(
+        BadRequestException,
+      );
+    });
+
+    it('AC-5: expense date > today berstatus SCHEDULED dan saldo akun TIDAK berubah meski saldo 0', async () => {
+      prisma.$queryRaw.mockResolvedValue([
+        {
+          ...mockAccount,
+          balance: 0n,
+          allow_negative: false,
+        },
+      ]);
+      prisma.category.findFirst.mockResolvedValue(expenseCategory);
+      prisma.transaction.create.mockImplementation((args: any) => ({
+        id: 'tx-exp-sched',
+        ...args.data,
+        created_at: new Date(),
+        updated_at: new Date(),
+      }));
+
+      const dto = {
+        type: 'EXPENSE' as const,
+        amount: 50000,
+        account_id: mockAccount.id,
+        category_id: expenseCategory.id,
+        date: '2099-12-31', // date > today
+        client_tx_id: validUlid,
+      };
+
+      const result = await service.create(user, dto);
+
+      expect(result.status).toBe('SCHEDULED');
+      expect(prisma.account.update).not.toHaveBeenCalled();
     });
   });
 });

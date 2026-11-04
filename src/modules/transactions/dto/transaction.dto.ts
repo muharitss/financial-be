@@ -55,8 +55,24 @@ export const createIncomeSchema = z
 
 export type CreateIncomeDto = z.infer<typeof createIncomeSchema>;
 
+export const createExpenseSchema = z
+  .object({
+    type: z.literal('EXPENSE'),
+    amount: z.number().int().positive(),
+    account_id: z.uuid(),
+    category_id: z.uuid(),
+    date: z.iso.date(),
+    note: z.string().trim().max(500).optional(),
+    tags: z.array(z.uuid()).max(10).optional(),
+    client_tx_id: z.string().regex(ULID_REGEX).optional(),
+  })
+  .strict();
+
+export type CreateExpenseDto = z.infer<typeof createExpenseSchema>;
+
 export const createTransactionSchema = z.discriminatedUnion('type', [
   createIncomeSchema,
+  createExpenseSchema,
 ]);
 
 export type CreateTransactionDto = z.infer<typeof createTransactionSchema>;

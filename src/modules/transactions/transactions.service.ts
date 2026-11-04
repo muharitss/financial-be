@@ -12,6 +12,7 @@ import {
   resolveClientTxId,
   type CreateTransactionDto,
   type CreateIncomeDto,
+  type CreateExpenseDto,
 } from './dto/transaction.dto.js';
 
 export interface TransactionResponse {
@@ -110,6 +111,23 @@ export function toTransactionResponse(
   return res;
 }
 
+export async function getAccountReserved(
+  tx: Prisma.TransactionClient,
+  accountId: string,
+): Promise<bigint> {
+  const allocation = await tx.savingsAllocation.groupBy({
+    by: ['account_id'],
+    where: {
+      account_id: accountId,
+      status: 'ACTIVE',
+    },
+    _sum: {
+      amount: true,
+    },
+  });
+  return allocation[0]?._sum.amount ?? 0n;
+}
+
 @Injectable()
 export class TransactionsService {
   constructor(private readonly prisma: PrismaService) {}
@@ -121,6 +139,9 @@ export class TransactionsService {
   ): Promise<TransactionResponse> {
     if (dto.type === 'INCOME') {
       return this.createIncome(user, dto, headerIdempotencyKey);
+    }
+    if (dto.type === 'EXPENSE') {
+      return this.createExpense(user, dto, headerIdempotencyKey);
     }
 
     throw new BadRequestException({
@@ -253,6 +274,198 @@ export class TransactionsService {
         let finalBalance = account.balance;
         if (status === 'POSTED') {
           finalBalance = account.balance + BigInt(dto.amount);
+          await tx.account.update({
+            where: { id: account.id, user_id: user.userId },
+            data: { balance: finalBalance },
+          });
+        }
+
+        let warning: string | undefined;
+        if (status === 'POSTED' && finalBalance < 0n) {
+          warning = 'NEGATIVE_BALANCE';
+        }
+
+        // 8. Buat TransactionAudit (C-06, NFR-TRX-005)
+        const response = toTransactionResponse(
+          {
+            ...created,
+            tags: tagIds,
+          },
+          warning,
+        );
+
+        await tx.transactionAudit.create({
+          data: {
+            transaction_id: created.id,
+            action: 'CREATE',
+            before: Prisma.DbNull,
+            after: response as unknown as Prisma.InputJsonValue,
+            actor_user_id: user.userId,
+          },
+        });
+
+        return response;
+      });
+    } catch (error: any) {
+      if (
+        error instanceof Prisma.PrismaClientKnownRequestError &&
+        error.code === 'P2002'
+      ) {
+        throw new ConflictException({
+          code: 'CLIENT_TX_ID_DUPLICATE',
+          message: 'client_tx_id sudah pernah digunakan',
+        });
+      }
+      throw error;
+    }
+  }
+
+  private async createExpense(
+    user: { userId: string; role?: string },
+    dto: CreateExpenseDto,
+    headerIdempotencyKey?: string,
+  ): Promise<TransactionResponse> {
+    const clientTxId = resolveClientTxId(dto.client_tx_id, headerIdempotencyKey);
+
+    const pref = await this.prisma.userPreference.findFirst({
+      where: { user_id: user.userId },
+    });
+    const tz = pref?.timezone ?? 'Asia/Jakarta';
+    const today = todayInTz(tz);
+
+    try {
+      return await this.prisma.$transaction(async (tx) => {
+        // 1. Kunci baris akun dengan SELECT ... FOR UPDATE
+        const accounts = await tx.$queryRaw<
+          Array<{
+            id: string;
+            financial_profile_id: string;
+            balance: bigint;
+            allow_negative: boolean;
+            archived: boolean;
+          }>
+        >`SELECT id, financial_profile_id, balance, allow_negative, archived FROM accounts WHERE id = ${dto.account_id}::uuid AND user_id = ${user.userId}::uuid FOR UPDATE`;
+
+        const account = accounts[0];
+        if (!account) {
+          throw new NotFoundException({
+            code: 'ACCOUNT_NOT_FOUND',
+            message: 'Akun tidak ditemukan',
+          });
+        }
+
+        if (account.archived) {
+          throw new ConflictException({
+            code: 'ACCOUNT_ARCHIVED',
+            message: 'Akun telah diarsipkan',
+          });
+        }
+
+        // 2. Cek kategori
+        const category = await tx.category.findFirst({
+          where: { id: dto.category_id, user_id: user.userId },
+        });
+
+        if (!category) {
+          throw new NotFoundException({
+            code: 'CATEGORY_NOT_FOUND',
+            message: 'Kategori tidak ditemukan',
+          });
+        }
+
+        if (category.archived) {
+          throw new UnprocessableEntityException({
+            code: 'CATEGORY_ARCHIVED',
+            message: 'Kategori telah diarsipkan',
+          });
+        }
+
+        if (category.type !== 'EXPENSE') {
+          throw new BadRequestException({
+            code: 'INVALID_CATEGORY_TYPE',
+            message: 'Kategori harus bertipe EXPENSE',
+          });
+        }
+
+        // 3. Cek tags jika ada
+        let tagIds: string[] = [];
+        if (dto.tags && dto.tags.length > 0) {
+          tagIds = Array.from(new Set(dto.tags));
+          const tags = await tx.tag.findMany({
+            where: { id: { in: tagIds }, user_id: user.userId },
+          });
+
+          if (tags.length !== tagIds.length) {
+            throw new NotFoundException({
+              code: 'TAG_NOT_FOUND',
+              message: 'Tag tidak ditemukan',
+            });
+          }
+
+          if (tags.some((t) => t.archived)) {
+            throw new UnprocessableEntityException({
+              code: 'TAG_ARCHIVED',
+              message: 'Tag telah diarsipkan',
+            });
+          }
+        }
+
+        // 4. Hitung status: scheduled vs posted (C-04)
+        const isScheduled = dto.date > today;
+        const status: TransactionStatus = isScheduled ? 'SCHEDULED' : 'POSTED';
+
+        // Pengecekan saldo hanya untuk transaksi efektif (status === POSTED)
+        if (status === 'POSTED') {
+          const reserved = await getAccountReserved(tx, account.id);
+          const available = account.balance - reserved;
+          const needed = BigInt(dto.amount);
+
+          if (
+            !account.allow_negative &&
+            (needed > available || account.balance - needed < 0n)
+          ) {
+            throw new ConflictException({
+              code: 'INSUFFICIENT_BALANCE',
+              message: 'Saldo tersedia tidak mencukupi',
+              details: {
+                available: Number(available),
+                needed: dto.amount,
+                account_id: account.id,
+              },
+            });
+          }
+        }
+
+        // 5. Buat Transaction
+        const created = await tx.transaction.create({
+          data: {
+            user_id: user.userId,
+            financial_profile_id: account.financial_profile_id,
+            account_id: account.id,
+            type: 'EXPENSE',
+            amount: BigInt(dto.amount),
+            date: new Date(`${dto.date}T00:00:00.000Z`),
+            status,
+            category_id: dto.category_id,
+            note: dto.note ?? null,
+            client_tx_id: clientTxId,
+          },
+        });
+
+        // 6. Relasi tag
+        if (tagIds.length > 0) {
+          await tx.transactionTag.createMany({
+            data: tagIds.map((tag_id) => ({
+              transaction_id: created.id,
+              tag_id,
+            })),
+          });
+        }
+
+        // 7. Update balance akun jika POSTED
+        let finalBalance = account.balance;
+        if (status === 'POSTED') {
+          finalBalance = account.balance - BigInt(dto.amount);
           await tx.account.update({
             where: { id: account.id, user_id: user.userId },
             data: { balance: finalBalance },
