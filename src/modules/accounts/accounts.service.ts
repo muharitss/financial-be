@@ -344,6 +344,82 @@ export class AccountsService {
     });
   }
 
+  async setAllowNegative(
+    user: { userId: string; role?: string },
+    accountId: string,
+    allowNegative: boolean,
+  ): Promise<AccountResponse> {
+    return this.prisma.$transaction(async (tx) => {
+      const account = await tx.account.findFirst({
+        where: {
+          id: accountId,
+          user_id: user.userId,
+        },
+      });
+
+      if (!account) {
+        throw new NotFoundException({
+          code: 'ACCOUNT_NOT_FOUND',
+          message: 'Akun tidak ditemukan',
+        });
+      }
+
+      if (account.archived) {
+        throw new ConflictException({
+          code: 'ACCOUNT_ARCHIVED',
+          message: 'Akun sudah diarsipkan',
+        });
+      }
+
+      const allocation = await tx.savingsAllocation.groupBy({
+        by: ['account_id'],
+        where: {
+          account_id: accountId,
+          status: 'ACTIVE',
+        },
+        _sum: {
+          amount: true,
+        },
+      });
+      const reserved = allocation[0]?._sum.amount ?? 0n;
+
+      if (account.allow_negative === allowNegative) {
+        return toAccountResponse(account, reserved);
+      }
+
+      if (!allowNegative && account.balance < 0n) {
+        throw new ConflictException({
+          code: 'NEGATIVE_BALANCE_EXISTS',
+          message: 'Saldo akun masih negatif. Sesuaikan saldo dulu.',
+        });
+      }
+
+      const updated = await tx.account.update({
+        where: {
+          id: accountId,
+          user_id: user.userId,
+        },
+        data: {
+          allow_negative: allowNegative,
+        },
+      });
+
+      await tx.auditLog.create({
+        data: {
+          action: 'ACCOUNT_ALLOW_NEGATIVE_UPDATE',
+          resource_type: 'account',
+          resource_id: account.id,
+          actor_user_id: user.userId,
+          actor_role: user.role ?? 'USER',
+          before: { allow_negative: account.allow_negative },
+          after: { allow_negative: updated.allow_negative },
+        },
+      });
+
+      return toAccountResponse(updated, reserved);
+    });
+  }
+
   async getOwnedAccount(userId: string, accountId: string) {
     const account = await this.prisma.account.findFirst({
       where: {

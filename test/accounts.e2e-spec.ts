@@ -815,4 +815,169 @@ describe('Accounts E2E Test Suite (Supertest)', () => {
     const acc = await prisma.account.findFirst({ where: { id: accountId, user_id: userAId } });
     expect(acc?.archived).toBe(false);
   });
+
+  describe('PATCH /accounts/:id/allow-negative', () => {
+    it('AC-1 & AC-2: PATCH { allow_negative: true } -> 200, audit log tercatat; request ulang idempoten tanpa audit baru', async () => {
+      const resCreate = await request(app.getHttpServer())
+        .post('/accounts')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          name: 'Akun Negatif Test',
+          type: 'BANK',
+          opening_balance: 100000,
+        });
+      expect(resCreate.status).toBe(201);
+      const accountId = resCreate.body.id;
+      expect(resCreate.body.allow_negative).toBe(false);
+
+      // AC-1: aktifkan allow_negative
+      const resPatch1 = await request(app.getHttpServer())
+        .patch(`/accounts/${accountId}/allow-negative`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({ allow_negative: true });
+
+      expect(resPatch1.status).toBe(200);
+      expect(resPatch1.body.allow_negative).toBe(true);
+
+      const audits = await prisma.auditLog.findMany({
+        where: {
+          resource_id: accountId,
+          action: 'ACCOUNT_ALLOW_NEGATIVE_UPDATE',
+        },
+      });
+      expect(audits).toHaveLength(1);
+      expect(audits[0].before).toEqual({ allow_negative: false });
+      expect(audits[0].after).toEqual({ allow_negative: true });
+
+      // AC-2: request ulang sama -> idempoten, 200, tanpa audit baru
+      const resPatch2 = await request(app.getHttpServer())
+        .patch(`/accounts/${accountId}/allow-negative`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({ allow_negative: true });
+
+      expect(resPatch2.status).toBe(200);
+      expect(resPatch2.body.allow_negative).toBe(true);
+
+      const auditsAfter = await prisma.auditLog.findMany({
+        where: {
+          resource_id: accountId,
+          action: 'ACCOUNT_ALLOW_NEGATIVE_UPDATE',
+        },
+      });
+      expect(auditsAfter).toHaveLength(1);
+    });
+
+    it('AC-3: Saldo negatif (balance < 0) -> PATCH { allow_negative: false } -> 409 NEGATIVE_BALANCE_EXISTS', async () => {
+      const resCreate = await request(app.getHttpServer())
+        .post('/accounts')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          name: 'Akun Minus Test',
+          type: 'EWALLET',
+          opening_balance: 10000,
+        });
+      expect(resCreate.status).toBe(201);
+      const accountId = resCreate.body.id;
+
+      // Izinkan negatif dulu
+      await request(app.getHttpServer())
+        .patch(`/accounts/${accountId}/allow-negative`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({ allow_negative: true });
+
+      // Buat saldo < 0 via prisma
+      await prisma.account.update({
+        where: { id: accountId, user_id: userAId },
+        data: { balance: -50000n },
+      });
+
+      // Coba matikan allow_negative
+      const resDisable = await request(app.getHttpServer())
+        .patch(`/accounts/${accountId}/allow-negative`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({ allow_negative: false });
+
+      expect(resDisable.status).toBe(409);
+      expect(resDisable.body.code).toBe('NEGATIVE_BALANCE_EXISTS');
+
+      const acc = await prisma.account.findFirst({ where: { id: accountId, user_id: userAId } });
+      expect(acc?.allow_negative).toBe(true);
+    });
+
+    it('AC-4: Body { allow_negative: "yes" } atau field tambahan -> 400 VALIDATION_ERROR', async () => {
+      const resCreate = await request(app.getHttpServer())
+        .post('/accounts')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          name: 'Akun Schema Test',
+          type: 'CASH',
+          opening_balance: 10000,
+        });
+      expect(resCreate.status).toBe(201);
+      const accountId = resCreate.body.id;
+
+      const resString = await request(app.getHttpServer())
+        .patch(`/accounts/${accountId}/allow-negative`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({ allow_negative: 'yes' });
+      expect(resString.status).toBe(400);
+      expect(resString.body.code).toBe('VALIDATION_ERROR');
+
+      const resExtra = await request(app.getHttpServer())
+        .patch(`/accounts/${accountId}/allow-negative`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({ allow_negative: true, extra_field: 'illegal' });
+      expect(resExtra.status).toBe(400);
+      expect(resExtra.body.code).toBe('VALIDATION_ERROR');
+    });
+
+    it('AC-5: Akun diarsipkan -> 409 ACCOUNT_ARCHIVED', async () => {
+      const resCreate = await request(app.getHttpServer())
+        .post('/accounts')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          name: 'Akun Arsip Negatif Test',
+          type: 'BANK',
+          opening_balance: 10000,
+        });
+      expect(resCreate.status).toBe(201);
+      const accountId = resCreate.body.id;
+
+      await request(app.getHttpServer())
+        .post(`/accounts/${accountId}/archive`)
+        .set('Cookie', userAHeaders.cookie);
+
+      const resPatch = await request(app.getHttpServer())
+        .patch(`/accounts/${accountId}/allow-negative`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({ allow_negative: true });
+
+      expect(resPatch.status).toBe(409);
+      expect(resPatch.body.code).toBe('ACCOUNT_ARCHIVED');
+    });
+
+    it('AC-6 (isolasi): User B mengubah allow_negative akun user A -> 404 ACCOUNT_NOT_FOUND', async () => {
+      const resCreate = await request(app.getHttpServer())
+        .post('/accounts')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          name: 'Akun User A Private Negatif',
+          type: 'BANK',
+          opening_balance: 10000,
+        });
+      expect(resCreate.status).toBe(201);
+      const accountId = resCreate.body.id;
+
+      const resAttack = await request(app.getHttpServer())
+        .patch(`/accounts/${accountId}/allow-negative`)
+        .set('Cookie', userBHeaders.cookie)
+        .send({ allow_negative: true });
+
+      expect(resAttack.status).toBe(404);
+      expect(resAttack.body.code).toBe('ACCOUNT_NOT_FOUND');
+
+      const acc = await prisma.account.findFirst({ where: { id: accountId, user_id: userAId } });
+      expect(acc?.allow_negative).toBe(false);
+    });
+  });
 });

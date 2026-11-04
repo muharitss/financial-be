@@ -545,4 +545,111 @@ describe('AccountsService', () => {
       );
     });
   });
+
+  describe('setAllowNegative', () => {
+    const user = { userId: 'user-1', role: 'USER' };
+    const baseAccount = {
+      id: 'acc-1',
+      user_id: 'user-1',
+      name: 'Dompet',
+      type: 'CASH',
+      provider: null,
+      note: null,
+      opening_balance: 100000n,
+      opening_date: new Date('2026-11-04T00:00:00.000Z'),
+      balance: 100000n,
+      allow_negative: false,
+      archived: false,
+      archived_at: null,
+      created_at: new Date('2026-11-04T00:00:00.000Z'),
+      updated_at: new Date('2026-11-04T00:00:00.000Z'),
+    };
+
+    it('berhasil mengaktifkan allow_negative dan mencatat audit log (AC-1)', async () => {
+      prisma.account.findFirst.mockResolvedValue(baseAccount);
+      prisma.savingsAllocation.groupBy.mockResolvedValue([]);
+      prisma.account.update.mockResolvedValue({
+        ...baseAccount,
+        allow_negative: true,
+      });
+      prisma.auditLog.create.mockResolvedValue({ id: 'audit-1' });
+
+      const res = await service.setAllowNegative(user, 'acc-1', true);
+
+      expect(res.allow_negative).toBe(true);
+      expect(prisma.account.update).toHaveBeenCalledWith({
+        where: { id: 'acc-1', user_id: 'user-1' },
+        data: { allow_negative: true },
+      });
+      expect(prisma.auditLog.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          action: 'ACCOUNT_ALLOW_NEGATIVE_UPDATE',
+          resource_type: 'account',
+          resource_id: 'acc-1',
+          actor_user_id: 'user-1',
+          before: { allow_negative: false },
+          after: { allow_negative: true },
+        }),
+      });
+    });
+
+    it('idempoten jika nilai allow_negative sama: return state sekarang tanpa update/audit baru (AC-2)', async () => {
+      prisma.account.findFirst.mockResolvedValue(baseAccount);
+      prisma.savingsAllocation.groupBy.mockResolvedValue([]);
+
+      const res = await service.setAllowNegative(user, 'acc-1', false);
+
+      expect(res.allow_negative).toBe(false);
+      expect(prisma.account.update).not.toHaveBeenCalled();
+      expect(prisma.auditLog.create).not.toHaveBeenCalled();
+    });
+
+    it('melempar ConflictException NEGATIVE_BALANCE_EXISTS jika mematikan saat saldo negatif (AC-3)', async () => {
+      prisma.account.findFirst.mockResolvedValue({
+        ...baseAccount,
+        balance: -50000n,
+        allow_negative: true,
+      });
+      prisma.savingsAllocation.groupBy.mockResolvedValue([]);
+
+      await expect(service.setAllowNegative(user, 'acc-1', false)).rejects.toThrow(ConflictException);
+
+      try {
+        await service.setAllowNegative(user, 'acc-1', false);
+      } catch (err: any) {
+        expect(err.getResponse()).toEqual({
+          code: 'NEGATIVE_BALANCE_EXISTS',
+          message: 'Saldo akun masih negatif. Sesuaikan saldo dulu.',
+        });
+      }
+      expect(prisma.account.update).not.toHaveBeenCalled();
+    });
+
+    it('melempar ConflictException ACCOUNT_ARCHIVED jika akun diarsipkan (AC-5)', async () => {
+      prisma.account.findFirst.mockResolvedValue({
+        ...baseAccount,
+        archived: true,
+      });
+
+      await expect(service.setAllowNegative(user, 'acc-1', true)).rejects.toThrow(ConflictException);
+
+      try {
+        await service.setAllowNegative(user, 'acc-1', true);
+      } catch (err: any) {
+        expect(err.getResponse()).toEqual({
+          code: 'ACCOUNT_ARCHIVED',
+          message: 'Akun sudah diarsipkan',
+        });
+      }
+      expect(prisma.account.update).not.toHaveBeenCalled();
+    });
+
+    it('melempar NotFoundException jika akun tidak ditemukan atau milik user lain (AC-6)', async () => {
+      prisma.account.findFirst.mockResolvedValue(null);
+
+      await expect(service.setAllowNegative({ userId: 'user-2' }, 'acc-1', true)).rejects.toThrow(
+        NotFoundException,
+      );
+    });
+  });
 });

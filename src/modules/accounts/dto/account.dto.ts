@@ -28,3 +28,11 @@ export const updateAccountSchema = z
   );
 
 export type UpdateAccountDto = z.infer<typeof updateAccountSchema>;
+
+export const allowNegativeSchema = z
+  .object({
+    allow_negative: z.boolean(),
+  })
+  .strict();
+
+export type AllowNegativeDto = z.infer<typeof allowNegativeSchema>;

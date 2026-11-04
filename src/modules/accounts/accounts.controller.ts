@@ -19,8 +19,10 @@ import { AccountsService, AccountResponse } from './accounts.service.js';
 import {
   createAccountSchema,
   updateAccountSchema,
+  allowNegativeSchema,
   type CreateAccountDto,
   type UpdateAccountDto,
+  type AllowNegativeDto,
 } from './dto/account.dto.js';
 
 @ApiTags('accounts')
@@ -86,5 +88,21 @@ export class AccountsController {
     @Param('id', new ParseUUIDPipe()) id: string,
   ): Promise<AccountResponse> {
     return this.accountsService.archive(user, id);
+  }
+
+  @Patch(':id/allow-negative')
+  @ApiOperation({ summary: 'Mengubah izin saldo negatif akun keuangan' })
+  @ApiParam({ name: 'id', format: 'uuid', description: 'ID akun keuangan' })
+  @ApiResponse({ status: 200, description: 'Pengaturan saldo negatif berhasil diperbarui' })
+  @ApiResponse({ status: 400, description: 'Data tidak valid atau id bukan UUID' })
+  @ApiResponse({ status: 401, description: 'Sesi tidak valid' })
+  @ApiResponse({ status: 404, description: 'Akun tidak ditemukan' })
+  @ApiResponse({ status: 409, description: 'Akun diarsipkan atau saldo masih negatif saat mematikan' })
+  async setAllowNegative(
+    @CurrentUser() user: { userId: string; role?: string },
+    @Param('id', new ParseUUIDPipe()) id: string,
+    @Body(new ZodValidationPipe(allowNegativeSchema)) dto: AllowNegativeDto,
+  ): Promise<AccountResponse> {
+    return this.accountsService.setAllowNegative(user, id, dto.allow_negative);
   }
 }
