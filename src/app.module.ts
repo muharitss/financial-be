@@ -6,6 +6,7 @@ import { ThrottlerModule } from '@nestjs/throttler';
 import { PrismaModule } from './prisma/prisma.module.js';
 import { HealthModule } from './modules/health/health.module.js';
 import { AuthModule } from './modules/auth/auth.module.js';
+import { UsersModule } from './modules/users/users.module.js';
 import { LoggerModule } from './common/logger/logger.module.js';
 import { TraceMiddleware } from './common/logger/trace.middleware.js';
 import { throttlerConfig } from './common/throttler/throttler.config.js';
@@ -22,6 +23,7 @@ export const { ObserveModule, ObserveInstrument } = createObserveModule();
     PrismaModule,
     PassportModule.register({ defaultStrategy: 'jwt' }),
     AuthModule,
+    UsersModule,
     HealthModule,
     ObserveModule.forRoot({
       appKey: process.env.OBSERVE_APP_KEY ?? 'YOUR_APP_KEY',

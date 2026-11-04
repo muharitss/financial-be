@@ -131,7 +131,7 @@ export class AuthService {
     }
 
     const tokenHash = createHash('sha256').update(rawRefreshToken).digest('hex');
-    const existing = await this.prisma.refreshToken.findUnique({
+    const existing = await this.prisma.asSystem().refreshToken.findUnique({
       where: { token_hash: tokenHash },
     });
 
@@ -177,7 +177,7 @@ export class AuthService {
     const newTokenHash = createHash('sha256').update(newRawRefreshToken).digest('hex');
     const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
 
-    await this.prisma.$transaction(async (tx) => {
+    await this.prisma.asSystem().$transaction(async (tx) => {
       const created = await tx.refreshToken.create({
         data: {
           user_id: user.id,
@@ -211,8 +211,9 @@ export class AuthService {
   async logout(rawRefreshToken?: string) {
     if (rawRefreshToken) {
       const tokenHash = createHash('sha256').update(rawRefreshToken).digest('hex');
-      await this.prisma.refreshToken
-        .update({
+      await this.prisma
+        .asSystem()
+        .refreshToken.update({
           where: { token_hash: tokenHash },
           data: { revoked_at: new Date() },
         })

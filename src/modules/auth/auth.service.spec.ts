@@ -30,6 +30,7 @@ describe('AuthService (Manual Auth)', () => {
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
       },
       $transaction: jest.fn(async (callback) => callback(prisma)),
+      asSystem: jest.fn(() => prisma),
     };
 
     jwtService = {
