@@ -1,0 +1,592 @@
+import { Test, TestingModule } from '@nestjs/testing';
+import { INestApplication } from '@nestjs/common';
+import { ThrottlerStorage } from '@nestjs/throttler';
+import request from 'supertest';
+import cookieParser from 'cookie-parser';
+import { AppModule } from '../src/app.module.js';
+import { PrismaService } from '../src/prisma/prisma.service.js';
+import { AllExceptionsFilter } from '../src/common/filters/all-exceptions.filter.js';
+
+function generateTestUlid(): string {
+  const chars = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+  let str = '0';
+  for (let i = 1; i < 26; i++) {
+    str += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return str;
+}
+
+describe('Transactions E2E Test Suite (Supertest)', () => {
+  let app: INestApplication;
+  let prisma: PrismaService;
+  let throttlerStorage: any;
+
+  let userAHeaders: { cookie: string };
+  let userBHeaders: { cookie: string };
+  let userAId: string;
+  let userBId: string;
+  let profileAId: string;
+
+  let userAAccount: any;
+  let userBAccount: any;
+  let incomeCategoryA: any;
+  let expenseCategoryA: any;
+  let userATag: any;
+
+  beforeAll(async () => {
+    const moduleFixture: TestingModule = await Test.createTestingModule({
+      imports: [AppModule],
+    }).compile();
+
+    app = moduleFixture.createNestApplication();
+    app.use(cookieParser());
+    app.useGlobalFilters(new AllExceptionsFilter());
+    await app.init();
+
+    prisma = app.get(PrismaService);
+    throttlerStorage = app.get(ThrottlerStorage);
+
+    // Bersihkan test data lama
+    await prisma.asSystem().transactionAudit.deleteMany();
+    await prisma.asSystem().transactionTag.deleteMany();
+    await prisma.asSystem().transaction.deleteMany();
+    await prisma.asSystem().savingsAllocation.deleteMany();
+    await prisma.asSystem().tag.deleteMany();
+    await prisma.asSystem().account.deleteMany();
+    await prisma.asSystem().category.deleteMany();
+    await prisma.asSystem().user.deleteMany({
+      where: {
+        email: {
+          endsWith: '@duitku.test',
+        },
+      },
+    });
+
+    // Registrasi User A
+    const resA = await request(app.getHttpServer())
+      .post('/auth/register')
+      .send({
+        email: 'user-a-trx@duitku.test',
+        password: 'Password123!',
+        name: 'User A Trx',
+      });
+    expect(resA.status).toBe(201);
+    userAId = resA.body.user.id;
+    const cookieA = resA.headers['set-cookie']
+      .map((c: string) => c.split(';')[0])
+      .join('; ');
+    userAHeaders = { cookie: cookieA };
+
+    // Registrasi User B
+    const resB = await request(app.getHttpServer())
+      .post('/auth/register')
+      .send({
+        email: 'user-b-trx@duitku.test',
+        password: 'Password123!',
+        name: 'User B Trx',
+      });
+    expect(resB.status).toBe(201);
+    userBId = resB.body.user.id;
+    const cookieB = resB.headers['set-cookie']
+      .map((c: string) => c.split(';')[0])
+      .join('; ');
+    userBHeaders = { cookie: cookieB };
+
+    // Ambil default profile User A
+    const profileA = await prisma.financialProfile.findFirst({
+      where: { user_id: userAId, is_default: true },
+    });
+    profileAId = profileA!.id;
+
+    // Buat Akun User A
+    const accResA = await request(app.getHttpServer())
+      .post('/accounts')
+      .set('Cookie', userAHeaders.cookie)
+      .send({
+        name: 'BCA User A',
+        type: 'BANK',
+        opening_balance: 1000000,
+      });
+    expect(accResA.status).toBe(201);
+    userAAccount = accResA.body;
+
+    // Buat Akun User B
+    const accResB = await request(app.getHttpServer())
+      .post('/accounts')
+      .set('Cookie', userBHeaders.cookie)
+      .send({
+        name: 'Mandiri User B',
+        type: 'BANK',
+        opening_balance: 500000,
+      });
+    expect(accResB.status).toBe(201);
+    userBAccount = accResB.body;
+
+    // Ambil kategori default User A
+    incomeCategoryA = await prisma.category.findFirst({
+      where: {
+        user_id: userAId,
+        type: 'INCOME',
+        archived: false,
+      },
+    });
+    expect(incomeCategoryA).toBeDefined();
+
+    expenseCategoryA = await prisma.category.findFirst({
+      where: {
+        user_id: userAId,
+        type: 'EXPENSE',
+        archived: false,
+      },
+    });
+    expect(expenseCategoryA).toBeDefined();
+
+    // Buat Tag untuk User A
+    userATag = await prisma.tag.create({
+      data: {
+        user_id: userAId,
+        financial_profile_id: profileAId,
+        name: 'Bonus Tahunan',
+      },
+    });
+  });
+
+  beforeEach(() => {
+    throttlerStorage?._storage?.clear();
+    throttlerStorage?.hitExpirations?.clear();
+  });
+
+  afterAll(async () => {
+    await prisma.asSystem().transactionAudit.deleteMany();
+    await prisma.asSystem().transactionTag.deleteMany();
+    await prisma.asSystem().transaction.deleteMany();
+    await prisma.asSystem().savingsAllocation.deleteMany();
+    await prisma.asSystem().tag.deleteMany();
+    await prisma.asSystem().account.deleteMany();
+    await prisma.asSystem().category.deleteMany();
+    await prisma.asSystem().user.deleteMany({
+      where: {
+        email: {
+          endsWith: '@duitku.test',
+        },
+      },
+    });
+    await app.close();
+  });
+
+  it('AC-1: POST /transactions (type: INCOME, date <= today) valid -> 201, status: POSTED, saldo bertambah, response tipe number', async () => {
+    const clientTxId = generateTestUlid();
+    const res = await request(app.getHttpServer())
+      .post('/transactions')
+      .set('Cookie', userAHeaders.cookie)
+      .send({
+        type: 'INCOME',
+        amount: 250000,
+        account_id: userAAccount.id,
+        category_id: incomeCategoryA.id,
+        date: '2026-11-01',
+        note: 'Gaji sampingan',
+        client_tx_id: clientTxId,
+      });
+
+    expect(res.status).toBe(201);
+    expect(res.body.id).toBeDefined();
+    expect(res.body.status).toBe('POSTED');
+    expect(res.body.amount).toBe(250000);
+    expect(typeof res.body.amount).toBe('number');
+    expect(typeof res.body.transfer_fee).toBe('number');
+    expect(res.body.date).toBe('2026-11-01');
+    expect(res.body.client_tx_id).toBe(clientTxId);
+    expect(res.body.warning).toBeUndefined();
+
+    // Verifikasi saldo akun di database bertambah: 1000000 + 250000 = 1250000
+    const updatedAcc = await prisma.account.findFirst({
+      where: { id: userAAccount.id, user_id: userAId },
+    });
+    expect(updatedAcc?.balance).toBe(1250000n);
+  });
+
+  it('AC-2: Setelah AC-1, tercatat 1 baris transaction_audits dengan action = CREATE, before = null, after.amount = amount', async () => {
+    const clientTxId = generateTestUlid();
+    const res = await request(app.getHttpServer())
+      .post('/transactions')
+      .set('Cookie', userAHeaders.cookie)
+      .send({
+        type: 'INCOME',
+        amount: 150000,
+        account_id: userAAccount.id,
+        category_id: incomeCategoryA.id,
+        date: '2026-11-01',
+        client_tx_id: clientTxId,
+      });
+
+    expect(res.status).toBe(201);
+    const txId = res.body.id;
+
+    const audits = await prisma.asSystem().transactionAudit.findMany({
+      where: { transaction_id: txId },
+    });
+    expect(audits).toHaveLength(1);
+    const audit = audits[0];
+    expect(audit.action).toBe('CREATE');
+    expect(audit.before).toBeNull();
+    expect(audit.actor_user_id).toBe(userAId);
+
+    const afterData = audit.after as any;
+    expect(afterData).toBeDefined();
+    expect(afterData.amount).toBe(150000);
+    expect(typeof afterData.amount).toBe('number');
+  });
+
+  it('AC-3: POST /transactions (type: INCOME) dengan date > today -> 201, status: SCHEDULED, saldo tidak berubah', async () => {
+    // Cek saldo awal akun User A sebelum SCHEDULED
+    const accBefore = await prisma.account.findFirst({
+      where: { id: userAAccount.id, user_id: userAId },
+    });
+    const balanceBefore = accBefore?.balance;
+
+    const clientTxId = generateTestUlid();
+    const res = await request(app.getHttpServer())
+      .post('/transactions')
+      .set('Cookie', userAHeaders.cookie)
+      .send({
+        type: 'INCOME',
+        amount: 500000,
+        account_id: userAAccount.id,
+        category_id: incomeCategoryA.id,
+        date: '2099-12-31',
+        client_tx_id: clientTxId,
+      });
+
+    expect(res.status).toBe(201);
+    expect(res.body.status).toBe('SCHEDULED');
+
+    // Cek saldo akun di database TIDAK berubah
+    const accAfter = await prisma.account.findFirst({
+      where: { id: userAAccount.id, user_id: userAId },
+    });
+    expect(accAfter?.balance).toBe(balanceBefore);
+  });
+
+  it('AC-4: category_id bertipe EXPENSE -> 400 INVALID_CATEGORY_TYPE; kategori arsip -> 422 CATEGORY_ARCHIVED; akun arsip -> 409 ACCOUNT_ARCHIVED', async () => {
+    // 1. Kategori EXPENSE
+    const resExpense = await request(app.getHttpServer())
+      .post('/transactions')
+      .set('Cookie', userAHeaders.cookie)
+      .send({
+        type: 'INCOME',
+        amount: 50000,
+        account_id: userAAccount.id,
+        category_id: expenseCategoryA.id,
+        date: '2026-11-01',
+        client_tx_id: generateTestUlid(),
+      });
+    expect(resExpense.status).toBe(400);
+    expect(resExpense.body.code).toBe('INVALID_CATEGORY_TYPE');
+
+    // 2. Kategori diarsipkan
+    const archivedCategory = await prisma.category.create({
+      data: {
+        user_id: userAId,
+        financial_profile_id: profileAId,
+        name: 'Arsip Kategori Income ' + Date.now(),
+        type: 'INCOME',
+        archived: true,
+      },
+    });
+
+    const resArchivedCat = await request(app.getHttpServer())
+      .post('/transactions')
+      .set('Cookie', userAHeaders.cookie)
+      .send({
+        type: 'INCOME',
+        amount: 50000,
+        account_id: userAAccount.id,
+        category_id: archivedCategory.id,
+        date: '2026-11-01',
+        client_tx_id: generateTestUlid(),
+      });
+    expect(resArchivedCat.status).toBe(422);
+    expect(resArchivedCat.body.code).toBe('CATEGORY_ARCHIVED');
+
+    // 3. Akun diarsipkan
+    const archivedAcc = await prisma.account.create({
+      data: {
+        user_id: userAId,
+        financial_profile_id: profileAId,
+        name: 'Akun Arsip ' + Date.now(),
+        type: 'BANK',
+        opening_balance: 0n,
+        opening_date: new Date('2026-11-01T00:00:00.000Z'),
+        balance: 0n,
+        archived: true,
+      },
+    });
+
+    const resArchivedAcc = await request(app.getHttpServer())
+      .post('/transactions')
+      .set('Cookie', userAHeaders.cookie)
+      .send({
+        type: 'INCOME',
+        amount: 50000,
+        account_id: archivedAcc.id,
+        category_id: incomeCategoryA.id,
+        date: '2026-11-01',
+        client_tx_id: generateTestUlid(),
+      });
+    expect(resArchivedAcc.status).toBe(409);
+    expect(resArchivedAcc.body.code).toBe('ACCOUNT_ARCHIVED');
+  });
+
+  it('AC-5: amount <= 0 atau desimal -> 400/422 VALIDATION_ERROR; tanpa client_tx_id & tanpa header -> 422 MISSING_CLIENT_TX_ID', async () => {
+    // 1. amount = 0
+    const resZero = await request(app.getHttpServer())
+      .post('/transactions')
+      .set('Cookie', userAHeaders.cookie)
+      .send({
+        type: 'INCOME',
+        amount: 0,
+        account_id: userAAccount.id,
+        category_id: incomeCategoryA.id,
+        date: '2026-11-01',
+        client_tx_id: generateTestUlid(),
+      });
+    expect([400, 422]).toContain(resZero.status);
+    expect(resZero.body.code).toBe('VALIDATION_ERROR');
+
+    // 2. amount negatif
+    const resNeg = await request(app.getHttpServer())
+      .post('/transactions')
+      .set('Cookie', userAHeaders.cookie)
+      .send({
+        type: 'INCOME',
+        amount: -1000,
+        account_id: userAAccount.id,
+        category_id: incomeCategoryA.id,
+        date: '2026-11-01',
+        client_tx_id: generateTestUlid(),
+      });
+    expect([400, 422]).toContain(resNeg.status);
+    expect(resNeg.body.code).toBe('VALIDATION_ERROR');
+
+    // 3. amount desimal
+    const resDecimal = await request(app.getHttpServer())
+      .post('/transactions')
+      .set('Cookie', userAHeaders.cookie)
+      .send({
+        type: 'INCOME',
+        amount: 1500.5,
+        account_id: userAAccount.id,
+        category_id: incomeCategoryA.id,
+        date: '2026-11-01',
+        client_tx_id: generateTestUlid(),
+      });
+    expect([400, 422]).toContain(resDecimal.status);
+    expect(resDecimal.body.code).toBe('VALIDATION_ERROR');
+
+    // 4. Tanpa client_tx_id di body dan tanpa header Idempotency-Key
+    const resNoIdempotency = await request(app.getHttpServer())
+      .post('/transactions')
+      .set('Cookie', userAHeaders.cookie)
+      .send({
+        type: 'INCOME',
+        amount: 50000,
+        account_id: userAAccount.id,
+        category_id: incomeCategoryA.id,
+        date: '2026-11-01',
+      });
+    expect(resNoIdempotency.status).toBe(422);
+    expect(resNoIdempotency.body.code).toBe('MISSING_CLIENT_TX_ID');
+  });
+
+  it('AC-6 (isolasi): Menggunakan account_id, category_id, atau tags milik user lain -> 404, saldo user lain tidak berubah', async () => {
+    const userBBalanceBefore = (await prisma.account.findFirst({
+      where: { id: userBAccount.id, user_id: userBId },
+    }))?.balance;
+
+    // 1. Akun milik User B dengan credential User A
+    const resWrongAcc = await request(app.getHttpServer())
+      .post('/transactions')
+      .set('Cookie', userAHeaders.cookie)
+      .send({
+        type: 'INCOME',
+        amount: 100000,
+        account_id: userBAccount.id,
+        category_id: incomeCategoryA.id,
+        date: '2026-11-01',
+        client_tx_id: generateTestUlid(),
+      });
+    expect(resWrongAcc.status).toBe(404);
+    expect(resWrongAcc.body.code).toBe('ACCOUNT_NOT_FOUND');
+
+    // 2. Kategori milik User B
+    const catB = await prisma.category.findFirst({
+      where: { user_id: userBId, type: 'INCOME' },
+    });
+    const resWrongCat = await request(app.getHttpServer())
+      .post('/transactions')
+      .set('Cookie', userAHeaders.cookie)
+      .send({
+        type: 'INCOME',
+        amount: 100000,
+        account_id: userAAccount.id,
+        category_id: catB!.id,
+        date: '2026-11-01',
+        client_tx_id: generateTestUlid(),
+      });
+    expect(resWrongCat.status).toBe(404);
+    expect(resWrongCat.body.code).toBe('CATEGORY_NOT_FOUND');
+
+    // 3. Tag milik User B
+    const profileB = await prisma.financialProfile.findFirst({
+      where: { user_id: userBId, is_default: true },
+    });
+    const tagB = await prisma.tag.create({
+      data: {
+        user_id: userBId,
+        financial_profile_id: profileB!.id,
+        name: 'Tag User B',
+      },
+    });
+
+    const resWrongTag = await request(app.getHttpServer())
+      .post('/transactions')
+      .set('Cookie', userAHeaders.cookie)
+      .send({
+        type: 'INCOME',
+        amount: 100000,
+        account_id: userAAccount.id,
+        category_id: incomeCategoryA.id,
+        date: '2026-11-01',
+        tags: [tagB.id],
+        client_tx_id: generateTestUlid(),
+      });
+    expect(resWrongTag.status).toBe(404);
+    expect(resWrongTag.body.code).toBe('TAG_NOT_FOUND');
+
+    // Verifikasi saldo akun User B tidak berubah
+    const userBBalanceAfter = (await prisma.account.findFirst({
+      where: { id: userBAccount.id, user_id: userBId },
+    }))?.balance;
+    expect(userBBalanceAfter).toBe(userBBalanceBefore);
+  });
+
+  it('Dapat menggunakan header Idempotency-Key jika client_tx_id tidak ada di body', async () => {
+    const ulidFromHeader = generateTestUlid();
+    const res = await request(app.getHttpServer())
+      .post('/transactions')
+      .set('Cookie', userAHeaders.cookie)
+      .set('Idempotency-Key', ulidFromHeader)
+      .send({
+        type: 'INCOME',
+        amount: 80000,
+        account_id: userAAccount.id,
+        category_id: incomeCategoryA.id,
+        date: '2026-11-01',
+      });
+
+    expect(res.status).toBe(201);
+    expect(res.body.client_tx_id).toBe(ulidFromHeader);
+  });
+
+  it('Dapat menyertakan tag valid dan relasi transaction_tags tersimpan', async () => {
+    const res = await request(app.getHttpServer())
+      .post('/transactions')
+      .set('Cookie', userAHeaders.cookie)
+      .send({
+        type: 'INCOME',
+        amount: 60000,
+        account_id: userAAccount.id,
+        category_id: incomeCategoryA.id,
+        date: '2026-11-01',
+        tags: [userATag.id],
+        client_tx_id: generateTestUlid(),
+      });
+
+    expect(res.status).toBe(201);
+    expect(res.body.tags).toEqual([userATag.id]);
+
+    const txTags = await prisma.asSystem().transactionTag.findMany({
+      where: { transaction_id: res.body.id },
+    });
+    expect(txTags).toHaveLength(1);
+    expect(txTags[0].tag_id).toBe(userATag.id);
+  });
+
+  it('Melempar 422 TOO_MANY_TAGS jika tag lebih dari 10', async () => {
+    const fakeUuids = Array(11).fill('00000000-0000-0000-0000-000000000001');
+    const res = await request(app.getHttpServer())
+      .post('/transactions')
+      .set('Cookie', userAHeaders.cookie)
+      .send({
+        type: 'INCOME',
+        amount: 50000,
+        account_id: userAAccount.id,
+        category_id: incomeCategoryA.id,
+        date: '2026-11-01',
+        tags: fakeUuids,
+        client_tx_id: generateTestUlid(),
+      });
+
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe('TOO_MANY_TAGS');
+  });
+
+  it('Melempar 422 TAG_ARCHIVED jika ada tag yang diarsipkan', async () => {
+    const archivedTag = await prisma.tag.create({
+      data: {
+        user_id: userAId,
+        financial_profile_id: profileAId,
+        name: 'Tag Arsip ' + Date.now(),
+        archived: true,
+      },
+    });
+
+    const res = await request(app.getHttpServer())
+      .post('/transactions')
+      .set('Cookie', userAHeaders.cookie)
+      .send({
+        type: 'INCOME',
+        amount: 50000,
+        account_id: userAAccount.id,
+        category_id: incomeCategoryA.id,
+        date: '2026-11-01',
+        tags: [archivedTag.id],
+        client_tx_id: generateTestUlid(),
+      });
+
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe('TAG_ARCHIVED');
+  });
+
+  it('Menyertakan warning NEGATIVE_BALANCE jika saldo akhir masih < 0', async () => {
+    // Buat akun allow_negative dengan saldo awal 0, lalu paksa saldo negatif lewat raw query
+    const negAcc = await prisma.account.create({
+      data: {
+        user_id: userAId,
+        financial_profile_id: profileAId,
+        name: 'Akun Negatif ' + Date.now(),
+        type: 'BANK',
+        opening_balance: 0n,
+        opening_date: new Date('2026-11-01T00:00:00.000Z'),
+        balance: -200000n,
+        allow_negative: true,
+      },
+    });
+
+    const res = await request(app.getHttpServer())
+      .post('/transactions')
+      .set('Cookie', userAHeaders.cookie)
+      .send({
+        type: 'INCOME',
+        amount: 50000, // Saldo akhir = -150000 (< 0)
+        account_id: negAcc.id,
+        category_id: incomeCategoryA.id,
+        date: '2026-11-01',
+        client_tx_id: generateTestUlid(),
+      });
+
+    expect(res.status).toBe(201);
+    expect(res.body.warning).toBe('NEGATIVE_BALANCE');
+  });
+});
