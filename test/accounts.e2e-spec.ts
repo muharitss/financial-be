@@ -31,6 +31,7 @@ describe('Accounts E2E Test Suite (Supertest)', () => {
     throttlerStorage = app.get(ThrottlerStorage);
 
     // Bersihkan test data
+    await prisma.asSystem().transaction.deleteMany();
     await prisma.asSystem().savingsAllocation.deleteMany();
     await prisma.user.deleteMany({
       where: {
@@ -76,6 +77,7 @@ describe('Accounts E2E Test Suite (Supertest)', () => {
   });
 
   afterAll(async () => {
+    await prisma.asSystem().transaction.deleteMany();
     await prisma.asSystem().savingsAllocation.deleteMany();
     await prisma.user.deleteMany({
       where: {
@@ -400,5 +402,417 @@ describe('Accounts E2E Test Suite (Supertest)', () => {
     for (const acc of resB.body) {
       expect(userAAccountIds.has(acc.id)).toBe(false);
     }
+  });
+
+  it('AC-1 & AC-2 (PATCH): PATCH /accounts/:id valid -> 200, field berubah, balance tetap, dan audit log tercatat', async () => {
+    const resCreate = await request(app.getHttpServer())
+      .post('/accounts')
+      .set('Cookie', userAHeaders.cookie)
+      .send({
+        name: 'BCA Awal',
+        type: 'BANK',
+        opening_balance: 500000,
+        note: 'Awal',
+      });
+    expect(resCreate.status).toBe(201);
+    const accountId = resCreate.body.id;
+
+    const resPatch = await request(app.getHttpServer())
+      .patch(`/accounts/${accountId}`)
+      .set('Cookie', userAHeaders.cookie)
+      .send({
+        name: 'BCA Utama',
+        note: 'Gaji',
+      });
+
+    expect(resPatch.status).toBe(200);
+    expect(resPatch.body.name).toBe('BCA Utama');
+    expect(resPatch.body.note).toBe('Gaji');
+    expect(resPatch.body.balance).toBe(500000);
+    expect(resPatch.body.opening_balance).toBe(500000);
+
+    const audit = await prisma.auditLog.findFirst({
+      where: {
+        action: 'ACCOUNT_UPDATE',
+        resource_id: accountId,
+      },
+    });
+    expect(audit).not.toBeNull();
+    expect((audit?.before as any)?.name).toBe('BCA Awal');
+    expect((audit?.after as any)?.name).toBe('BCA Utama');
+  });
+
+  it('AC-3 (PATCH): Body berisi opening_balance atau balance -> 400 VALIDATION_ERROR, data tidak berubah', async () => {
+    const resCreate = await request(app.getHttpServer())
+      .post('/accounts')
+      .set('Cookie', userAHeaders.cookie)
+      .send({
+        name: 'Akun Cek Field Terlarang',
+        type: 'BANK',
+        opening_balance: 100000,
+      });
+    expect(resCreate.status).toBe(201);
+    const accountId = resCreate.body.id;
+
+    const resForbidden1 = await request(app.getHttpServer())
+      .patch(`/accounts/${accountId}`)
+      .set('Cookie', userAHeaders.cookie)
+      .send({
+        name: 'Nama Baru',
+        opening_balance: 999999,
+      });
+    expect(resForbidden1.status).toBe(400);
+    expect(resForbidden1.body.code).toBe('VALIDATION_ERROR');
+
+    const resForbidden2 = await request(app.getHttpServer())
+      .patch(`/accounts/${accountId}`)
+      .set('Cookie', userAHeaders.cookie)
+      .send({
+        balance: 999999,
+      });
+    expect(resForbidden2.status).toBe(400);
+    expect(resForbidden2.body.code).toBe('VALIDATION_ERROR');
+
+    const acc = await prisma.account.findFirst({ where: { id: accountId, user_id: userAId } });
+    expect(acc?.name).toBe('Akun Cek Field Terlarang');
+    expect(acc?.balance).toBe(100000n);
+  });
+
+  it('AC-4 (PATCH): Body kosong {} -> 400 VALIDATION_ERROR', async () => {
+    const resCreate = await request(app.getHttpServer())
+      .post('/accounts')
+      .set('Cookie', userAHeaders.cookie)
+      .send({
+        name: 'Akun Cek Empty Body',
+        type: 'CASH',
+        opening_balance: 50000,
+      });
+    expect(resCreate.status).toBe(201);
+    const accountId = resCreate.body.id;
+
+    const resEmpty = await request(app.getHttpServer())
+      .patch(`/accounts/${accountId}`)
+      .set('Cookie', userAHeaders.cookie)
+      .send({});
+    expect(resEmpty.status).toBe(400);
+    expect(resEmpty.body.code).toBe('VALIDATION_ERROR');
+  });
+
+  it('AC-5 (PATCH): Ganti nama ke nama akun lain milik user yang sama -> 409 ACCOUNT_NAME_TAKEN', async () => {
+    const resAcc1 = await request(app.getHttpServer())
+      .post('/accounts')
+      .set('Cookie', userAHeaders.cookie)
+      .send({
+        name: 'Akun Kembar 1',
+        type: 'BANK',
+        opening_balance: 10000,
+      });
+    expect(resAcc1.status).toBe(201);
+
+    const resAcc2 = await request(app.getHttpServer())
+      .post('/accounts')
+      .set('Cookie', userAHeaders.cookie)
+      .send({
+        name: 'Akun Kembar 2',
+        type: 'BANK',
+        opening_balance: 10000,
+      });
+    expect(resAcc2.status).toBe(201);
+
+    const resConflict = await request(app.getHttpServer())
+      .patch(`/accounts/${resAcc2.body.id}`)
+      .set('Cookie', userAHeaders.cookie)
+      .send({
+        name: 'Akun Kembar 1',
+      });
+    expect(resConflict.status).toBe(409);
+    expect(resConflict.body.code).toBe('ACCOUNT_NAME_TAKEN');
+  });
+
+  it('AC-6 (PATCH): Akun arsip -> 409 ACCOUNT_ARCHIVED', async () => {
+    const resCreate = await request(app.getHttpServer())
+      .post('/accounts')
+      .set('Cookie', userAHeaders.cookie)
+      .send({
+        name: 'Akun Bakal Arsip',
+        type: 'BANK',
+        opening_balance: 10000,
+      });
+    expect(resCreate.status).toBe(201);
+    const accountId = resCreate.body.id;
+
+    await prisma.asSystem().account.update({
+      where: { id: accountId },
+      data: { archived: true, archived_at: new Date() },
+    });
+
+    const resArchived = await request(app.getHttpServer())
+      .patch(`/accounts/${accountId}`)
+      .set('Cookie', userAHeaders.cookie)
+      .send({
+        name: 'Nama Setelah Arsip',
+      });
+    expect(resArchived.status).toBe(409);
+    expect(resArchived.body.code).toBe('ACCOUNT_ARCHIVED');
+  });
+
+  it('AC-7 (PATCH): User B PATCH akun user A -> 404 ACCOUNT_NOT_FOUND, data A tidak berubah', async () => {
+    const resCreate = await request(app.getHttpServer())
+      .post('/accounts')
+      .set('Cookie', userAHeaders.cookie)
+      .send({
+        name: 'Akun Milik User A',
+        type: 'BANK',
+        opening_balance: 20000,
+      });
+    expect(resCreate.status).toBe(201);
+    const accountId = resCreate.body.id;
+
+    const resHack = await request(app.getHttpServer())
+      .patch(`/accounts/${accountId}`)
+      .set('Cookie', userBHeaders.cookie)
+      .send({
+        name: 'Dibajak User B',
+      });
+    expect(resHack.status).toBe(404);
+    expect(resHack.body.code).toBe('ACCOUNT_NOT_FOUND');
+
+    const acc = await prisma.account.findFirst({ where: { id: accountId, user_id: userAId } });
+    expect(acc?.name).toBe('Akun Milik User A');
+  });
+
+  it('AC-8 (PATCH): id bukan UUID -> 400', async () => {
+    const res = await request(app.getHttpServer())
+      .patch('/accounts/bukan-uuid')
+      .set('Cookie', userAHeaders.cookie)
+      .send({
+        name: 'Test',
+      });
+    expect(res.status).toBe(400);
+  });
+
+  it('AC-1 & AC-2 (ARCHIVE): POST /accounts/:id/archive valid -> 200 & 1 audit log; pemanggilan kedua idempoten tanpa audit baru', async () => {
+    const resCreate = await request(app.getHttpServer())
+      .post('/accounts')
+      .set('Cookie', userAHeaders.cookie)
+      .send({
+        name: 'Akun Untuk Arsip',
+        type: 'BANK',
+        opening_balance: 100000,
+      });
+    expect(resCreate.status).toBe(201);
+    const accountId = resCreate.body.id;
+
+    // Archive pertama kali
+    const resArchive1 = await request(app.getHttpServer())
+      .post(`/accounts/${accountId}/archive`)
+      .set('Cookie', userAHeaders.cookie);
+
+    expect(resArchive1.status).toBe(200);
+    expect(resArchive1.body.archived).toBe(true);
+    expect(resArchive1.body.archived_at).not.toBeNull();
+
+    const auditCount1 = await prisma.auditLog.count({
+      where: {
+        action: 'ACCOUNT_ARCHIVE',
+        resource_id: accountId,
+      },
+    });
+    expect(auditCount1).toBe(1);
+
+    // Archive kedua kali (idempoten)
+    const resArchive2 = await request(app.getHttpServer())
+      .post(`/accounts/${accountId}/archive`)
+      .set('Cookie', userAHeaders.cookie);
+
+    expect(resArchive2.status).toBe(200);
+    expect(resArchive2.body.archived).toBe(true);
+    expect(resArchive2.body.archived_at).toBe(resArchive1.body.archived_at);
+
+    const auditCount2 = await prisma.auditLog.count({
+      where: {
+        action: 'ACCOUNT_ARCHIVE',
+        resource_id: accountId,
+      },
+    });
+    expect(auditCount2).toBe(1);
+  });
+
+  it('AC-3 (ARCHIVE): Akun dengan alokasi ACTIVE -> 409 ACCOUNT_HAS_ACTIVE_ALLOCATIONS, akun tetap aktif', async () => {
+    const resAcc = await request(app.getHttpServer())
+      .post('/accounts')
+      .set('Cookie', userAHeaders.cookie)
+      .send({
+        name: 'Akun Alokasi Tabungan',
+        type: 'BANK',
+        opening_balance: 200000,
+      });
+    expect(resAcc.status).toBe(201);
+    const accountId = resAcc.body.id;
+
+    const profile = await prisma.financialProfile.findFirst({
+      where: { user_id: userAId, is_default: true },
+    });
+    const goal = await prisma.savingsGoal.create({
+      data: {
+        id: randomUUID(),
+        user_id: userAId,
+        financial_profile_id: profile!.id,
+        name: 'Target Liburan Arsip',
+        target_amount: 5000000n,
+      },
+    });
+    await prisma.savingsAllocation.create({
+      data: {
+        id: randomUUID(),
+        savings_goal_id: goal.id,
+        account_id: accountId,
+        amount: 50000n,
+        status: 'ACTIVE',
+      },
+    });
+
+    const resBlock = await request(app.getHttpServer())
+      .post(`/accounts/${accountId}/archive`)
+      .set('Cookie', userAHeaders.cookie);
+
+    expect(resBlock.status).toBe(409);
+    expect(resBlock.body.code).toBe('ACCOUNT_HAS_ACTIVE_ALLOCATIONS');
+
+    const acc = await prisma.account.findFirst({ where: { id: accountId, user_id: userAId } });
+    expect(acc?.archived).toBe(false);
+  });
+
+  it('AC-4 (ARCHIVE): Akun dengan transaksi SCHEDULED (sumber atau tujuan transfer) -> 409 ACCOUNT_HAS_SCHEDULED_TRANSACTIONS', async () => {
+    const profile = await prisma.financialProfile.findFirst({
+      where: { user_id: userAId, is_default: true },
+    });
+
+    // 1. Cek sebagai sumber transaksi scheduled
+    const resSource = await request(app.getHttpServer())
+      .post('/accounts')
+      .set('Cookie', userAHeaders.cookie)
+      .send({
+        name: 'Sumber Scheduled',
+        type: 'BANK',
+        opening_balance: 500000,
+      });
+    expect(resSource.status).toBe(201);
+    const sourceId = resSource.body.id;
+
+    await prisma.transaction.create({
+      data: {
+        id: randomUUID(),
+        user_id: userAId,
+        financial_profile_id: profile!.id,
+        account_id: sourceId,
+        type: 'EXPENSE',
+        amount: 25000n,
+        date: new Date('2026-12-15'),
+        status: 'SCHEDULED',
+        client_tx_id: randomUUID(),
+      },
+    });
+
+    const resBlockSource = await request(app.getHttpServer())
+      .post(`/accounts/${sourceId}/archive`)
+      .set('Cookie', userAHeaders.cookie);
+
+    expect(resBlockSource.status).toBe(409);
+    expect(resBlockSource.body.code).toBe('ACCOUNT_HAS_SCHEDULED_TRANSACTIONS');
+
+    // 2. Cek sebagai tujuan transfer scheduled
+    const resTarget = await request(app.getHttpServer())
+      .post('/accounts')
+      .set('Cookie', userAHeaders.cookie)
+      .send({
+        name: 'Tujuan Transfer Scheduled',
+        type: 'BANK',
+        opening_balance: 500000,
+      });
+    expect(resTarget.status).toBe(201);
+    const targetId = resTarget.body.id;
+
+    await prisma.transaction.create({
+      data: {
+        id: randomUUID(),
+        user_id: userAId,
+        financial_profile_id: profile!.id,
+        account_id: sourceId,
+        to_account_id: targetId,
+        type: 'TRANSFER',
+        amount: 50000n,
+        date: new Date('2026-12-20'),
+        status: 'SCHEDULED',
+        client_tx_id: randomUUID(),
+      },
+    });
+
+    const resBlockTarget = await request(app.getHttpServer())
+      .post(`/accounts/${targetId}/archive`)
+      .set('Cookie', userAHeaders.cookie);
+
+    expect(resBlockTarget.status).toBe(409);
+    expect(resBlockTarget.body.code).toBe('ACCOUNT_HAS_SCHEDULED_TRANSACTIONS');
+  });
+
+  it('AC-5 (ARCHIVE): Setelah arsip, akun hilang dari GET /accounts dan muncul di GET /accounts?include_archived=true', async () => {
+    const resCreate = await request(app.getHttpServer())
+      .post('/accounts')
+      .set('Cookie', userAHeaders.cookie)
+      .send({
+        name: 'Akun List Check',
+        type: 'CASH',
+        opening_balance: 50000,
+      });
+    expect(resCreate.status).toBe(201);
+    const accountId = resCreate.body.id;
+
+    // Sebelum arsip: ada di GET /accounts
+    const beforeList = await request(app.getHttpServer())
+      .get('/accounts')
+      .set('Cookie', userAHeaders.cookie);
+    expect(beforeList.body.some((a: any) => a.id === accountId)).toBe(true);
+
+    // Arsipkan
+    const resArchive = await request(app.getHttpServer())
+      .post(`/accounts/${accountId}/archive`)
+      .set('Cookie', userAHeaders.cookie);
+    expect(resArchive.status).toBe(200);
+
+    // Setelah arsip: hilang dari GET /accounts
+    const afterList = await request(app.getHttpServer())
+      .get('/accounts')
+      .set('Cookie', userAHeaders.cookie);
+    expect(afterList.body.some((a: any) => a.id === accountId)).toBe(false);
+
+    // Muncul di GET /accounts?include_archived=true
+    const afterListArchived = await request(app.getHttpServer())
+      .get('/accounts?include_archived=true')
+      .set('Cookie', userAHeaders.cookie);
+    expect(afterListArchived.body.some((a: any) => a.id === accountId && a.archived === true)).toBe(true);
+  });
+
+  it('AC-6 (ARCHIVE): User B archive akun user A -> 404 ACCOUNT_NOT_FOUND, akun A tetap aktif', async () => {
+    const resCreate = await request(app.getHttpServer())
+      .post('/accounts')
+      .set('Cookie', userAHeaders.cookie)
+      .send({
+        name: 'Akun User A Anti Bajak',
+        type: 'BANK',
+        opening_balance: 10000,
+      });
+    expect(resCreate.status).toBe(201);
+    const accountId = resCreate.body.id;
+
+    const resAttack = await request(app.getHttpServer())
+      .post(`/accounts/${accountId}/archive`)
+      .set('Cookie', userBHeaders.cookie);
+
+    expect(resAttack.status).toBe(404);
+    expect(resAttack.body.code).toBe('ACCOUNT_NOT_FOUND');
+
+    const acc = await prisma.account.findFirst({ where: { id: accountId, user_id: userAId } });
+    expect(acc?.archived).toBe(false);
   });
 });

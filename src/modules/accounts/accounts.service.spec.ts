@@ -21,9 +21,14 @@ describe('AccountsService', () => {
         create: jest.fn(),
         findFirst: jest.fn(),
         findMany: jest.fn(),
+        update: jest.fn(),
       },
       savingsAllocation: {
         groupBy: jest.fn(),
+        count: jest.fn(),
+      },
+      transaction: {
+        count: jest.fn(),
       },
       auditLog: {
         create: jest.fn(),
@@ -301,6 +306,243 @@ describe('AccountsService', () => {
         where: { user_id: 'user-1' },
         orderBy: { created_at: 'asc' },
       });
+    });
+  });
+
+  describe('update', () => {
+    const user = { userId: 'user-1', role: 'USER' };
+    const existingAccount = {
+      id: 'acc-1',
+      user_id: 'user-1',
+      financial_profile_id: 'prof-1',
+      name: 'BCA Lama',
+      type: 'BANK',
+      provider: 'BCA',
+      note: 'Catatan lama',
+      opening_balance: 500000n,
+      opening_date: new Date('2026-11-04T00:00:00.000Z'),
+      balance: 500000n,
+      allow_negative: false,
+      archived: false,
+      archived_at: null,
+      created_at: new Date('2026-11-04T01:00:00.000Z'),
+      updated_at: new Date('2026-11-04T01:00:00.000Z'),
+    };
+
+    it('berhasil mengubah data akun dan mencatat audit log (AC-1, AC-2)', async () => {
+      prisma.account.findFirst.mockResolvedValue(existingAccount);
+      prisma.savingsAllocation.groupBy.mockResolvedValue([
+        { account_id: 'acc-1', _sum: { amount: 100000n } },
+      ]);
+      const updatedAccount = {
+        ...existingAccount,
+        name: 'BCA Utama',
+        note: 'Gaji',
+      };
+      prisma.account.update.mockResolvedValue(updatedAccount);
+      prisma.auditLog.create.mockResolvedValue({ id: 'audit-1' });
+
+      const res = await service.update(user, 'acc-1', {
+        name: 'BCA Utama',
+        note: 'Gaji',
+      });
+
+      expect(res.name).toBe('BCA Utama');
+      expect(res.note).toBe('Gaji');
+      expect(res.balance).toBe(500000);
+      expect(res.opening_balance).toBe(500000);
+      expect(res.reserved).toBe(100000);
+      expect(res.available).toBe(400000);
+
+      expect(prisma.account.update).toHaveBeenCalledWith({
+        where: { id: 'acc-1', user_id: 'user-1' },
+        data: {
+          name: 'BCA Utama',
+          type: undefined,
+          provider: undefined,
+          note: 'Gaji',
+        },
+      });
+
+      expect(prisma.auditLog.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          action: 'ACCOUNT_UPDATE',
+          resource_type: 'account',
+          resource_id: 'acc-1',
+          actor_user_id: 'user-1',
+          before: expect.objectContaining({ name: 'BCA Lama' }),
+          after: expect.objectContaining({ name: 'BCA Utama' }),
+        }),
+      });
+    });
+
+    it('melempar ConflictException ACCOUNT_ARCHIVED jika akun sudah diarsipkan (AC-6)', async () => {
+      prisma.account.findFirst.mockResolvedValue({
+        ...existingAccount,
+        archived: true,
+        archived_at: new Date(),
+      });
+
+      await expect(
+        service.update(user, 'acc-1', { name: 'BCA Baru' }),
+      ).rejects.toThrow(ConflictException);
+
+      try {
+        await service.update(user, 'acc-1', { name: 'BCA Baru' });
+      } catch (err: any) {
+        expect(err.getResponse()).toEqual({
+          code: 'ACCOUNT_ARCHIVED',
+          message: 'Akun sudah diarsipkan',
+        });
+      }
+    });
+
+    it('melempar NotFoundException jika akun milik user lain atau tidak ditemukan (AC-7)', async () => {
+      prisma.account.findFirst.mockResolvedValue(null);
+
+      await expect(
+        service.update({ userId: 'user-2' }, 'acc-1', { name: 'BCA Hack' }),
+      ).rejects.toThrow(NotFoundException);
+    });
+
+    it('melempar ConflictException ACCOUNT_NAME_TAKEN jika nama akun bentrok P2002 (AC-5)', async () => {
+      prisma.account.findFirst.mockResolvedValue(existingAccount);
+      prisma.savingsAllocation.groupBy.mockResolvedValue([]);
+
+      const p2002Error = new Prisma.PrismaClientKnownRequestError('Unique constraint failed', {
+        code: 'P2002',
+        clientVersion: '5.0.0',
+      });
+      prisma.account.update.mockRejectedValue(p2002Error);
+
+      await expect(
+        service.update(user, 'acc-1', { name: 'BCA Sudah Ada' }),
+      ).rejects.toThrow(ConflictException);
+
+      try {
+        await service.update(user, 'acc-1', { name: 'BCA Sudah Ada' });
+      } catch (err: any) {
+        expect(err.getResponse()).toEqual({
+          code: 'ACCOUNT_NAME_TAKEN',
+          message: 'Nama akun sudah dipakai',
+        });
+      }
+    });
+  });
+
+  describe('archive', () => {
+    const user = { userId: 'user-1', role: 'USER' };
+    const activeAccount = {
+      id: 'acc-1',
+      user_id: 'user-1',
+      financial_profile_id: 'prof-1',
+      name: 'BCA',
+      type: 'BANK',
+      provider: 'BCA',
+      note: null,
+      opening_balance: 500000n,
+      opening_date: new Date('2026-11-04T00:00:00.000Z'),
+      balance: 500000n,
+      allow_negative: false,
+      archived: false,
+      archived_at: null,
+      created_at: new Date('2026-11-04T01:00:00.000Z'),
+      updated_at: new Date('2026-11-04T01:00:00.000Z'),
+    };
+
+    it('berhasil mengarsipkan akun aktif tanpa alokasi/transaksi terjadwal dan mencatat audit log (AC-1)', async () => {
+      prisma.account.findFirst.mockResolvedValue(activeAccount);
+      prisma.savingsAllocation.count.mockResolvedValue(0);
+      prisma.transaction.count.mockResolvedValue(0);
+
+      const archivedDate = new Date();
+      prisma.account.update.mockResolvedValue({
+        ...activeAccount,
+        archived: true,
+        archived_at: archivedDate,
+      });
+      prisma.auditLog.create.mockResolvedValue({ id: 'audit-1' });
+
+      const res = await service.archive(user, 'acc-1');
+
+      expect(res.archived).toBe(true);
+      expect(res.archived_at).toEqual(archivedDate);
+      expect(prisma.account.update).toHaveBeenCalledWith({
+        where: { id: 'acc-1', user_id: 'user-1' },
+        data: {
+          archived: true,
+          archived_at: expect.any(Date),
+        },
+      });
+      expect(prisma.auditLog.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          action: 'ACCOUNT_ARCHIVE',
+          resource_type: 'account',
+          resource_id: 'acc-1',
+          actor_user_id: 'user-1',
+          before: expect.objectContaining({ archived: false }),
+          after: expect.objectContaining({ archived: true }),
+        }),
+      });
+    });
+
+    it('idempoten jika sudah diarsipkan: return state sekarang tanpa update/audit baru (AC-2)', async () => {
+      const alreadyArchived = {
+        ...activeAccount,
+        archived: true,
+        archived_at: new Date('2026-11-04T02:00:00.000Z'),
+      };
+      prisma.account.findFirst.mockResolvedValue(alreadyArchived);
+
+      const res = await service.archive(user, 'acc-1');
+
+      expect(res.archived).toBe(true);
+      expect(res.archived_at).toEqual(alreadyArchived.archived_at);
+      expect(prisma.account.update).not.toHaveBeenCalled();
+      expect(prisma.auditLog.create).not.toHaveBeenCalled();
+    });
+
+    it('melempar ConflictException ACCOUNT_HAS_ACTIVE_ALLOCATIONS jika ada alokasi aktif (AC-3)', async () => {
+      prisma.account.findFirst.mockResolvedValue(activeAccount);
+      prisma.savingsAllocation.count.mockResolvedValue(2);
+
+      await expect(service.archive(user, 'acc-1')).rejects.toThrow(ConflictException);
+
+      try {
+        await service.archive(user, 'acc-1');
+      } catch (err: any) {
+        expect(err.getResponse()).toEqual({
+          code: 'ACCOUNT_HAS_ACTIVE_ALLOCATIONS',
+          message: 'Lepaskan alokasi tabungan dari akun ini dulu',
+        });
+      }
+      expect(prisma.account.update).not.toHaveBeenCalled();
+    });
+
+    it('melempar ConflictException ACCOUNT_HAS_SCHEDULED_TRANSACTIONS jika ada transaksi terjadwal (AC-4)', async () => {
+      prisma.account.findFirst.mockResolvedValue(activeAccount);
+      prisma.savingsAllocation.count.mockResolvedValue(0);
+      prisma.transaction.count.mockResolvedValue(1);
+
+      await expect(service.archive(user, 'acc-1')).rejects.toThrow(ConflictException);
+
+      try {
+        await service.archive(user, 'acc-1');
+      } catch (err: any) {
+        expect(err.getResponse()).toEqual({
+          code: 'ACCOUNT_HAS_SCHEDULED_TRANSACTIONS',
+          message: 'Batalkan transaksi terjadwal akun ini dulu',
+        });
+      }
+      expect(prisma.account.update).not.toHaveBeenCalled();
+    });
+
+    it('melempar NotFoundException jika akun tidak ditemukan atau milik user lain (AC-6)', async () => {
+      prisma.account.findFirst.mockResolvedValue(null);
+
+      await expect(service.archive({ userId: 'user-2' }, 'acc-1')).rejects.toThrow(
+        NotFoundException,
+      );
     });
   });
 });

@@ -7,7 +7,7 @@ import {
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service.js';
 import { todayInTz } from '../../common/utils/date.js';
-import type { CreateAccountDto } from './dto/account.dto.js';
+import type { CreateAccountDto, UpdateAccountDto } from './dto/account.dto.js';
 
 export interface AccountResponse {
   id: string;
@@ -153,6 +153,75 @@ export class AccountsService {
     }
   }
 
+  async update(
+    user: { userId: string; role?: string },
+    accountId: string,
+    dto: UpdateAccountDto,
+  ): Promise<AccountResponse> {
+    const account = await this.getOwnedAccount(user.userId, accountId);
+
+    if (account.archived) {
+      throw new ConflictException({
+        code: 'ACCOUNT_ARCHIVED',
+        message: 'Akun sudah diarsipkan',
+      });
+    }
+
+    const allocation = await this.prisma.savingsAllocation.groupBy({
+      by: ['account_id'],
+      where: {
+        account_id: accountId,
+        status: 'ACTIVE',
+      },
+      _sum: {
+        amount: true,
+      },
+    });
+    const reserved = allocation[0]?._sum.amount ?? 0n;
+    const beforeResponse = toAccountResponse(account, reserved);
+
+    try {
+      return await this.prisma.$transaction(async (tx) => {
+        const updated = await tx.account.update({
+          where: {
+            id: accountId,
+            user_id: user.userId,
+          },
+          data: {
+            name: dto.name,
+            type: dto.type,
+            provider: dto.provider,
+            note: dto.note,
+          },
+        });
+
+        const afterResponse = toAccountResponse(updated, reserved);
+
+        await tx.auditLog.create({
+          data: {
+            action: 'ACCOUNT_UPDATE',
+            resource_type: 'account',
+            resource_id: account.id,
+            actor_user_id: user.userId,
+            actor_role: user.role ?? 'USER',
+            before: beforeResponse as unknown as Prisma.InputJsonValue,
+            after: afterResponse as unknown as Prisma.InputJsonValue,
+          },
+        });
+
+        return afterResponse;
+      });
+    } catch (error: any) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+        throw new ConflictException({
+          code: 'ACCOUNT_NAME_TAKEN',
+          message: 'Nama akun sudah dipakai',
+        });
+      }
+      throw error;
+    }
+  }
+
   async list(userId: string, includeArchived: boolean = false): Promise<AccountResponse[]> {
     const accounts = await this.prisma.account.findMany({
       where: {
@@ -188,6 +257,91 @@ export class AccountsService {
     return accounts.map((acc) =>
       toAccountResponse(acc, reservedMap.get(acc.id) ?? 0n),
     );
+  }
+
+  async archive(
+    user: { userId: string; role?: string },
+    accountId: string,
+  ): Promise<AccountResponse> {
+    return this.prisma.$transaction(async (tx) => {
+      const account = await tx.account.findFirst({
+        where: {
+          id: accountId,
+          user_id: user.userId,
+        },
+      });
+
+      if (!account) {
+        throw new NotFoundException({
+          code: 'ACCOUNT_NOT_FOUND',
+          message: 'Akun tidak ditemukan',
+        });
+      }
+
+      if (account.archived) {
+        return toAccountResponse(account, 0n);
+      }
+
+      const activeAllocations = await tx.savingsAllocation.count({
+        where: {
+          account_id: accountId,
+          status: 'ACTIVE',
+        },
+      });
+
+      if (activeAllocations > 0) {
+        throw new ConflictException({
+          code: 'ACCOUNT_HAS_ACTIVE_ALLOCATIONS',
+          message: 'Lepaskan alokasi tabungan dari akun ini dulu',
+        });
+      }
+
+      const scheduledTransactions = await tx.transaction.count({
+        where: {
+          user_id: user.userId,
+          status: 'SCHEDULED',
+          OR: [
+            { account_id: accountId },
+            { to_account_id: accountId },
+          ],
+        },
+      });
+
+      if (scheduledTransactions > 0) {
+        throw new ConflictException({
+          code: 'ACCOUNT_HAS_SCHEDULED_TRANSACTIONS',
+          message: 'Batalkan transaksi terjadwal akun ini dulu',
+        });
+      }
+
+      const updated = await tx.account.update({
+        where: {
+          id: accountId,
+          user_id: user.userId,
+        },
+        data: {
+          archived: true,
+          archived_at: new Date(),
+        },
+      });
+
+      const beforeResponse = toAccountResponse(account, 0n);
+      const afterResponse = toAccountResponse(updated, 0n);
+
+      await tx.auditLog.create({
+        data: {
+          action: 'ACCOUNT_ARCHIVE',
+          resource_type: 'account',
+          resource_id: account.id,
+          actor_user_id: user.userId,
+          actor_role: user.role ?? 'USER',
+          before: beforeResponse as unknown as Prisma.InputJsonValue,
+          after: afterResponse as unknown as Prisma.InputJsonValue,
+        },
+      });
+
+      return afterResponse;
+    });
   }
 
   async getOwnedAccount(userId: string, accountId: string) {

@@ -2,20 +2,25 @@ import {
   Controller,
   Post,
   Get,
+  Patch,
+  Param,
+  ParseUUIDPipe,
   Query,
   Body,
   UseGuards,
   HttpStatus,
   HttpCode,
 } from '@nestjs/common';
-import { ApiTags, ApiOperation, ApiResponse, ApiQuery, ApiCookieAuth } from '@nestjs/swagger';
+import { ApiTags, ApiOperation, ApiResponse, ApiParam, ApiQuery, ApiCookieAuth } from '@nestjs/swagger';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard.js';
 import { CurrentUser } from '../../common/decorators/current-user.decorator.js';
 import { ZodValidationPipe } from '../../common/pipes/zod-validation.pipe.js';
 import { AccountsService, AccountResponse } from './accounts.service.js';
 import {
   createAccountSchema,
+  updateAccountSchema,
   type CreateAccountDto,
+  type UpdateAccountDto,
 } from './dto/account.dto.js';
 
 @ApiTags('accounts')
@@ -49,5 +54,37 @@ export class AccountsController {
     @Query('include_archived') includeArchived?: string,
   ): Promise<AccountResponse[]> {
     return this.accountsService.list(user.userId, includeArchived === 'true');
+  }
+
+  @Patch(':id')
+  @ApiOperation({ summary: 'Mengubah informasi akun keuangan' })
+  @ApiParam({ name: 'id', format: 'uuid', description: 'ID akun keuangan' })
+  @ApiResponse({ status: 200, description: 'Akun berhasil diperbarui' })
+  @ApiResponse({ status: 400, description: 'Data tidak valid atau id bukan UUID' })
+  @ApiResponse({ status: 401, description: 'Sesi tidak valid' })
+  @ApiResponse({ status: 404, description: 'Akun tidak ditemukan' })
+  @ApiResponse({ status: 409, description: 'Nama akun sudah dipakai atau akun diarsipkan' })
+  async update(
+    @CurrentUser() user: { userId: string; role?: string },
+    @Param('id', new ParseUUIDPipe()) id: string,
+    @Body(new ZodValidationPipe(updateAccountSchema)) dto: UpdateAccountDto,
+  ): Promise<AccountResponse> {
+    return this.accountsService.update(user, id, dto);
+  }
+
+  @Post(':id/archive')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Mengarsipkan akun keuangan' })
+  @ApiParam({ name: 'id', format: 'uuid', description: 'ID akun keuangan' })
+  @ApiResponse({ status: 200, description: 'Akun berhasil diarsipkan' })
+  @ApiResponse({ status: 400, description: 'ID bukan UUID' })
+  @ApiResponse({ status: 401, description: 'Sesi tidak valid' })
+  @ApiResponse({ status: 404, description: 'Akun tidak ditemukan' })
+  @ApiResponse({ status: 409, description: 'Akun memiliki alokasi tabungan aktif atau transaksi terjadwal' })
+  async archive(
+    @CurrentUser() user: { userId: string; role?: string },
+    @Param('id', new ParseUUIDPipe()) id: string,
+  ): Promise<AccountResponse> {
+    return this.accountsService.archive(user, id);
   }
 }

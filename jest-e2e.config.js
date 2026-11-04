@@ -4,6 +4,7 @@ export default {
   rootDir: 'test',
   setupFilesAfterEnv: ['<rootDir>/setup.ts'],
   testRegex: '.e2e-spec.ts$',
+  maxWorkers: 1,
   transform: {
     '^.+\\.tsx?$': [
       'ts-jest',
