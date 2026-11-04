@@ -1,5 +1,6 @@
 import { Module, NestModule, MiddlewareConsumer } from '@nestjs/common';
 import { APP_FILTER, APP_GUARD } from '@nestjs/core';
+import { ScheduleModule } from '@nestjs/schedule';
 import { PassportModule } from '@nestjs/passport';
 import { createObserveModule } from '@nestjs/observe';
 import { ThrottlerModule } from '@nestjs/throttler';
@@ -19,6 +20,7 @@ export const { ObserveModule, ObserveInstrument } = createObserveModule();
 @Module({
   imports: [
     LoggerModule,
+    ScheduleModule.forRoot(),
     ThrottlerModule.forRoot(throttlerConfig),
     PrismaModule,
     PassportModule.register({ defaultStrategy: 'jwt' }),
