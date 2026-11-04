@@ -133,6 +133,41 @@ describe('Auth E2E Test Suite (Supertest)', () => {
     expect(userInDb?.financial_profiles[0].name).toBe('Pribadi');
     expect(userInDb?.preferences).toBeDefined();
     expect(userInDb?.preferences?.timezone).toBe('Asia/Jakarta');
+
+    // TASK-036: Verifikasi 32 kategori otomatis terbuat pada registrasi (AC-1, AC-2, AC-3)
+    const userCategories = await prisma.category.findMany({
+      where: { user_id: userInDb!.id },
+    });
+    expect(userCategories).toHaveLength(32);
+
+    const incomeRoots = userCategories.filter(
+      (c) => c.type === 'INCOME' && c.parent_id === null,
+    );
+    expect(incomeRoots).toHaveLength(7);
+
+    const expenseRoots = userCategories.filter(
+      (c) => c.type === 'EXPENSE' && c.parent_id === null,
+    );
+    expect(expenseRoots).toHaveLength(10);
+
+    const expenseSubs = userCategories.filter(
+      (c) => c.type === 'EXPENSE' && c.parent_id !== null,
+    );
+    expect(expenseSubs).toHaveLength(15);
+
+    // AC-2: Tepat 2 kategori is_system = true (Biaya Transfer dan Lainnya)
+    const systemCats = userCategories.filter((c) => c.is_system);
+    expect(systemCats).toHaveLength(2);
+    expect(systemCats.map((c) => c.name).sort((a, b) => a.localeCompare(b))).toEqual([
+      'Biaya Transfer',
+      'Lainnya',
+    ]);
+
+    // AC-3: Tidak ada tags yang dibuat saat register
+    const userTags = await prisma.tag.findMany({
+      where: { user_id: userInDb!.id },
+    });
+    expect(userTags).toHaveLength(0);
   });
 
   // 2. POST /auth/register email duplikat -> 409 EMAIL_ALREADY_EXISTS

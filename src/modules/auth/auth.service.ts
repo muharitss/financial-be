@@ -10,6 +10,7 @@ import { randomBytes, createHash } from 'node:crypto';
 import { LoginCooldownTracker } from '../../common/throttler/throttler.config.js';
 import { PrismaService } from '../../prisma/prisma.service.js';
 import type { RegisterDto, LoginDto } from './dto/auth.dto.js';
+import { seedDefaultCategories } from '../categories/default-categories.js';
 
 @Injectable()
 export class AuthService {
@@ -50,13 +51,15 @@ export class AuthService {
         },
       });
 
-      await tx.financialProfile.create({
+      const profile = await tx.financialProfile.create({
         data: {
           user_id: newUser.id,
           name: 'Pribadi',
           is_default: true,
         },
       });
+
+      await seedDefaultCategories(tx, profile.id, newUser.id);
 
       return newUser;
     });

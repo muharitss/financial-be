@@ -22,7 +22,11 @@ describe('AuthService (Manual Auth)', () => {
         create: jest.fn(),
       },
       financialProfile: {
-        create: jest.fn(),
+        create: jest.fn().mockResolvedValue({ id: 'profile-uuid-1', user_id: 'user-uuid-1', is_default: true }),
+      },
+      category: {
+        findMany: jest.fn().mockResolvedValue([]),
+        createMany: jest.fn().mockResolvedValue({ count: 17 }),
       },
       refreshToken: {
         create: jest.fn().mockResolvedValue({ id: 'rt-1' }),
@@ -83,6 +87,12 @@ describe('AuthService (Manual Auth)', () => {
       expect(prisma.financialProfile.create).toHaveBeenCalledWith({
         data: expect.objectContaining({ user_id: 'user-uuid-1', is_default: true }),
       });
+      expect(prisma.category.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ user_id: 'user-uuid-1', financial_profile_id: 'profile-uuid-1' }),
+        }),
+      );
+      expect(prisma.category.createMany).toHaveBeenCalled();
 
       expect(result.user.email).toBe('budi@example.com');
       expect(result.sessionToken).toBe('mock-jwt-token');
