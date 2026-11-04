@@ -153,6 +153,43 @@ export class AccountsService {
     }
   }
 
+  async list(userId: string, includeArchived: boolean = false): Promise<AccountResponse[]> {
+    const accounts = await this.prisma.account.findMany({
+      where: {
+        user_id: userId,
+        ...(includeArchived ? {} : { archived: false }),
+      },
+      orderBy: { created_at: 'asc' },
+    });
+
+    if (accounts.length === 0) {
+      return [];
+    }
+
+    const ids = accounts.map((acc) => acc.id);
+    const allocations = await this.prisma.savingsAllocation.groupBy({
+      by: ['account_id'],
+      where: {
+        account_id: { in: ids },
+        status: 'ACTIVE',
+      },
+      _sum: {
+        amount: true,
+      },
+    });
+
+    const reservedMap = new Map<string, bigint>();
+    for (const item of allocations) {
+      if (item._sum.amount !== null) {
+        reservedMap.set(item.account_id, item._sum.amount);
+      }
+    }
+
+    return accounts.map((acc) =>
+      toAccountResponse(acc, reservedMap.get(acc.id) ?? 0n),
+    );
+  }
+
   async getOwnedAccount(userId: string, accountId: string) {
     const account = await this.prisma.account.findFirst({
       where: {

@@ -1,12 +1,14 @@
 import {
   Controller,
   Post,
+  Get,
+  Query,
   Body,
   UseGuards,
   HttpStatus,
   HttpCode,
 } from '@nestjs/common';
-import { ApiTags, ApiOperation, ApiResponse, ApiCookieAuth } from '@nestjs/swagger';
+import { ApiTags, ApiOperation, ApiResponse, ApiQuery, ApiCookieAuth } from '@nestjs/swagger';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard.js';
 import { CurrentUser } from '../../common/decorators/current-user.decorator.js';
 import { ZodValidationPipe } from '../../common/pipes/zod-validation.pipe.js';
@@ -35,5 +37,17 @@ export class AccountsController {
     @Body(new ZodValidationPipe(createAccountSchema)) dto: CreateAccountDto,
   ): Promise<AccountResponse> {
     return this.accountsService.create(user, dto);
+  }
+
+  @Get()
+  @ApiOperation({ summary: 'Mendapatkan daftar akun keuangan' })
+  @ApiQuery({ name: 'include_archived', required: false, type: Boolean })
+  @ApiResponse({ status: 200, description: 'Daftar akun keuangan' })
+  @ApiResponse({ status: 401, description: 'Sesi tidak valid' })
+  async list(
+    @CurrentUser() user: { userId: string },
+    @Query('include_archived') includeArchived?: string,
+  ): Promise<AccountResponse[]> {
+    return this.accountsService.list(user.userId, includeArchived === 'true');
   }
 }

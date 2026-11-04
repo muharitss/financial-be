@@ -3,6 +3,7 @@ import { INestApplication } from '@nestjs/common';
 import { ThrottlerStorage } from '@nestjs/throttler';
 import request from 'supertest';
 import cookieParser from 'cookie-parser';
+import { randomUUID } from 'node:crypto';
 import { AppModule } from '../src/app.module.js';
 import { PrismaService } from '../src/prisma/prisma.service.js';
 import { AllExceptionsFilter } from '../src/common/filters/all-exceptions.filter.js';
@@ -30,6 +31,7 @@ describe('Accounts E2E Test Suite (Supertest)', () => {
     throttlerStorage = app.get(ThrottlerStorage);
 
     // Bersihkan test data
+    await prisma.asSystem().savingsAllocation.deleteMany();
     await prisma.user.deleteMany({
       where: {
         email: {
@@ -74,6 +76,7 @@ describe('Accounts E2E Test Suite (Supertest)', () => {
   });
 
   afterAll(async () => {
+    await prisma.asSystem().savingsAllocation.deleteMany();
     await prisma.user.deleteMany({
       where: {
         email: {
@@ -254,5 +257,148 @@ describe('Accounts E2E Test Suite (Supertest)', () => {
         opening_balance: 1000000,
       });
     expect(resCash2.status).toBe(201);
+  });
+
+  it('AC-1 (GET): GET /accounts tanpa cookie -> 401', async () => {
+    const res = await request(app.getHttpServer()).get('/accounts');
+    expect(res.status).toBe(401);
+  });
+
+  it('AC-2 (GET): User baru tanpa akun -> 200 []', async () => {
+    const resNew = await request(app.getHttpServer())
+      .post('/auth/register')
+      .send({
+        email: 'user-empty@duitku.test',
+        password: 'Password123!',
+        name: 'Empty User',
+      });
+    expect(resNew.status).toBe(201);
+    const cookieNew = resNew.headers['set-cookie']
+      .map((c: string) => c.split(';')[0])
+      .join('; ');
+
+    const res = await request(app.getHttpServer())
+      .get('/accounts')
+      .set('Cookie', cookieNew);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual([]);
+  });
+
+  it('AC-3 (GET): Akun balance = 500000 dengan 2 alokasi ACTIVE (100k + 50k) dan 1 RELEASED (70k) -> reserved = 150000, available = 350000', async () => {
+    const resAcc = await request(app.getHttpServer())
+      .post('/accounts')
+      .set('Cookie', userAHeaders.cookie)
+      .send({
+        name: 'Tabungan Khusus',
+        type: 'BANK',
+        opening_balance: 500000,
+      });
+    expect(resAcc.status).toBe(201);
+    const accountId = resAcc.body.id;
+
+    const profile = await prisma.financialProfile.findFirst({
+      where: { user_id: userAId, is_default: true },
+    });
+    expect(profile).not.toBeNull();
+
+    const goal = await prisma.savingsGoal.create({
+      data: {
+        id: randomUUID(),
+        user_id: userAId,
+        financial_profile_id: profile!.id,
+        name: 'Target Liburan',
+        target_amount: 10000000n,
+      },
+    });
+
+    await prisma.savingsAllocation.create({
+      data: {
+        id: randomUUID(),
+        savings_goal_id: goal.id,
+        account_id: accountId,
+        amount: 100000n,
+        status: 'ACTIVE',
+      },
+    });
+    await prisma.savingsAllocation.create({
+      data: {
+        id: randomUUID(),
+        savings_goal_id: goal.id,
+        account_id: accountId,
+        amount: 50000n,
+        status: 'ACTIVE',
+      },
+    });
+    await prisma.savingsAllocation.create({
+      data: {
+        id: randomUUID(),
+        savings_goal_id: goal.id,
+        account_id: accountId,
+        amount: 70000n,
+        status: 'RELEASED',
+      },
+    });
+
+    const res = await request(app.getHttpServer())
+      .get('/accounts')
+      .set('Cookie', userAHeaders.cookie);
+
+    expect(res.status).toBe(200);
+    const target = res.body.find((a: any) => a.id === accountId);
+    expect(target).toBeDefined();
+    expect(target.balance).toBe(500000);
+    expect(target.reserved).toBe(150000);
+    expect(target.available).toBe(350000);
+  });
+
+  it('AC-4 (GET): Akun arsip tidak muncul di GET /accounts, muncul di GET /accounts?include_archived=true dengan archived: true', async () => {
+    const resAcc = await request(app.getHttpServer())
+      .post('/accounts')
+      .set('Cookie', userAHeaders.cookie)
+      .send({
+        name: 'Akun Diarsip',
+        type: 'BANK',
+        opening_balance: 100000,
+      });
+    expect(resAcc.status).toBe(201);
+    const accountId = resAcc.body.id;
+
+    await prisma.asSystem().account.update({
+      where: { id: accountId },
+      data: { archived: true, archived_at: new Date() },
+    });
+
+    const resWithoutArchived = await request(app.getHttpServer())
+      .get('/accounts')
+      .set('Cookie', userAHeaders.cookie);
+    expect(resWithoutArchived.status).toBe(200);
+    expect(resWithoutArchived.body.some((a: any) => a.id === accountId)).toBe(false);
+
+    const resWithArchived = await request(app.getHttpServer())
+      .get('/accounts?include_archived=true')
+      .set('Cookie', userAHeaders.cookie);
+    expect(resWithArchived.status).toBe(200);
+    const archivedAcc = resWithArchived.body.find((a: any) => a.id === accountId);
+    expect(archivedAcc).toBeDefined();
+    expect(archivedAcc.archived).toBe(true);
+    expect(archivedAcc.archived_at).not.toBeNull();
+  });
+
+  it('AC-5 (GET): User B memanggil GET /accounts -> tidak melihat satu pun akun user A', async () => {
+    const userAAccounts = await prisma.account.findMany({
+      where: { user_id: userAId },
+    });
+    const userAAccountIds = new Set(userAAccounts.map((a) => a.id));
+
+    const resB = await request(app.getHttpServer())
+      .get('/accounts?include_archived=true')
+      .set('Cookie', userBHeaders.cookie);
+
+    expect(resB.status).toBe(200);
+    expect(resB.body.length).toBeGreaterThan(0);
+    for (const acc of resB.body) {
+      expect(userAAccountIds.has(acc.id)).toBe(false);
+    }
   });
 });

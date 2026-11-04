@@ -20,6 +20,10 @@ describe('AccountsService', () => {
       account: {
         create: jest.fn(),
         findFirst: jest.fn(),
+        findMany: jest.fn(),
+      },
+      savingsAllocation: {
+        groupBy: jest.fn(),
       },
       auditLog: {
         create: jest.fn(),
@@ -201,6 +205,102 @@ describe('AccountsService', () => {
           message: 'Akun tidak ditemukan',
         });
       }
+    });
+  });
+
+  describe('list', () => {
+    it('mengembalikan array kosong dan hanya 1 query jika user tidak punya akun (AC-2, AC-6)', async () => {
+      prisma.account.findMany.mockResolvedValue([]);
+
+      const result = await service.list('user-1');
+
+      expect(result).toEqual([]);
+      expect(prisma.account.findMany).toHaveBeenCalledTimes(1);
+      expect(prisma.savingsAllocation.groupBy).not.toHaveBeenCalled();
+    });
+
+    it('menghitung reserved dan available dengan tepat dan melakukan tepat 2 query (AC-3, AC-6)', async () => {
+      const mockAccounts = [
+        {
+          id: 'acc-1',
+          name: 'BCA',
+          type: 'BANK',
+          provider: 'BCA',
+          note: null,
+          opening_balance: 500000n,
+          opening_date: new Date('2026-11-04T00:00:00.000Z'),
+          balance: 500000n,
+          allow_negative: false,
+          archived: false,
+          archived_at: null,
+          created_at: new Date('2026-11-04T01:00:00.000Z'),
+        },
+        {
+          id: 'acc-2',
+          name: 'Dompet',
+          type: 'CASH',
+          provider: null,
+          note: null,
+          opening_balance: 100000n,
+          opening_date: new Date('2026-11-04T00:00:00.000Z'),
+          balance: 100000n,
+          allow_negative: false,
+          archived: false,
+          archived_at: null,
+          created_at: new Date('2026-11-04T02:00:00.000Z'),
+        },
+      ];
+
+      prisma.account.findMany.mockResolvedValue(mockAccounts);
+      prisma.savingsAllocation.groupBy.mockResolvedValue([
+        {
+          account_id: 'acc-1',
+          _sum: { amount: 150000n },
+        },
+      ]);
+
+      const result = await service.list('user-1', false);
+
+      expect(prisma.account.findMany).toHaveBeenCalledTimes(1);
+      expect(prisma.account.findMany).toHaveBeenCalledWith({
+        where: { user_id: 'user-1', archived: false },
+        orderBy: { created_at: 'asc' },
+      });
+      expect(prisma.savingsAllocation.groupBy).toHaveBeenCalledTimes(1);
+      expect(prisma.savingsAllocation.groupBy).toHaveBeenCalledWith({
+        by: ['account_id'],
+        where: { account_id: { in: ['acc-1', 'acc-2'] }, status: 'ACTIVE' },
+        _sum: { amount: true },
+      });
+
+      expect(result).toHaveLength(2);
+      expect(result[0]).toEqual(
+        expect.objectContaining({
+          id: 'acc-1',
+          balance: 500000,
+          reserved: 150000,
+          available: 350000,
+        }),
+      );
+      expect(result[1]).toEqual(
+        expect.objectContaining({
+          id: 'acc-2',
+          balance: 100000,
+          reserved: 0,
+          available: 100000,
+        }),
+      );
+    });
+
+    it('memasukkan akun arsip jika includeArchived = true (AC-4)', async () => {
+      prisma.account.findMany.mockResolvedValue([]);
+
+      await service.list('user-1', true);
+
+      expect(prisma.account.findMany).toHaveBeenCalledWith({
+        where: { user_id: 'user-1' },
+        orderBy: { created_at: 'asc' },
+      });
     });
   });
 });
