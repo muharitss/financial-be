@@ -40,18 +40,37 @@ export function resolveClientTxId(
   return candidate;
 }
 
+export const splitItemSchema = z
+  .object({
+    category_id: z.uuid(),
+    amount: z.number().int().positive(),
+  })
+  .strict();
+
+export type SplitItemDto = z.infer<typeof splitItemSchema>;
+
 export const createIncomeSchema = z
   .object({
     type: z.literal('INCOME'),
     amount: z.number().int().positive(),
     account_id: z.uuid(),
-    category_id: z.uuid(),
+    category_id: z.uuid().optional(),
+    splits: z.array(splitItemSchema).min(2).max(20).optional(),
     date: z.iso.date(),
     note: z.string().trim().max(500).optional(),
     tags: z.array(z.uuid()).max(10).optional(),
     client_tx_id: z.string().regex(ULID_REGEX).optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((data, ctx) => {
+    if (!data.splits && !data.category_id) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'category_id wajib disertakan jika splits tidak digunakan',
+        path: ['category_id'],
+      });
+    }
+  });
 
 export type CreateIncomeDto = z.infer<typeof createIncomeSchema>;
 
@@ -60,13 +79,23 @@ export const createExpenseSchema = z
     type: z.literal('EXPENSE'),
     amount: z.number().int().positive(),
     account_id: z.uuid(),
-    category_id: z.uuid(),
+    category_id: z.uuid().optional(),
+    splits: z.array(splitItemSchema).min(2).max(20).optional(),
     date: z.iso.date(),
     note: z.string().trim().max(500).optional(),
     tags: z.array(z.uuid()).max(10).optional(),
     client_tx_id: z.string().regex(ULID_REGEX).optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((data, ctx) => {
+    if (!data.splits && !data.category_id) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'category_id wajib disertakan jika splits tidak digunakan',
+        path: ['category_id'],
+      });
+    }
+  });
 
 export type CreateExpenseDto = z.infer<typeof createExpenseSchema>;
 

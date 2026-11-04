@@ -1426,4 +1426,242 @@ describe('Transactions E2E Test Suite (Supertest)', () => {
       expect(res.body.client_tx_id).toBe(key);
     });
   });
+
+  describe('TRANSACTION SPLITS Endpoints (TASK-044)', () => {
+    let catExp1: any;
+    let catExp2: any;
+    let catExp3: any;
+    let catInc1: any;
+    let catInc2: any;
+
+    beforeAll(async () => {
+      catExp1 = await prisma.category.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Split Makanan ' + Date.now(),
+          type: 'EXPENSE',
+        },
+      });
+      catExp2 = await prisma.category.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Split Perlengkapan ' + Date.now(),
+          type: 'EXPENSE',
+        },
+      });
+      catExp3 = await prisma.category.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Split Rumah ' + Date.now(),
+          type: 'EXPENSE',
+        },
+      });
+      catInc1 = await prisma.category.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Split Gaji ' + Date.now(),
+          type: 'INCOME',
+        },
+      });
+      catInc2 = await prisma.category.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Split Bonus ' + Date.now(),
+          type: 'INCOME',
+        },
+      });
+    });
+
+    it('AC-1: POST expense dengan 3 splits -> 201, 1 transaksi, 3 splits di DB, saldo berkurang tepat 1x', async () => {
+      const acc = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Akun Split Test',
+          type: 'BANK',
+          opening_balance: 500000n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 500000n,
+        },
+      });
+
+      const res = await request(app.getHttpServer())
+        .post('/transactions')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          type: 'EXPENSE',
+          account_id: acc.id,
+          amount: 100000,
+          splits: [
+            { category_id: catExp1.id, amount: 40000 },
+            { category_id: catExp2.id, amount: 35000 },
+            { category_id: catExp3.id, amount: 25000 },
+          ],
+          date: '2026-11-01',
+          client_tx_id: generateTestUlid(),
+        });
+
+      expect(res.status).toBe(201);
+      expect(res.body.amount).toBe(100000);
+      expect(res.body.category_id).toBeNull();
+      expect(res.body.splits).toHaveLength(3);
+
+      const updatedAcc = await prisma.account.findFirst({
+        where: { id: acc.id, user_id: userAId },
+      });
+      expect(updatedAcc!.balance).toBe(400000n);
+
+      const dbSplits = await prisma.asSystem().transactionSplit.findMany({
+        where: { transaction_id: res.body.id },
+      });
+      expect(dbSplits).toHaveLength(3);
+    });
+
+    it('AC-2: Total splits != amount -> 422 SPLIT_SUM_MISMATCH', async () => {
+      const res = await request(app.getHttpServer())
+        .post('/transactions')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          type: 'EXPENSE',
+          account_id: userAAccount.id,
+          amount: 100000,
+          splits: [
+            { category_id: catExp1.id, amount: 40000 },
+            { category_id: catExp2.id, amount: 30000 },
+          ],
+          date: '2026-11-01',
+          client_tx_id: generateTestUlid(),
+        });
+
+      expect(res.status).toBe(422);
+      expect(res.body.code).toBe('SPLIT_SUM_MISMATCH');
+    });
+
+    it('AC-3: splits hanya 1 item -> 400/422 VALIDATION_ERROR', async () => {
+      const res = await request(app.getHttpServer())
+        .post('/transactions')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          type: 'EXPENSE',
+          account_id: userAAccount.id,
+          amount: 100000,
+          splits: [{ category_id: catExp1.id, amount: 100000 }],
+          date: '2026-11-01',
+          client_tx_id: generateTestUlid(),
+        });
+
+      expect([400, 422]).toContain(res.status);
+      expect(res.body.code).toBe('VALIDATION_ERROR');
+    });
+
+    it('AC-4: splits berisi category_id milik user lain -> 403 FORBIDDEN', async () => {
+      // Buat kategori milik user B
+      const userBProfile = await prisma.financialProfile.findFirst({ where: { user_id: userBId } });
+      const catUserB = await prisma.category.create({
+        data: {
+          user_id: userBId,
+          financial_profile_id: userBProfile!.id,
+          name: 'Cat User B ' + Date.now(),
+          type: 'EXPENSE',
+        },
+      });
+
+      const res = await request(app.getHttpServer())
+        .post('/transactions')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          type: 'EXPENSE',
+          account_id: userAAccount.id,
+          amount: 100000,
+          splits: [
+            { category_id: catExp1.id, amount: 50000 },
+            { category_id: catUserB.id, amount: 50000 },
+          ],
+          date: '2026-11-01',
+          client_tx_id: generateTestUlid(),
+        });
+
+      expect(res.status).toBe(403);
+      expect(res.body.code).toBe('FORBIDDEN');
+    });
+
+    it('AC-5: splits pada EXPENSE berisi kategori bertipe INCOME -> 400 INVALID_CATEGORY_TYPE; kategori arsip -> 422 CATEGORY_ARCHIVED', async () => {
+      // 1. Kategori salah tipe (INCOME di EXPENSE)
+      const resWrongType = await request(app.getHttpServer())
+        .post('/transactions')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          type: 'EXPENSE',
+          account_id: userAAccount.id,
+          amount: 100000,
+          splits: [
+            { category_id: catExp1.id, amount: 50000 },
+            { category_id: catInc1.id, amount: 50000 },
+          ],
+          date: '2026-11-01',
+          client_tx_id: generateTestUlid(),
+        });
+
+      expect(resWrongType.status).toBe(400);
+      expect(resWrongType.body.code).toBe('INVALID_CATEGORY_TYPE');
+
+      // 2. Kategori diarsipkan
+      const archivedCat = await prisma.category.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Archived Split Cat ' + Date.now(),
+          type: 'EXPENSE',
+          archived: true,
+          archived_at: new Date(),
+        },
+      });
+
+      const resArchived = await request(app.getHttpServer())
+        .post('/transactions')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          type: 'EXPENSE',
+          account_id: userAAccount.id,
+          amount: 100000,
+          splits: [
+            { category_id: catExp1.id, amount: 50000 },
+            { category_id: archivedCat.id, amount: 50000 },
+          ],
+          date: '2026-11-01',
+          client_tx_id: generateTestUlid(),
+        });
+
+      expect(resArchived.status).toBe(422);
+      expect(resArchived.body.code).toBe('CATEGORY_ARCHIVED');
+    });
+
+    it('mendukung splits pada transaksi bertipe INCOME', async () => {
+      const res = await request(app.getHttpServer())
+        .post('/transactions')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          type: 'INCOME',
+          account_id: userAAccount.id,
+          amount: 200000,
+          splits: [
+            { category_id: catInc1.id, amount: 150000 },
+            { category_id: catInc2.id, amount: 50000 },
+          ],
+          date: '2026-11-01',
+          client_tx_id: generateTestUlid(),
+        });
+
+      expect(res.status).toBe(201);
+      expect(res.body.type).toBe('INCOME');
+      expect(res.body.amount).toBe(200000);
+      expect(res.body.category_id).toBeNull();
+      expect(res.body.splits).toHaveLength(2);
+    });
+  });
 });

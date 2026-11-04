@@ -5,6 +5,7 @@ import {
   ConflictException,
   BadRequestException,
   UnprocessableEntityException,
+  ForbiddenException,
 } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import {
@@ -43,6 +44,7 @@ describe('TransactionsService', () => {
       },
       category: {
         findFirst: jest.fn<any>(),
+        findMany: jest.fn<any>(),
         update: jest.fn<any>(),
         create: jest.fn<any>(),
       },
@@ -54,6 +56,9 @@ describe('TransactionsService', () => {
       },
       transaction: {
         create: jest.fn<any>(),
+      },
+      transactionSplit: {
+        createMany: jest.fn<any>(),
       },
       transactionTag: {
         createMany: jest.fn<any>(),
@@ -1380,6 +1385,189 @@ describe('TransactionsService', () => {
       );
       await expect(service.createAdjustment(user, dto)).rejects.toMatchObject({
         response: { code: 'CLIENT_TX_ID_DUPLICATE' },
+      });
+    });
+  });
+
+  describe('Transaction Splits (TASK-044)', () => {
+    const c1 = '44444444-4444-4444-4444-444444444441';
+    const c2 = '44444444-4444-4444-4444-444444444442';
+    const c3 = '44444444-4444-4444-4444-444444444443';
+
+    it('AC-1: berhasil membuat expense dengan splits valid, 1 transaksi dan baris splits tersimpan', async () => {
+      prisma.$queryRaw.mockResolvedValue([mockAccount]);
+      prisma.savingsAllocation.groupBy.mockResolvedValue([]);
+      prisma.category.findMany.mockResolvedValue([
+        { id: c1, user_id: user.userId, type: 'EXPENSE', archived: false },
+        { id: c2, user_id: user.userId, type: 'EXPENSE', archived: false },
+        { id: c3, user_id: user.userId, type: 'EXPENSE', archived: false },
+      ]);
+      prisma.transaction.create.mockImplementation((args: any) => ({
+        id: 'tx-split-1',
+        ...args.data,
+        created_at: new Date(),
+        updated_at: new Date(),
+      }));
+
+      const dto = {
+        type: 'EXPENSE' as const,
+        account_id: mockAccount.id,
+        amount: 100000,
+        splits: [
+          { category_id: c1, amount: 40000 },
+          { category_id: c2, amount: 35000 },
+          { category_id: c3, amount: 25000 },
+        ],
+        date: '2026-11-01',
+        client_tx_id: validUlid,
+      };
+
+      const result = await service.create(user, dto);
+
+      expect(result.amount).toBe(100000);
+      expect(result.category_id).toBeNull();
+      expect(result.splits).toHaveLength(3);
+      expect(prisma.transactionSplit.createMany).toHaveBeenCalledWith({
+        data: expect.arrayContaining([
+          expect.objectContaining({ transaction_id: 'tx-split-1', category_id: c1, amount: 40000n }),
+          expect.objectContaining({ transaction_id: 'tx-split-1', category_id: c2, amount: 35000n }),
+          expect.objectContaining({ transaction_id: 'tx-split-1', category_id: c3, amount: 25000n }),
+        ]),
+      });
+      // Saldo akun berkurang tepat 1 kali sebesar 100000
+      expect(prisma.account.update).toHaveBeenCalledTimes(1);
+      expect(prisma.account.update).toHaveBeenCalledWith({
+        where: { id: mockAccount.id, user_id: user.userId },
+        data: { balance: 0n },
+      });
+      // Audit log mencatat splits
+      expect(prisma.transactionAudit.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          transaction_id: 'tx-split-1',
+          action: 'CREATE',
+          after: expect.objectContaining({
+            splits: expect.arrayContaining([
+              expect.objectContaining({ category_id: c1, amount: 40000 }),
+            ]),
+          }),
+        }),
+      });
+    });
+
+    it('AC-2: melempar 422 SPLIT_SUM_MISMATCH jika jumlah nominal split != total amount', async () => {
+      prisma.$queryRaw.mockResolvedValue([mockAccount]);
+      prisma.savingsAllocation.groupBy.mockResolvedValue([]);
+
+      const dto = {
+        type: 'EXPENSE' as const,
+        account_id: mockAccount.id,
+        amount: 100000,
+        splits: [
+          { category_id: c1, amount: 40000 },
+          { category_id: c2, amount: 30000 }, // sum = 70000 != 100000
+        ],
+        date: '2026-11-01',
+        client_tx_id: validUlid,
+      };
+
+      await expect(service.create(user, dto)).rejects.toThrow(
+        UnprocessableEntityException,
+      );
+      await expect(service.create(user, dto)).rejects.toMatchObject({
+        response: { code: 'SPLIT_SUM_MISMATCH' },
+      });
+      expect(prisma.transaction.create).not.toHaveBeenCalled();
+    });
+
+    it('AC-4: melempar 403 FORBIDDEN jika kategori split bukan milik user', async () => {
+      prisma.$queryRaw.mockResolvedValue([mockAccount]);
+      prisma.savingsAllocation.groupBy.mockResolvedValue([]);
+      // Hanya menemukan 1 dari 2 kategori
+      prisma.category.findMany.mockResolvedValue([
+        { id: c1, user_id: user.userId, type: 'EXPENSE', archived: false },
+      ]);
+      prisma.transaction.create.mockImplementation((args: any) => ({
+        id: 'tx-forbidden',
+        ...args.data,
+      }));
+
+      const dto = {
+        type: 'EXPENSE' as const,
+        account_id: mockAccount.id,
+        amount: 100000,
+        splits: [
+          { category_id: c1, amount: 50000 },
+          { category_id: c2, amount: 50000 },
+        ],
+        date: '2026-11-01',
+        client_tx_id: validUlid,
+      };
+
+      await expect(service.create(user, dto)).rejects.toThrow(ForbiddenException);
+      await expect(service.create(user, dto)).rejects.toMatchObject({
+        response: { code: 'FORBIDDEN' },
+      });
+    });
+
+    it('AC-5: tolak 400 INVALID_CATEGORY_TYPE jika ada kategori bertipe salah', async () => {
+      prisma.$queryRaw.mockResolvedValue([mockAccount]);
+      prisma.savingsAllocation.groupBy.mockResolvedValue([]);
+      prisma.category.findMany.mockResolvedValue([
+        { id: c1, user_id: user.userId, type: 'EXPENSE', archived: false },
+        { id: c2, user_id: user.userId, type: 'INCOME', archived: false }, // salah tipe
+      ]);
+      prisma.transaction.create.mockImplementation((args: any) => ({
+        id: 'tx-inv-type',
+        ...args.data,
+      }));
+
+      const dto = {
+        type: 'EXPENSE' as const,
+        account_id: mockAccount.id,
+        amount: 100000,
+        splits: [
+          { category_id: c1, amount: 50000 },
+          { category_id: c2, amount: 50000 },
+        ],
+        date: '2026-11-01',
+        client_tx_id: validUlid,
+      };
+
+      await expect(service.create(user, dto)).rejects.toThrow(BadRequestException);
+      await expect(service.create(user, dto)).rejects.toMatchObject({
+        response: { code: 'INVALID_CATEGORY_TYPE' },
+      });
+    });
+
+    it('AC-5: tolak 422 CATEGORY_ARCHIVED jika ada kategori yang diarsipkan', async () => {
+      prisma.$queryRaw.mockResolvedValue([mockAccount]);
+      prisma.savingsAllocation.groupBy.mockResolvedValue([]);
+      prisma.category.findMany.mockResolvedValue([
+        { id: c1, user_id: user.userId, type: 'EXPENSE', archived: false },
+        { id: c2, user_id: user.userId, type: 'EXPENSE', archived: true }, // diarsipkan
+      ]);
+      prisma.transaction.create.mockImplementation((args: any) => ({
+        id: 'tx-arch',
+        ...args.data,
+      }));
+
+      const dto = {
+        type: 'EXPENSE' as const,
+        account_id: mockAccount.id,
+        amount: 100000,
+        splits: [
+          { category_id: c1, amount: 50000 },
+          { category_id: c2, amount: 50000 },
+        ],
+        date: '2026-11-01',
+        client_tx_id: validUlid,
+      };
+
+      await expect(service.create(user, dto)).rejects.toThrow(
+        UnprocessableEntityException,
+      );
+      await expect(service.create(user, dto)).rejects.toMatchObject({
+        response: { code: 'CATEGORY_ARCHIVED' },
       });
     });
   });

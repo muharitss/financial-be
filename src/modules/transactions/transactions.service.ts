@@ -5,6 +5,7 @@ import {
   ConflictException,
   BadRequestException,
   UnprocessableEntityException,
+  ForbiddenException,
 } from '@nestjs/common';
 import { Prisma, TransactionStatus } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service.js';
@@ -16,6 +17,7 @@ import {
   type CreateExpenseDto,
   type CreateTransferDto,
   type CreateAdjustmentDto,
+  type SplitItemDto,
 } from './dto/transaction.dto.js';
 
 export interface TransactionResponse {
@@ -37,6 +39,7 @@ export interface TransactionResponse {
   note: string | null;
   client_tx_id: string;
   tags?: string[];
+  splits?: Array<{ id?: string; category_id: string; amount: number }>;
   processed_at: Date | null;
   cancelled_at: Date | null;
   created_at: Date;
@@ -64,6 +67,7 @@ export function toTransactionResponse(
     note?: string | null;
     client_tx_id: string;
     tags?: Array<{ tag_id?: string; id?: string } | string>;
+    splits?: Array<{ id?: string; category_id: string; amount: bigint | number }>;
     processed_at?: Date | null;
     cancelled_at?: Date | null;
     created_at: Date;
@@ -81,6 +85,15 @@ export function toTransactionResponse(
   const tags = Array.isArray(tx.tags)
     ? tx.tags.map((t) => (typeof t === 'string' ? t : (t.tag_id ?? t.id ?? '')))
     : [];
+
+  const splits =
+    Array.isArray(tx.splits) && tx.splits.length > 0
+      ? tx.splits.map((s: any) => ({
+          id: s.id,
+          category_id: s.category_id,
+          amount: Number(s.amount),
+        }))
+      : undefined;
 
   const res: TransactionResponse = {
     id: tx.id,
@@ -101,6 +114,7 @@ export function toTransactionResponse(
     note: tx.note ?? null,
     client_tx_id: tx.client_tx_id,
     tags,
+    splits,
     processed_at: tx.processed_at ?? null,
     cancelled_at: tx.cancelled_at ?? null,
     created_at: tx.created_at,
@@ -200,30 +214,40 @@ export class TransactionsService {
           });
         }
 
-        // 2. Cek kategori
-        const category = await tx.category.findFirst({
-          where: { id: dto.category_id, user_id: user.userId },
-        });
-
-        if (!category) {
-          throw new NotFoundException({
-            code: 'CATEGORY_NOT_FOUND',
-            message: 'Kategori tidak ditemukan',
+        // 2. Cek kategori jika tidak menggunakan splits
+        if (dto.splits && dto.splits.length > 0) {
+          await this.validateAndCreateSplits(
+            tx,
+            user.userId,
+            'INCOME',
+            dto.amount,
+            dto.splits,
+          );
+        } else {
+          const category = await tx.category.findFirst({
+            where: { id: dto.category_id, user_id: user.userId },
           });
-        }
 
-        if (category.archived) {
-          throw new UnprocessableEntityException({
-            code: 'CATEGORY_ARCHIVED',
-            message: 'Kategori telah diarsipkan',
-          });
-        }
+          if (!category) {
+            throw new NotFoundException({
+              code: 'CATEGORY_NOT_FOUND',
+              message: 'Kategori tidak ditemukan',
+            });
+          }
 
-        if (category.type !== 'INCOME') {
-          throw new BadRequestException({
-            code: 'INVALID_CATEGORY_TYPE',
-            message: 'Kategori harus bertipe INCOME',
-          });
+          if (category.archived) {
+            throw new UnprocessableEntityException({
+              code: 'CATEGORY_ARCHIVED',
+              message: 'Kategori telah diarsipkan',
+            });
+          }
+
+          if (category.type !== 'INCOME') {
+            throw new BadRequestException({
+              code: 'INVALID_CATEGORY_TYPE',
+              message: 'Kategori harus bertipe INCOME',
+            });
+          }
         }
 
         // 3. Cek tags jika ada
@@ -263,13 +287,34 @@ export class TransactionsService {
             amount: BigInt(dto.amount),
             date: new Date(`${dto.date}T00:00:00.000Z`),
             status,
-            category_id: dto.category_id,
+            category_id: dto.splits && dto.splits.length > 0 ? null : (dto.category_id ?? null),
             note: dto.note ?? null,
             client_tx_id: clientTxId,
           },
         });
 
-        // 6. Relasi tag
+        // 6. Relasi splits
+        let splitRecords:
+          | Array<{
+              id: string;
+              transaction_id: string;
+              category_id: string;
+              amount: bigint;
+            }>
+          | undefined;
+        if (dto.splits && dto.splits.length > 0) {
+          splitRecords = dto.splits.map((s) => ({
+            id: randomUUID(),
+            transaction_id: created.id,
+            category_id: s.category_id,
+            amount: BigInt(s.amount),
+          }));
+          await tx.transactionSplit.createMany({
+            data: splitRecords,
+          });
+        }
+
+        // 7. Relasi tag
         if (tagIds.length > 0) {
           await tx.transactionTag.createMany({
             data: tagIds.map((tag_id) => ({
@@ -279,7 +324,7 @@ export class TransactionsService {
           });
         }
 
-        // 7. Update balance akun jika POSTED
+        // 8. Update balance akun jika POSTED
         let finalBalance = account.balance;
         if (status === 'POSTED') {
           finalBalance = account.balance + BigInt(dto.amount);
@@ -294,11 +339,12 @@ export class TransactionsService {
           warning = 'NEGATIVE_BALANCE';
         }
 
-        // 8. Buat TransactionAudit (C-06, NFR-TRX-005)
+        // 9. Buat TransactionAudit (C-06, NFR-TRX-005)
         const response = toTransactionResponse(
           {
             ...created,
             tags: tagIds,
+            splits: splitRecords,
           },
           warning,
         );
@@ -370,30 +416,40 @@ export class TransactionsService {
           });
         }
 
-        // 2. Cek kategori
-        const category = await tx.category.findFirst({
-          where: { id: dto.category_id, user_id: user.userId },
-        });
-
-        if (!category) {
-          throw new NotFoundException({
-            code: 'CATEGORY_NOT_FOUND',
-            message: 'Kategori tidak ditemukan',
+        // 2. Cek kategori jika tidak menggunakan splits
+        if (dto.splits && dto.splits.length > 0) {
+          await this.validateAndCreateSplits(
+            tx,
+            user.userId,
+            'EXPENSE',
+            dto.amount,
+            dto.splits,
+          );
+        } else {
+          const category = await tx.category.findFirst({
+            where: { id: dto.category_id, user_id: user.userId },
           });
-        }
 
-        if (category.archived) {
-          throw new UnprocessableEntityException({
-            code: 'CATEGORY_ARCHIVED',
-            message: 'Kategori telah diarsipkan',
-          });
-        }
+          if (!category) {
+            throw new NotFoundException({
+              code: 'CATEGORY_NOT_FOUND',
+              message: 'Kategori tidak ditemukan',
+            });
+          }
 
-        if (category.type !== 'EXPENSE') {
-          throw new BadRequestException({
-            code: 'INVALID_CATEGORY_TYPE',
-            message: 'Kategori harus bertipe EXPENSE',
-          });
+          if (category.archived) {
+            throw new UnprocessableEntityException({
+              code: 'CATEGORY_ARCHIVED',
+              message: 'Kategori telah diarsipkan',
+            });
+          }
+
+          if (category.type !== 'EXPENSE') {
+            throw new BadRequestException({
+              code: 'INVALID_CATEGORY_TYPE',
+              message: 'Kategori harus bertipe EXPENSE',
+            });
+          }
         }
 
         // 3. Cek tags jika ada
@@ -455,13 +511,34 @@ export class TransactionsService {
             amount: BigInt(dto.amount),
             date: new Date(`${dto.date}T00:00:00.000Z`),
             status,
-            category_id: dto.category_id,
+            category_id: dto.splits && dto.splits.length > 0 ? null : (dto.category_id ?? null),
             note: dto.note ?? null,
             client_tx_id: clientTxId,
           },
         });
 
-        // 6. Relasi tag
+        // 6. Relasi splits
+        let splitRecords:
+          | Array<{
+              id: string;
+              transaction_id: string;
+              category_id: string;
+              amount: bigint;
+            }>
+          | undefined;
+        if (dto.splits && dto.splits.length > 0) {
+          splitRecords = dto.splits.map((s) => ({
+            id: randomUUID(),
+            transaction_id: created.id,
+            category_id: s.category_id,
+            amount: BigInt(s.amount),
+          }));
+          await tx.transactionSplit.createMany({
+            data: splitRecords,
+          });
+        }
+
+        // 7. Relasi tag
         if (tagIds.length > 0) {
           await tx.transactionTag.createMany({
             data: tagIds.map((tag_id) => ({
@@ -471,7 +548,7 @@ export class TransactionsService {
           });
         }
 
-        // 7. Update balance akun jika POSTED
+        // 8. Update balance akun jika POSTED
         let finalBalance = account.balance;
         if (status === 'POSTED') {
           finalBalance = account.balance - BigInt(dto.amount);
@@ -486,11 +563,12 @@ export class TransactionsService {
           warning = 'NEGATIVE_BALANCE';
         }
 
-        // 8. Buat TransactionAudit (C-06, NFR-TRX-005)
+        // 9. Buat TransactionAudit (C-06, NFR-TRX-005)
         const response = toTransactionResponse(
           {
             ...created,
             tags: tagIds,
+            splits: splitRecords,
           },
           warning,
         );
@@ -965,6 +1043,48 @@ export class TransactionsService {
         });
       }
       throw error;
+    }
+  }
+
+  private async validateAndCreateSplits(
+    tx: Prisma.TransactionClient,
+    userId: string,
+    txType: 'INCOME' | 'EXPENSE',
+    totalAmount: number,
+    splits: SplitItemDto[],
+  ) {
+    const sum = splits.reduce((acc, s) => acc + BigInt(s.amount), 0n);
+    if (sum !== BigInt(totalAmount)) {
+      throw new UnprocessableEntityException({
+        code: 'SPLIT_SUM_MISMATCH',
+        message: 'Total nominal split harus sama dengan nominal transaksi',
+      });
+    }
+
+    const uniqueCatIds = Array.from(new Set(splits.map((s) => s.category_id)));
+    const categories = await tx.category.findMany({
+      where: { id: { in: uniqueCatIds }, user_id: userId },
+    });
+
+    if (categories.length !== uniqueCatIds.length) {
+      throw new ForbiddenException({
+        code: 'FORBIDDEN',
+        message: 'Kategori split tidak ditemukan atau bukan milik Anda',
+      });
+    }
+
+    if (categories.some((c) => c.archived)) {
+      throw new UnprocessableEntityException({
+        code: 'CATEGORY_ARCHIVED',
+        message: 'Kategori telah diarsipkan',
+      });
+    }
+
+    if (categories.some((c) => c.type !== txType)) {
+      throw new BadRequestException({
+        code: 'INVALID_CATEGORY_TYPE',
+        message: `Kategori harus bertipe ${txType}`,
+      });
     }
   }
 }
