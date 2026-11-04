@@ -6,6 +6,7 @@ import cookieParser from 'cookie-parser';
 import { AppModule } from '../src/app.module.js';
 import { PrismaService } from '../src/prisma/prisma.service.js';
 import { AllExceptionsFilter } from '../src/common/filters/all-exceptions.filter.js';
+import { ScheduledTransactionService } from '../src/modules/transactions/scheduled-transaction.service.js';
 
 function generateTestUlid(): string {
   const chars = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
@@ -20,6 +21,7 @@ describe('Transactions E2E Test Suite (Supertest)', () => {
   let app: INestApplication;
   let prisma: PrismaService;
   let throttlerStorage: any;
+  let scheduledService: ScheduledTransactionService;
 
   let userAHeaders: { cookie: string };
   let userBHeaders: { cookie: string };
@@ -45,6 +47,7 @@ describe('Transactions E2E Test Suite (Supertest)', () => {
 
     prisma = app.get(PrismaService);
     throttlerStorage = app.get(ThrottlerStorage);
+    scheduledService = app.get(ScheduledTransactionService);
 
     // Bersihkan test data lama
     await prisma.asSystem().transactionAudit.deleteMany();
@@ -1662,6 +1665,196 @@ describe('Transactions E2E Test Suite (Supertest)', () => {
       expect(res.body.amount).toBe(200000);
       expect(res.body.category_id).toBeNull();
       expect(res.body.splits).toHaveLength(2);
+    });
+  });
+
+  describe('SCHEDULED TRANSACTION POSTING (TASK-045)', () => {
+    it('AC-1: Transaksi EXPENSE status = SCHEDULED dengan date <= today -> diposting -> status POSTED, balance berkurang, dan audit log tercatat', async () => {
+      const acc = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Akun Sched AC-1',
+          type: 'BANK',
+          opening_balance: 200000n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 200000n,
+        },
+      });
+
+      const schedTx = await prisma.asSystem().transaction.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          account_id: acc.id,
+          type: 'EXPENSE',
+          amount: 50000n,
+          date: new Date('2026-11-01T00:00:00.000Z'),
+          status: 'SCHEDULED',
+          category_id: expenseCategoryA.id,
+          client_tx_id: generateTestUlid(),
+        },
+      });
+
+      const result = await scheduledService.processDueForUser(userAId);
+      expect(result.processedCount).toBeGreaterThanOrEqual(1);
+
+      const postedTx = await prisma.asSystem().transaction.findUnique({
+        where: { id: schedTx.id },
+      });
+      expect(postedTx!.status).toBe('POSTED');
+      expect(postedTx!.processed_at).not.toBeNull();
+      expect(postedTx!.job_run_id).not.toBeNull();
+
+      const updatedAcc = await prisma.account.findFirst({
+        where: { id: acc.id, user_id: userAId },
+      });
+      expect(updatedAcc!.balance).toBe(150000n);
+
+      const audits = await prisma.asSystem().transactionAudit.findMany({
+        where: { transaction_id: schedTx.id, action: 'UPDATE' },
+      });
+      expect(audits).toHaveLength(1);
+      expect(audits[0].reason).toBe('Auto-posted scheduled transaction');
+      expect(audits[0].before).toMatchObject({ status: 'SCHEDULED' });
+      expect(audits[0].after).toMatchObject({ status: 'POSTED' });
+    });
+
+    it('AC-2: Transaksi SCHEDULED dengan date > today tidak ikut diposting dan saldo akun tidak berubah', async () => {
+      const acc = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Akun Sched AC-2',
+          type: 'BANK',
+          opening_balance: 200000n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 200000n,
+        },
+      });
+
+      const futureTx = await prisma.asSystem().transaction.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          account_id: acc.id,
+          type: 'EXPENSE',
+          amount: 50000n,
+          date: new Date('2099-12-31T00:00:00.000Z'), // date > today
+          status: 'SCHEDULED',
+          category_id: expenseCategoryA.id,
+          client_tx_id: generateTestUlid(),
+        },
+      });
+
+      await scheduledService.processDueForUser(userAId);
+
+      const checkTx = await prisma.asSystem().transaction.findUnique({
+        where: { id: futureTx.id },
+      });
+      expect(checkTx!.status).toBe('SCHEDULED');
+      expect(checkTx!.processed_at).toBeNull();
+
+      const checkAcc = await prisma.account.findFirst({
+        where: { id: acc.id, user_id: userAId },
+      });
+      expect(checkAcc!.balance).toBe(200000n);
+    });
+
+    it('AC-3 (konkurensi / idempotensi): processDueForUser dan runDailyScheduledPosting bersamaan -> saldo berkurang tepat 1x', async () => {
+      const acc = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Akun Sched AC-3',
+          type: 'BANK',
+          opening_balance: 200000n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 200000n,
+        },
+      });
+
+      const schedTx = await prisma.asSystem().transaction.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          account_id: acc.id,
+          type: 'EXPENSE',
+          amount: 40000n,
+          date: new Date('2026-11-01T00:00:00.000Z'),
+          status: 'SCHEDULED',
+          category_id: expenseCategoryA.id,
+          client_tx_id: generateTestUlid(),
+        },
+      });
+
+      // Panggil bersamaan
+      await Promise.all([
+        scheduledService.processDueForUser(userAId),
+        scheduledService.runDailyScheduledPosting(),
+      ]);
+
+      const checkAcc = await prisma.account.findFirst({
+        where: { id: acc.id, user_id: userAId },
+      });
+      expect(checkAcc!.balance).toBe(160000n); // 200000 - 40000, tepat 1x
+
+      const checkTx = await prisma.asSystem().transaction.findUnique({
+        where: { id: schedTx.id },
+      });
+      expect(checkTx!.status).toBe('POSTED');
+    });
+
+    it('AC-4: Saat user login (POST /auth/login), onLoginPostProcess memicu pemrosesan transaksi SCHEDULED', async () => {
+      const acc = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Akun Sched AC-4',
+          type: 'BANK',
+          opening_balance: 200000n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 200000n,
+        },
+      });
+
+      const schedTx = await prisma.asSystem().transaction.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          account_id: acc.id,
+          type: 'EXPENSE',
+          amount: 30000n,
+          date: new Date('2026-11-01T00:00:00.000Z'),
+          status: 'SCHEDULED',
+          category_id: expenseCategoryA.id,
+          client_tx_id: generateTestUlid(),
+        },
+      });
+
+      // Login User A
+      const res = await request(app.getHttpServer())
+        .post('/auth/login')
+        .send({
+          email: 'user-a-trx@duitku.test',
+          password: 'Password123!',
+        });
+
+      expect(res.status).toBe(200);
+
+      // Tunggu fire-and-forget selesai
+      await new Promise((resolve) => setTimeout(resolve, 300));
+
+      const checkTx = await prisma.asSystem().transaction.findUnique({
+        where: { id: schedTx.id },
+      });
+      expect(checkTx!.status).toBe('POSTED');
+      expect(checkTx!.processed_at).not.toBeNull();
+
+      const checkAcc = await prisma.account.findFirst({
+        where: { id: acc.id, user_id: userAId },
+      });
+      expect(checkAcc!.balance).toBe(170000n);
     });
   });
 });

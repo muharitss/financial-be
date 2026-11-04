@@ -3,22 +3,26 @@ import {
   UnauthorizedException,
   ConflictException,
   ForbiddenException,
+  Logger,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import * as argon2 from '@node-rs/argon2';
 import { randomBytes, createHash } from 'node:crypto';
 import { LoginCooldownTracker } from '../../common/throttler/throttler.config.js';
 import { PrismaService } from '../../prisma/prisma.service.js';
+import { ScheduledTransactionService } from '../transactions/scheduled-transaction.service.js';
 import type { RegisterDto, LoginDto } from './dto/auth.dto.js';
 import { seedDefaultCategories } from '../categories/default-categories.js';
 
 @Injectable()
 export class AuthService {
+  private readonly logger = new Logger(AuthService.name);
   private readonly cooldown = new LoginCooldownTracker();
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly jwtService: JwtService,
+    private readonly scheduledTransactionService?: ScheduledTransactionService,
   ) {}
 
   async register(dto: RegisterDto) {
@@ -254,8 +258,14 @@ export class AuthService {
     return { ok: true };
   }
 
-  onLoginPostProcess(_userId: string): void {
-    // shortcut: stub for TASK-045 scheduled posting on login, will be hooked in phase 4
+  onLoginPostProcess(userId: string): void {
+    this.scheduledTransactionService
+      ?.processDueForUser(userId)
+      .catch((err) => {
+        this.logger.warn(
+          `Failed to process scheduled transactions on login for user ${userId}: ${err.message}`,
+        );
+      });
   }
 
   private async issueTokens(userId: string, role: string) {
