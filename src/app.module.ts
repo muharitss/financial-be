@@ -8,6 +8,7 @@ import { PrismaModule } from './prisma/prisma.module.js';
 import { HealthModule } from './modules/health/health.module.js';
 import { AuthModule } from './modules/auth/auth.module.js';
 import { UsersModule } from './modules/users/users.module.js';
+import { AccountsModule } from './modules/accounts/accounts.module.js';
 import { LoggerModule } from './common/logger/logger.module.js';
 import { TraceMiddleware } from './common/logger/trace.middleware.js';
 import { throttlerConfig } from './common/throttler/throttler.config.js';
@@ -26,6 +27,7 @@ export const { ObserveModule, ObserveInstrument } = createObserveModule();
     PassportModule.register({ defaultStrategy: 'jwt' }),
     AuthModule,
     UsersModule,
+    AccountsModule,
     HealthModule,
     ObserveModule.forRoot({
       appKey: process.env.OBSERVE_APP_KEY ?? 'YOUR_APP_KEY',
