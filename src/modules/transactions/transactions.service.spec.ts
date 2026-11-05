@@ -53,6 +53,7 @@ describe('TransactionsService', () => {
       },
       account: {
         findFirst: jest.fn<any>(),
+        findFirstOrThrow: jest.fn<any>(),
         update: jest.fn<any>(),
       },
       transaction: {
@@ -1406,6 +1407,127 @@ describe('TransactionsService', () => {
       await expect(service.createAdjustment(user, dto)).rejects.toMatchObject({
         response: { code: 'CLIENT_TX_ID_DUPLICATE' },
       });
+    });
+  });
+
+  describe('adjustToTarget (TASK-034)', () => {
+    const fullMockAccount = {
+      id: mockAccount.id,
+      name: 'Kas Utama',
+      type: 'CASH',
+      provider: null,
+      note: null,
+      opening_balance: 1000000n,
+      opening_date: new Date('2026-01-01'),
+      balance: 1000000n,
+      allow_negative: false,
+      archived: false,
+      archived_at: null,
+      created_at: new Date('2026-01-01'),
+    };
+
+    it('berhasil menyesuaikan saldo ke saldo target dan memanggil createAdjustment', async () => {
+      const mockAcc = {
+        id: mockAccount.id,
+        financial_profile_id: mockAccount.financial_profile_id,
+        balance: 1000000n,
+        allow_negative: false,
+        archived: false,
+      };
+      prisma.$queryRaw.mockResolvedValue([mockAcc]);
+      prisma.savingsAllocation.groupBy.mockResolvedValue([]);
+      prisma.transaction.create.mockImplementation((args: any) => ({
+        id: 'tx-adj-target-1',
+        ...args.data,
+        created_at: new Date(),
+        updated_at: new Date(),
+      }));
+      prisma.account.findFirstOrThrow.mockResolvedValue({
+        ...fullMockAccount,
+        balance: 950000n,
+      });
+
+      const res = await service.adjustToTarget(user, mockAccount.id, {
+        target_balance: 950000,
+        reason: 'Koreksi kas fisik',
+        client_tx_id: validUlid,
+      });
+
+      expect(res.transaction_id).toBe('tx-adj-target-1');
+      expect(res.amount).toBe(-50000);
+      expect(res.account.balance).toBe(950000);
+    });
+
+    it('melempar 422 NO_BALANCE_CHANGE jika target_balance sama dengan saldo saat ini', async () => {
+      prisma.$queryRaw.mockResolvedValue([
+        {
+          id: mockAccount.id,
+          financial_profile_id: mockAccount.financial_profile_id,
+          balance: 1000000n,
+          allow_negative: false,
+          archived: false,
+        },
+      ]);
+
+      await expect(
+        service.adjustToTarget(user, mockAccount.id, {
+          target_balance: 1000000,
+          reason: 'Koreksi kas fisik',
+          client_tx_id: validUlid,
+        }),
+      ).rejects.toThrow(UnprocessableEntityException);
+    });
+
+    it('melempar 404 ACCOUNT_NOT_FOUND jika akun tidak ditemukan', async () => {
+      prisma.$queryRaw.mockResolvedValue([]);
+
+      await expect(
+        service.adjustToTarget(user, mockAccount.id, {
+          target_balance: 900000,
+          reason: 'Koreksi kas fisik',
+          client_tx_id: validUlid,
+        }),
+      ).rejects.toThrow(NotFoundException);
+    });
+
+    it('melempar 409 ACCOUNT_ARCHIVED jika akun telah diarsipkan', async () => {
+      prisma.$queryRaw.mockResolvedValue([
+        {
+          id: mockAccount.id,
+          financial_profile_id: mockAccount.financial_profile_id,
+          balance: 1000000n,
+          allow_negative: false,
+          archived: true,
+        },
+      ]);
+
+      await expect(
+        service.adjustToTarget(user, mockAccount.id, {
+          target_balance: 900000,
+          reason: 'Koreksi kas fisik',
+          client_tx_id: validUlid,
+        }),
+      ).rejects.toThrow(ConflictException);
+    });
+
+    it('melempar 409 NEGATIVE_BALANCE_NOT_ALLOWED jika target_balance < 0 dan allow_negative = false', async () => {
+      prisma.$queryRaw.mockResolvedValue([
+        {
+          id: mockAccount.id,
+          financial_profile_id: mockAccount.financial_profile_id,
+          balance: 100000n,
+          allow_negative: false,
+          archived: false,
+        },
+      ]);
+
+      await expect(
+        service.adjustToTarget(user, mockAccount.id, {
+          target_balance: -50000,
+          reason: 'Koreksi kas fisik minus',
+          client_tx_id: validUlid,
+        }),
+      ).rejects.toThrow(ConflictException);
     });
   });
 
