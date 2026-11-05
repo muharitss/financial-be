@@ -2208,4 +2208,348 @@ describe('Transactions E2E Test Suite (Supertest)', () => {
       expect(res2.body.code).toBe('MISSING_CLIENT_TX_ID');
     });
   });
+
+  describe('REVERSAL ENDPOINTS (TASK-047)', () => {
+    it('AC-1: Expense POSTED 100000 (saldo akun 400000) -> POST /transactions/:id/reverse -> 201, transaksi asli REVERSED, reversal dibuat, saldo 500000', async () => {
+      const acc = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Akun Rev AC-1',
+          type: 'BANK',
+          opening_balance: 500000n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 400000n,
+        },
+      });
+
+      const tx = await prisma.asSystem().transaction.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          account_id: acc.id,
+          type: 'EXPENSE',
+          amount: 100000n,
+          date: new Date('2026-11-01T00:00:00.000Z'),
+          status: 'POSTED',
+          category_id: expenseCategoryA.id,
+          client_tx_id: generateTestUlid(),
+        },
+      });
+
+      const clientTxId = generateTestUlid();
+      const res = await request(app.getHttpServer())
+        .post(`/transactions/${tx.id}/reverse`)
+        .set(userAHeaders)
+        .send({
+          reason: 'Salah input nominal',
+          client_tx_id: clientTxId,
+        });
+
+      expect(res.status).toBe(201);
+      expect(res.body.reversal_id).toBeDefined();
+      expect(res.body.transaction.type).toBe('REVERSAL');
+      expect(res.body.transaction.parent_transaction_id).toBe(tx.id);
+      expect(res.body.transaction.amount).toBe(100000);
+
+      const originalCheck = await prisma.asSystem().transaction.findUnique({
+        where: { id: tx.id },
+      });
+      expect(originalCheck!.status).toBe('REVERSED');
+
+      const accCheck = await prisma.account.findFirst({
+        where: { id: acc.id, user_id: userAId },
+      });
+      expect(accCheck!.balance).toBe(500000n);
+
+      const audits = await prisma.asSystem().transactionAudit.findMany({
+        where: { transaction_id: { in: [tx.id, res.body.reversal_id] } },
+      });
+      expect(audits).toHaveLength(2);
+      const revAudit = audits.find((a) => a.action === 'REVERSE');
+      const createAudit = audits.find((a) => a.action === 'CREATE');
+      expect(revAudit).toBeDefined();
+      expect(createAudit).toBeDefined();
+    });
+
+    it('AC-2: Memanggil POST /transactions/:id/reverse kedua kali pada transaksi yang sudah REVERSED -> 409 ALREADY_REVERSED', async () => {
+      const acc = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Akun Rev AC-2',
+          type: 'BANK',
+          opening_balance: 500000n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 400000n,
+        },
+      });
+
+      const tx = await prisma.asSystem().transaction.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          account_id: acc.id,
+          type: 'EXPENSE',
+          amount: 50000n,
+          date: new Date('2026-11-01T00:00:00.000Z'),
+          status: 'REVERSED',
+          category_id: expenseCategoryA.id,
+          client_tx_id: generateTestUlid(),
+        },
+      });
+
+      const res = await request(app.getHttpServer())
+        .post(`/transactions/${tx.id}/reverse`)
+        .set(userAHeaders)
+        .send({
+          client_tx_id: generateTestUlid(),
+        });
+
+      expect(res.status).toBe(409);
+      expect(res.body.code).toBe('ALREADY_REVERSED');
+    });
+
+    it('AC-3: Reverse transaksi EXPENSE dengan 3 splits -> transaksi REVERSAL memiliki 3 splits identik', async () => {
+      const acc = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Akun Rev AC-3',
+          type: 'BANK',
+          opening_balance: 500000n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 400000n,
+        },
+      });
+
+      const c1 = await prisma.category.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Split Rev C1',
+          type: 'EXPENSE',
+        },
+      });
+      const c2 = await prisma.category.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Split Rev C2',
+          type: 'EXPENSE',
+        },
+      });
+      const c3 = await prisma.category.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Split Rev C3',
+          type: 'EXPENSE',
+        },
+      });
+
+      const tx = await prisma.asSystem().transaction.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          account_id: acc.id,
+          type: 'EXPENSE',
+          amount: 100000n,
+          date: new Date('2026-11-01T00:00:00.000Z'),
+          status: 'POSTED',
+          category_id: null,
+          client_tx_id: generateTestUlid(),
+        },
+      });
+
+      await prisma.transactionSplit.createMany({
+        data: [
+          { transaction_id: tx.id, category_id: c1.id, amount: 40000n },
+          { transaction_id: tx.id, category_id: c2.id, amount: 35000n },
+          { transaction_id: tx.id, category_id: c3.id, amount: 25000n },
+        ],
+      });
+
+      const res = await request(app.getHttpServer())
+        .post(`/transactions/${tx.id}/reverse`)
+        .set(userAHeaders)
+        .send({
+          client_tx_id: generateTestUlid(),
+        });
+
+      expect(res.status).toBe(201);
+      expect(res.body.transaction.splits).toHaveLength(3);
+
+      const dbSplits = await prisma.transactionSplit.findMany({
+        where: { transaction_id: res.body.reversal_id },
+        orderBy: { amount: 'desc' },
+      });
+      expect(dbSplits).toHaveLength(3);
+      expect(dbSplits[0].amount).toBe(40000n);
+      expect(dbSplits[1].amount).toBe(35000n);
+      expect(dbSplits[2].amount).toBe(25000n);
+    });
+
+    it('AC-4: Reverse TRANSFER Metode A membalik TRANSFER dan EXPENSE fee secara atomic', async () => {
+      const fromAcc = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Akun Src Rev AC-4',
+          type: 'BANK',
+          opening_balance: 1000000n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 493500n,
+        },
+      });
+      const toAcc = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Akun Dst Rev AC-4',
+          type: 'BANK',
+          opening_balance: 0n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 500000n,
+        },
+      });
+
+      const transferGroupId = '00000000-0000-0000-0000-000000000042';
+
+      const transferTx = await prisma.asSystem().transaction.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          account_id: fromAcc.id,
+          to_account_id: toAcc.id,
+          type: 'TRANSFER',
+          amount: 500000n,
+          date: new Date('2026-11-01T00:00:00.000Z'),
+          status: 'POSTED',
+          transfer_group_id: transferGroupId,
+          transfer_fee: 6500n,
+          fee_mode: 'SEPARATE',
+          client_tx_id: generateTestUlid(),
+        },
+      });
+
+      const feeTx = await prisma.asSystem().transaction.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          account_id: fromAcc.id,
+          type: 'EXPENSE',
+          amount: 6500n,
+          date: new Date('2026-11-01T00:00:00.000Z'),
+          status: 'POSTED',
+          category_id: expenseCategoryA.id,
+          transfer_group_id: transferGroupId,
+          client_tx_id: generateTestUlid(),
+        },
+      });
+
+      const res = await request(app.getHttpServer())
+        .post(`/transactions/${transferTx.id}/reverse`)
+        .set(userAHeaders)
+        .send({
+          client_tx_id: generateTestUlid(),
+        });
+
+      expect(res.status).toBe(201);
+
+      const updatedTransfer = await prisma.asSystem().transaction.findUnique({
+        where: { id: transferTx.id },
+      });
+      const updatedFee = await prisma.asSystem().transaction.findUnique({
+        where: { id: feeTx.id },
+      });
+      expect(updatedTransfer!.status).toBe('REVERSED');
+      expect(updatedFee!.status).toBe('REVERSED');
+
+      const fromCheck = await prisma.account.findFirst({
+        where: { id: fromAcc.id, user_id: userAId },
+      });
+      const toCheck = await prisma.account.findFirst({
+        where: { id: toAcc.id, user_id: userAId },
+      });
+      expect(fromCheck!.balance).toBe(1000000n);
+      expect(toCheck!.balance).toBe(0n);
+    });
+
+    it('AC-5: Memanggil /reverse pada transaksi SCHEDULED -> 409 CANNOT_REVERSE_SCHEDULED', async () => {
+      const acc = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Akun Rev AC-5',
+          type: 'BANK',
+          opening_balance: 500000n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 500000n,
+        },
+      });
+
+      const tx = await prisma.asSystem().transaction.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          account_id: acc.id,
+          type: 'EXPENSE',
+          amount: 50000n,
+          date: new Date('2026-11-15T00:00:00.000Z'),
+          status: 'SCHEDULED',
+          category_id: expenseCategoryA.id,
+          client_tx_id: generateTestUlid(),
+        },
+      });
+
+      const res = await request(app.getHttpServer())
+        .post(`/transactions/${tx.id}/reverse`)
+        .set(userAHeaders)
+        .send({
+          client_tx_id: generateTestUlid(),
+        });
+
+      expect(res.status).toBe(409);
+      expect(res.body.code).toBe('CANNOT_REVERSE_SCHEDULED');
+    });
+
+    it('AC-6 (isolasi): User B me-reverse transaksi User A -> 404 TRANSACTION_NOT_FOUND', async () => {
+      const acc = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Akun Rev AC-6',
+          type: 'BANK',
+          opening_balance: 500000n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 500000n,
+        },
+      });
+
+      const tx = await prisma.asSystem().transaction.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          account_id: acc.id,
+          type: 'EXPENSE',
+          amount: 50000n,
+          date: new Date('2026-11-01T00:00:00.000Z'),
+          status: 'POSTED',
+          category_id: expenseCategoryA.id,
+          client_tx_id: generateTestUlid(),
+        },
+      });
+
+      const res = await request(app.getHttpServer())
+        .post(`/transactions/${tx.id}/reverse`)
+        .set(userBHeaders)
+        .send({
+          client_tx_id: generateTestUlid(),
+        });
+
+      expect(res.status).toBe(404);
+      expect(res.body.code).toBe('TRANSACTION_NOT_FOUND');
+    });
+  });
 });

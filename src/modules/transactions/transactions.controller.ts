@@ -19,6 +19,8 @@ import {
   type CreateTransactionDto,
   UpdateTransactionPipe,
   type UpdateTransactionDto,
+  ReverseTransactionPipe,
+  type ReverseTransactionDto,
 } from './dto/transaction.dto.js';
 import {
   TransactionsService,
@@ -67,5 +69,28 @@ export class TransactionsController {
     @Headers('idempotency-key') headerIdempotencyKey?: string,
   ): Promise<{ transaction: TransactionResponse; audit_id: string; warning?: string }> {
     return this.transactionsService.update(user, id, dto, headerIdempotencyKey);
+  }
+
+  @Post(':id/reverse')
+  @HttpCode(HttpStatus.CREATED)
+  @Throttle({ transaction: { limit: 60, ttl: 60000 } })
+  @ApiOperation({ summary: 'Membalik transaksi (reversal)' })
+  @ApiResponse({ status: 201, description: 'Transaksi berhasil di-reverse' })
+  @ApiResponse({ status: 400, description: 'Data tidak valid' })
+  @ApiResponse({ status: 401, description: 'Sesi tidak valid' })
+  @ApiResponse({ status: 404, description: 'Transaksi tidak ditemukan' })
+  @ApiResponse({ status: 409, description: 'Status konflik (ALREADY_REVERSED, CANNOT_REVERSE_SCHEDULED, TRANSACTION_CANCELLED, INSUFFICIENT_BALANCE)' })
+  @ApiResponse({ status: 422, description: 'Validasi bisnis gagal (MISSING_CLIENT_TX_ID, NESTED_SPLIT_REVERSAL_NOT_SUPPORTED)' })
+  async reverse(
+    @CurrentUser() user: { userId: string; role?: string },
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body(new ReverseTransactionPipe()) dto: ReverseTransactionDto,
+    @Headers('idempotency-key') headerIdempotencyKey?: string,
+  ): Promise<{
+    reversal_id: string;
+    transaction: TransactionResponse;
+    warning?: string;
+  }> {
+    return this.transactionsService.reverse(user, id, dto, headerIdempotencyKey);
   }
 }

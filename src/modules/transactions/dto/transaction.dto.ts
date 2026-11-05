@@ -183,6 +183,37 @@ export const updateTransactionSchema = z
 
 export type UpdateTransactionDto = z.infer<typeof updateTransactionSchema>;
 
+export const reverseTransactionSchema = z
+  .object({
+    reason: z.string().trim().max(500).optional(),
+    client_tx_id: z.string().regex(ULID_REGEX).optional(),
+  })
+  .strict();
+
+export type ReverseTransactionDto = z.infer<typeof reverseTransactionSchema>;
+
+@Injectable()
+export class ReverseTransactionPipe implements PipeTransform {
+  transform(value: unknown) {
+    if (
+      value === undefined ||
+      value === null ||
+      (typeof value === 'object' && Object.keys(value).length === 0)
+    ) {
+      return {};
+    }
+    const parsed = reverseTransactionSchema.safeParse(value);
+    if (!parsed.success) {
+      throw new BadRequestException({
+        code: 'VALIDATION_ERROR',
+        message: 'Data tidak valid',
+        details: parsed.error.flatten().fieldErrors,
+      });
+    }
+    return parsed.data;
+  }
+}
+
 @Injectable()
 export class UpdateTransactionPipe implements PipeTransform {
   transform(value: unknown) {

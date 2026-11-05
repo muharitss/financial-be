@@ -58,6 +58,7 @@ describe('TransactionsService', () => {
       transaction: {
         create: jest.fn<any>(),
         update: jest.fn<any>(),
+        findMany: jest.fn<any>(),
       },
       transactionSplit: {
         findMany: jest.fn<any>().mockResolvedValue([]),
@@ -1763,6 +1764,244 @@ describe('TransactionsService', () => {
 
       expect(res.warning).toBe('LOCKED_BUDGET_PERIOD_AFFECTED');
       expect(res.transaction.warning).toBe('LOCKED_BUDGET_PERIOD_AFFECTED');
+    });
+  });
+
+  describe('reverse (TASK-047)', () => {
+    const originalExpense = {
+      id: 'tx-22222222-2222-2222-2222-222222222222',
+      financial_profile_id: mockAccount.financial_profile_id,
+      user_id: user.userId,
+      account_id: mockAccount.id,
+      to_account_id: null,
+      type: 'EXPENSE',
+      amount: 100000n,
+      date: new Date('2026-11-01T00:00:00.000Z'),
+      status: 'POSTED',
+      category_id: mockCategory.id,
+      transfer_group_id: null,
+      transfer_fee: 0n,
+      fee_mode: null,
+      parent_transaction_id: null,
+      reason: null,
+      note: 'Makan',
+      client_tx_id: validUlid,
+      processed_at: null,
+      cancelled_at: null,
+      created_at: new Date('2026-11-01T00:00:00.000Z'),
+      updated_at: new Date('2026-11-01T00:00:00.000Z'),
+    };
+
+    it('AC-1: Expense POSTED 100000 (saldo akun 400000) -> reverse -> 201, status REVERSED, reversal dibuat, saldo kembali 500000', async () => {
+      const accountBefore = { ...mockAccount, balance: 400000n };
+      prisma.$queryRaw
+        .mockResolvedValueOnce([originalExpense])
+        .mockResolvedValueOnce([accountBefore]);
+      prisma.transactionSplit.findMany.mockResolvedValue([]);
+      prisma.transaction.create.mockImplementation((args: any) => ({
+        id: 'reversal-tx-id',
+        ...args.data,
+        parent_transaction_id:
+          args.data.parent_transaction_id ??
+          args.data.parent?.connect?.id ??
+          null,
+        financial_profile_id: mockAccount.financial_profile_id,
+        user_id: user.userId,
+        account_id: mockAccount.id,
+        to_account_id: null,
+        created_at: new Date(),
+        updated_at: new Date(),
+      }));
+      prisma.transaction.update.mockResolvedValue({
+        ...originalExpense,
+        status: 'REVERSED',
+      });
+      prisma.transactionAudit.create.mockResolvedValue({ id: 'audit-rev' });
+
+      const res = await service.reverse(user, originalExpense.id, {
+        client_tx_id: '01ARZ3NDEKTSV4RRFFQ69G5FA1',
+      });
+
+      expect(res.reversal_id).toBe('reversal-tx-id');
+      expect(res.transaction.type).toBe('REVERSAL');
+      expect(res.transaction.parent_transaction_id).toBe(originalExpense.id);
+      expect(res.transaction.amount).toBe(100000);
+
+      expect(prisma.account.update).toHaveBeenCalledWith({
+        where: { id: mockAccount.id, user_id: user.userId },
+        data: { balance: 500000n },
+      });
+      expect(prisma.transaction.update).toHaveBeenCalledWith({
+        where: { id: originalExpense.id, user_id: user.userId },
+        data: { status: 'REVERSED' },
+      });
+    });
+
+    it('AC-2: Memanggil reverse kedua kali pada transaksi REVERSED -> 409 ALREADY_REVERSED', async () => {
+      prisma.$queryRaw.mockResolvedValueOnce([
+        { ...originalExpense, status: 'REVERSED' },
+      ]);
+
+      await expect(
+        service.reverse(user, originalExpense.id, {
+          client_tx_id: validUlid,
+        }),
+      ).rejects.toMatchObject({
+        response: { code: 'ALREADY_REVERSED' },
+      });
+    });
+
+    it('AC-3: Reverse transaksi EXPENSE dengan 3 splits -> reversal memiliki 3 splits identik', async () => {
+      const accountBefore = { ...mockAccount, balance: 400000n };
+      const splitItems = [
+        { id: 's1', transaction_id: originalExpense.id, category_id: 'c1', amount: 40000n },
+        { id: 's2', transaction_id: originalExpense.id, category_id: 'c2', amount: 35000n },
+        { id: 's3', transaction_id: originalExpense.id, category_id: 'c3', amount: 25000n },
+      ];
+
+      prisma.$queryRaw
+        .mockResolvedValueOnce([originalExpense])
+        .mockResolvedValueOnce([accountBefore]);
+      prisma.transactionSplit.findMany.mockResolvedValue(splitItems);
+      prisma.transaction.create.mockImplementation((args: any) => ({
+        id: 'reversal-split-id',
+        ...args.data,
+        parent_transaction_id:
+          args.data.parent_transaction_id ??
+          args.data.parent?.connect?.id ??
+          null,
+        financial_profile_id: mockAccount.financial_profile_id,
+        user_id: user.userId,
+        account_id: mockAccount.id,
+        created_at: new Date(),
+        updated_at: new Date(),
+      }));
+      prisma.transaction.update.mockResolvedValue({
+        ...originalExpense,
+        status: 'REVERSED',
+      });
+      prisma.transactionAudit.create.mockResolvedValue({ id: 'audit-split-rev' });
+
+      const res = await service.reverse(user, originalExpense.id, {
+        client_tx_id: '01ARZ3NDEKTSV4RRFFQ69G5FA2',
+      });
+
+      expect(res.transaction.splits).toHaveLength(3);
+      expect(prisma.transactionSplit.createMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.arrayContaining([
+            expect.objectContaining({ category_id: 'c1', amount: 40000n }),
+            expect.objectContaining({ category_id: 'c2', amount: 35000n }),
+            expect.objectContaining({ category_id: 'c3', amount: 25000n }),
+          ]),
+        }),
+      );
+    });
+
+    it('AC-4: Reverse TRANSFER Metode A membalik TRANSFER dan EXPENSE fee secara atomic', async () => {
+      const transferGroupId = 'group-111';
+      const fromAcc = { ...mockAccount, id: 'acc-src', balance: 493500n };
+      const toAcc = { ...mockAccount, id: 'acc-dst', balance: 500000n };
+
+      const transferTx = {
+        ...originalExpense,
+        id: 'tx-transfer-id',
+        type: 'TRANSFER',
+        amount: 500000n,
+        account_id: fromAcc.id,
+        to_account_id: toAcc.id,
+        transfer_group_id: transferGroupId,
+        transfer_fee: 6500n,
+        fee_mode: 'SEPARATE',
+      };
+
+      const feeTx = {
+        ...originalExpense,
+        id: 'tx-fee-id',
+        type: 'EXPENSE',
+        amount: 6500n,
+        account_id: fromAcc.id,
+        to_account_id: null,
+        transfer_group_id: transferGroupId,
+        transfer_fee: 0n,
+        fee_mode: null,
+      };
+
+      prisma.$queryRaw
+        .mockResolvedValueOnce([transferTx])
+        .mockResolvedValueOnce([fromAcc, toAcc]);
+      prisma.transactionSplit.findMany.mockResolvedValue([]);
+      prisma.savingsAllocation.groupBy.mockResolvedValue([]);
+      prisma.transaction.findMany.mockResolvedValue([transferTx, feeTx]);
+
+      prisma.transaction.create
+        .mockImplementationOnce((args: any) => ({
+          id: 'rev-fee-id',
+          ...args.data,
+          parent_transaction_id:
+            args.data.parent_transaction_id ??
+            args.data.parent?.connect?.id ??
+            null,
+          financial_profile_id: mockAccount.financial_profile_id,
+          user_id: user.userId,
+          created_at: new Date(),
+          updated_at: new Date(),
+        }))
+        .mockImplementationOnce((args: any) => ({
+          id: 'rev-transfer-id',
+          ...args.data,
+          parent_transaction_id:
+            args.data.parent_transaction_id ??
+            args.data.parent?.connect?.id ??
+            null,
+          financial_profile_id: mockAccount.financial_profile_id,
+          user_id: user.userId,
+          created_at: new Date(),
+          updated_at: new Date(),
+        }));
+
+      prisma.transaction.update.mockResolvedValue({});
+      prisma.transactionAudit.create.mockResolvedValue({});
+
+      const res = await service.reverse(user, transferTx.id, {
+        client_tx_id: '01ARZ3NDEKTSV4RRFFQ69G5FA3',
+      });
+
+      expect(res.reversal_id).toBe('rev-transfer-id');
+      expect(prisma.account.update).toHaveBeenCalledWith({
+        where: { id: fromAcc.id, user_id: user.userId },
+        data: { balance: 1000000n },
+      });
+      expect(prisma.account.update).toHaveBeenCalledWith({
+        where: { id: toAcc.id, user_id: user.userId },
+        data: { balance: 0n },
+      });
+    });
+
+    it('AC-5: Memanggil /reverse pada transaksi SCHEDULED -> 409 CANNOT_REVERSE_SCHEDULED', async () => {
+      prisma.$queryRaw.mockResolvedValueOnce([
+        { ...originalExpense, status: 'SCHEDULED' },
+      ]);
+
+      await expect(
+        service.reverse(user, originalExpense.id, {
+          client_tx_id: validUlid,
+        }),
+      ).rejects.toMatchObject({
+        response: { code: 'CANNOT_REVERSE_SCHEDULED' },
+      });
+    });
+
+    it('AC-6 (isolasi): User B me-reverse transaksi User A -> 404 TRANSACTION_NOT_FOUND', async () => {
+      prisma.$queryRaw.mockResolvedValueOnce([]);
+
+      await expect(
+        service.reverse({ userId: 'other-user-id' }, originalExpense.id, {
+          client_tx_id: validUlid,
+        }),
+      ).rejects.toMatchObject({
+        response: { code: 'TRANSACTION_NOT_FOUND' },
+      });
     });
   });
 });

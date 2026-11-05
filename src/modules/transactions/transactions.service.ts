@@ -18,6 +18,7 @@ import {
   type CreateTransferDto,
   type CreateAdjustmentDto,
   type UpdateTransactionDto,
+  type ReverseTransactionDto,
   type SplitItemDto,
 } from './dto/transaction.dto.js';
 
@@ -1547,6 +1548,449 @@ export class TransactionsService {
         return {
           transaction: afterResponse,
           audit_id: audit.id,
+          ...(warning ? { warning } : {}),
+        };
+      });
+    } catch (error: any) {
+      if (
+        error instanceof Prisma.PrismaClientKnownRequestError &&
+        error.code === 'P2002'
+      ) {
+        throw new ConflictException({
+          code: 'CLIENT_TX_ID_DUPLICATE',
+          message: 'client_tx_id sudah pernah digunakan',
+        });
+      }
+      throw error;
+    }
+  }
+
+  async reverse(
+    user: { userId: string; role?: string },
+    transactionId: string,
+    dto: ReverseTransactionDto,
+    headerIdempotencyKey?: string,
+  ): Promise<{
+    reversal_id: string;
+    transaction: TransactionResponse;
+    warning?: string;
+  }> {
+    const clientTxId = resolveClientTxId(dto?.client_tx_id, headerIdempotencyKey);
+
+    const pref = await this.prisma.userPreference.findFirst({
+      where: { user_id: user.userId },
+    });
+    const tz = pref?.timezone ?? 'Asia/Jakarta';
+    const today = todayInTz(tz);
+    const todayDate = new Date(`${today}T00:00:00.000Z`);
+
+    try {
+      return await this.prisma.$transaction(async (tx) => {
+        // 1. Kunci baris transaksi asli (FOR UPDATE + filter user_id)
+        const originalTxs = await tx.$queryRaw<
+          Array<{
+            id: string;
+            financial_profile_id: string;
+            user_id: string;
+            account_id: string;
+            to_account_id: string | null;
+            type: string;
+            amount: bigint;
+            date: Date;
+            status: string;
+            category_id: string | null;
+            transfer_group_id: string | null;
+            transfer_fee: bigint;
+            fee_mode: string | null;
+            parent_transaction_id: string | null;
+            reason: string | null;
+            note: string | null;
+            client_tx_id: string;
+            processed_at: Date | null;
+            cancelled_at: Date | null;
+            created_at: Date;
+            updated_at: Date;
+          }>
+        >`SELECT id, financial_profile_id, user_id, account_id, to_account_id, type, amount, date, status, category_id, transfer_group_id, transfer_fee, fee_mode, parent_transaction_id, reason, note, client_tx_id, processed_at, cancelled_at, created_at, updated_at FROM transactions WHERE id = ${transactionId}::uuid AND user_id = ${user.userId}::uuid FOR UPDATE`;
+
+        const original = originalTxs[0];
+        if (!original) {
+          throw new NotFoundException({
+            code: 'TRANSACTION_NOT_FOUND',
+            message: 'Transaksi tidak ditemukan',
+          });
+        }
+
+        // 2. Validasi status
+        if (original.status === 'REVERSED') {
+          throw new ConflictException({
+            code: 'ALREADY_REVERSED',
+            message: 'Transaksi sudah pernah di-reverse',
+          });
+        }
+        if (original.status === 'SCHEDULED') {
+          throw new ConflictException({
+            code: 'CANNOT_REVERSE_SCHEDULED',
+            message:
+              'Transaksi terjadwal belum efektif; gunakan fitur batalkan (cancel)',
+          });
+        }
+        if (original.status === 'CANCELLED') {
+          throw new ConflictException({
+            code: 'TRANSACTION_CANCELLED',
+            message: 'Transaksi sudah dibatalkan',
+          });
+        }
+
+        // Cek splits
+        const originalSplits = await tx.transactionSplit.findMany({
+          where: { transaction_id: original.id },
+        });
+
+        if (original.type === 'REVERSAL' && originalSplits.length > 0) {
+          throw new UnprocessableEntityException({
+            code: 'NESTED_SPLIT_REVERSAL_NOT_SUPPORTED',
+            message:
+              'Nested reversal untuk transaksi split tidak didukung di MVP',
+          });
+        }
+
+        // 3. Efek pembalikan saldo
+        let warning: string | undefined;
+
+        if (original.type === 'INCOME') {
+          const accounts = await tx.$queryRaw<
+            Array<{
+              id: string;
+              financial_profile_id: string;
+              balance: bigint;
+              allow_negative: boolean;
+              archived: boolean;
+            }>
+          >`SELECT id, financial_profile_id, balance, allow_negative, archived FROM accounts WHERE id = ${original.account_id}::uuid AND user_id = ${user.userId}::uuid FOR UPDATE`;
+
+          const account = accounts[0];
+          const reserved = await getAccountReserved(tx, account.id);
+          const available = account.balance - reserved;
+          const newBalance = account.balance - original.amount;
+
+          if (
+            !account.allow_negative &&
+            (original.amount > available || newBalance < 0n)
+          ) {
+            throw new ConflictException({
+              code: 'INSUFFICIENT_BALANCE',
+              message:
+                'Saldo tersedia tidak mencukupi untuk membalik transaksi pendapatan',
+              details: {
+                available: Number(available),
+                needed: Number(original.amount),
+                account_id: account.id,
+              },
+            });
+          }
+
+          if (newBalance < 0n) {
+            warning = 'NEGATIVE_BALANCE';
+          }
+
+          await tx.account.update({
+            where: { id: account.id, user_id: user.userId },
+            data: { balance: newBalance },
+          });
+        } else if (original.type === 'EXPENSE') {
+          const accounts = await tx.$queryRaw<
+            Array<{
+              id: string;
+              financial_profile_id: string;
+              balance: bigint;
+              allow_negative: boolean;
+              archived: boolean;
+            }>
+          >`SELECT id, financial_profile_id, balance, allow_negative, archived FROM accounts WHERE id = ${original.account_id}::uuid AND user_id = ${user.userId}::uuid FOR UPDATE`;
+
+          const account = accounts[0];
+          const newBalance = account.balance + original.amount;
+
+          await tx.account.update({
+            where: { id: account.id, user_id: user.userId },
+            data: { balance: newBalance },
+          });
+        } else if (original.type === 'ADJUSTMENT') {
+          const accounts = await tx.$queryRaw<
+            Array<{
+              id: string;
+              financial_profile_id: string;
+              balance: bigint;
+              allow_negative: boolean;
+              archived: boolean;
+            }>
+          >`SELECT id, financial_profile_id, balance, allow_negative, archived FROM accounts WHERE id = ${original.account_id}::uuid AND user_id = ${user.userId}::uuid FOR UPDATE`;
+
+          const account = accounts[0];
+          const newBalance = account.balance - original.amount;
+
+          if (original.amount > 0n) {
+            const reserved = await getAccountReserved(tx, account.id);
+            const available = account.balance - reserved;
+            if (
+              !account.allow_negative &&
+              (original.amount > available || newBalance < 0n)
+            ) {
+              throw new ConflictException({
+                code: 'INSUFFICIENT_BALANCE',
+                message:
+                  'Saldo tersedia tidak mencukupi untuk membalik transaksi penyesuaian',
+                details: {
+                  available: Number(available),
+                  needed: Number(original.amount),
+                  account_id: account.id,
+                },
+              });
+            }
+          }
+
+          if (newBalance < 0n) {
+            warning = 'NEGATIVE_BALANCE';
+          }
+
+          await tx.account.update({
+            where: { id: account.id, user_id: user.userId },
+            data: { balance: newBalance },
+          });
+        } else if (original.type === 'TRANSFER') {
+          const accounts = await tx.$queryRaw<
+            Array<{
+              id: string;
+              financial_profile_id: string;
+              balance: bigint;
+              allow_negative: boolean;
+              archived: boolean;
+            }>
+          >`SELECT id, financial_profile_id, balance, allow_negative, archived FROM accounts WHERE id IN (${original.account_id}::uuid, ${original.to_account_id}::uuid) AND user_id = ${user.userId}::uuid ORDER BY id ASC FOR UPDATE`;
+
+          const fromAccount = accounts.find((a) => a.id === original.account_id);
+          const toAccount = accounts.find((a) => a.id === original.to_account_id);
+
+          const toReserved = await getAccountReserved(tx, toAccount!.id);
+          const toAvailable = toAccount!.balance - toReserved;
+          const newToBalance = toAccount!.balance - original.amount;
+
+          if (
+            !toAccount!.allow_negative &&
+            (original.amount > toAvailable || newToBalance < 0n)
+          ) {
+            throw new ConflictException({
+              code: 'INSUFFICIENT_BALANCE',
+              message:
+                'Saldo akun tujuan tidak mencukupi untuk pembalikan transfer',
+              details: {
+                available: Number(toAvailable),
+                needed: Number(original.amount),
+                account_id: toAccount!.id,
+              },
+            });
+          }
+
+          if (original.transfer_group_id) {
+            // Metode A: cari pasangan transaksi di transfer_group_id yang sama
+            const groupTxs = await tx.transaction.findMany({
+              where: {
+                transfer_group_id: original.transfer_group_id,
+                user_id: user.userId,
+                status: 'POSTED',
+              },
+            });
+
+            const feeTx = groupTxs.find(
+              (t) => t.id !== original.id && t.type === 'EXPENSE',
+            );
+            const feeAmount = feeTx ? feeTx.amount : 0n;
+            const newFromBalance =
+              fromAccount!.balance + original.amount + feeAmount;
+
+            await tx.account.update({
+              where: { id: fromAccount!.id, user_id: user.userId },
+              data: { balance: newFromBalance },
+            });
+            await tx.account.update({
+              where: { id: toAccount!.id, user_id: user.userId },
+              data: { balance: newToBalance },
+            });
+
+            if (feeTx) {
+              await tx.transaction.update({
+                where: { id: feeTx.id, user_id: user.userId },
+                data: { status: 'REVERSED' },
+              });
+              const feeReversal = await tx.transaction.create({
+                data: {
+                  user_id: user.userId,
+                  financial_profile_id: feeTx.financial_profile_id,
+                  account_id: feeTx.account_id,
+                  type: 'REVERSAL',
+                  status: 'POSTED',
+                  parent_transaction_id: feeTx.id,
+                  amount: feeTx.amount,
+                  category_id: feeTx.category_id,
+                  transfer_group_id: original.transfer_group_id,
+                  date: todayDate,
+                  reason: dto.reason?.trim() ?? null,
+                  client_tx_id: `${clientTxId}:fee`,
+                },
+              });
+
+              const feeReversalResp = toTransactionResponse(feeReversal);
+              await tx.transactionAudit.create({
+                data: {
+                  transaction_id: feeTx.id,
+                  action: 'REVERSE',
+                  before: toTransactionResponse(feeTx) as unknown as Prisma.InputJsonValue,
+                  after: {
+                    ...toTransactionResponse(feeTx),
+                    status: 'REVERSED',
+                    reversal_id: feeReversal.id,
+                  } as unknown as Prisma.InputJsonValue,
+                  actor_user_id: user.userId,
+                  reason: dto.reason?.trim() ?? null,
+                },
+              });
+              await tx.transactionAudit.create({
+                data: {
+                  transaction_id: feeReversal.id,
+                  action: 'CREATE',
+                  before: Prisma.DbNull,
+                  after: feeReversalResp as unknown as Prisma.InputJsonValue,
+                  actor_user_id: user.userId,
+                  reason: dto.reason?.trim() ?? null,
+                },
+              });
+            }
+          } else if (original.fee_mode === 'BUNDLED') {
+            // Metode B: bundled fee
+            const newFromBalance =
+              fromAccount!.balance + original.amount + original.transfer_fee;
+            await tx.account.update({
+              where: { id: fromAccount!.id, user_id: user.userId },
+              data: { balance: newFromBalance },
+            });
+            await tx.account.update({
+              where: { id: toAccount!.id, user_id: user.userId },
+              data: { balance: newToBalance },
+            });
+          } else {
+            // Transfer biasa tanpa fee
+            const newFromBalance = fromAccount!.balance + original.amount;
+            await tx.account.update({
+              where: { id: fromAccount!.id, user_id: user.userId },
+              data: { balance: newFromBalance },
+            });
+            await tx.account.update({
+              where: { id: toAccount!.id, user_id: user.userId },
+              data: { balance: newToBalance },
+            });
+          }
+        }
+
+        // 4. Buat baris REVERSAL
+        const reversalData: Prisma.TransactionUncheckedCreateInput = {
+          user_id: user.userId,
+          financial_profile_id: original.financial_profile_id,
+          account_id: original.account_id,
+          to_account_id: original.to_account_id ?? null,
+          type: 'REVERSAL',
+          status: 'POSTED',
+          parent_transaction_id: original.id,
+          amount: original.amount,
+          category_id: original.category_id ?? null,
+          transfer_group_id: original.transfer_group_id ?? null,
+          transfer_fee:
+            original.transfer_fee > 0n && original.fee_mode === 'BUNDLED'
+              ? original.transfer_fee
+              : 0n,
+          fee_mode:
+            original.transfer_fee > 0n && original.fee_mode === 'BUNDLED'
+              ? 'BUNDLED'
+              : null,
+          date: todayDate,
+          client_tx_id: clientTxId,
+          reason: dto.reason?.trim() ?? null,
+        };
+
+        const reversal = await tx.transaction.create({
+          data: reversalData,
+        });
+
+        // 5. Salin splits jika asli memiliki splits
+        let createdSplits: Array<{ id: string; category_id: string; amount: bigint }> = [];
+        if (originalSplits.length > 0) {
+          createdSplits = originalSplits.map((s) => ({
+            id: randomUUID(),
+            category_id: s.category_id,
+            amount: s.amount,
+          }));
+          await tx.transactionSplit.createMany({
+            data: createdSplits.map((s) => ({
+              id: s.id,
+              transaction_id: reversal.id,
+              category_id: s.category_id,
+              amount: s.amount,
+            })),
+          });
+        }
+
+        // 6. Update status transaksi asli menjadi REVERSED
+        const updatedOriginal = await tx.transaction.update({
+          where: { id: original.id, user_id: user.userId },
+          data: { status: 'REVERSED' },
+        });
+
+        // 7. Buat TransactionAudit
+        const originalResp = toTransactionResponse({
+          ...original,
+          splits: originalSplits,
+        });
+        const updatedOriginalResp = toTransactionResponse({
+          ...updatedOriginal,
+          splits: originalSplits,
+        });
+        const reversalResp = toTransactionResponse(
+          {
+            ...reversal,
+            splits: createdSplits,
+          },
+          warning,
+        );
+
+        await tx.transactionAudit.create({
+          data: {
+            transaction_id: original.id,
+            action: 'REVERSE',
+            before: originalResp as unknown as Prisma.InputJsonValue,
+            after: {
+              ...updatedOriginalResp,
+              status: 'REVERSED',
+              reversal_id: reversal.id,
+            } as unknown as Prisma.InputJsonValue,
+            actor_user_id: user.userId,
+            reason: dto.reason?.trim() ?? null,
+          },
+        });
+
+        await tx.transactionAudit.create({
+          data: {
+            transaction_id: reversal.id,
+            action: 'CREATE',
+            before: Prisma.DbNull,
+            after: reversalResp as unknown as Prisma.InputJsonValue,
+            actor_user_id: user.userId,
+            reason: dto.reason?.trim() ?? null,
+          },
+        });
+
+        return {
+          reversal_id: reversal.id,
+          transaction: reversalResp,
           ...(warning ? { warning } : {}),
         };
       });
