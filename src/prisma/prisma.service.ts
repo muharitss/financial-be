@@ -48,6 +48,11 @@ function hasUserId(obj: any): boolean {
   if (Array.isArray(obj.AND)) {
     return obj.AND.some((item: any) => hasUserId(item));
   }
+  for (const key of Object.keys(obj)) {
+    if (typeof obj[key] === 'object' && obj[key] !== null && hasUserId(obj[key])) {
+      return true;
+    }
+  }
   return false;
 }
 

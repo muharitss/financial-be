@@ -5,6 +5,7 @@ import { TransactionsService } from './transactions.service.js';
 import { ScheduledTransactionService } from './scheduled-transaction.service.js';
 import { TransactionAttachmentsController } from './transaction-attachments.controller.js';
 import { TransactionAttachmentsService } from './transaction-attachments.service.js';
+import { IdempotencyInterceptor } from '../../common/interceptors/idempotency.interceptor.js';
 
 @Module({
   imports: [PrismaModule],
@@ -13,11 +14,13 @@ import { TransactionAttachmentsService } from './transaction-attachments.service
     TransactionsService,
     ScheduledTransactionService,
     TransactionAttachmentsService,
+    IdempotencyInterceptor,
   ],
   exports: [
     TransactionsService,
     ScheduledTransactionService,
     TransactionAttachmentsService,
+    IdempotencyInterceptor,
   ],
 })
 export class TransactionsModule {}

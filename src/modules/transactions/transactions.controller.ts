@@ -6,6 +6,7 @@ import {
   Body,
   Headers,
   UseGuards,
+  UseInterceptors,
   HttpStatus,
   HttpCode,
   ParseUUIDPipe,
@@ -14,6 +15,10 @@ import { ApiTags, ApiOperation, ApiResponse, ApiCookieAuth } from '@nestjs/swagg
 import { Throttle } from '@nestjs/throttler';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard.js';
 import { CurrentUser } from '../../common/decorators/current-user.decorator.js';
+import {
+  IdempotencyInterceptor,
+  Idempotent,
+} from '../../common/interceptors/idempotency.interceptor.js';
 import {
   CreateTransactionPipe,
   type CreateTransactionDto,
@@ -37,6 +42,8 @@ export class TransactionsController {
   constructor(private readonly transactionsService: TransactionsService) {}
 
   @Post()
+  @UseInterceptors(IdempotencyInterceptor)
+  @Idempotent()
   @HttpCode(HttpStatus.CREATED)
   @Throttle({ transaction: { limit: 60, ttl: 60000 } })
   @ApiOperation({ summary: 'Membuat transaksi baru (INCOME, EXPENSE, TRANSFER, ADJUSTMENT)' })
@@ -55,6 +62,8 @@ export class TransactionsController {
   }
 
   @Patch(':id')
+  @UseInterceptors(IdempotencyInterceptor)
+  @Idempotent()
   @HttpCode(HttpStatus.OK)
   @Throttle({ transaction: { limit: 60, ttl: 60000 } })
   @ApiOperation({ summary: 'Mengubah transaksi dengan audit log' })
@@ -74,6 +83,8 @@ export class TransactionsController {
   }
 
   @Post(':id/reverse')
+  @UseInterceptors(IdempotencyInterceptor)
+  @Idempotent()
   @HttpCode(HttpStatus.CREATED)
   @Throttle({ transaction: { limit: 60, ttl: 60000 } })
   @ApiOperation({ summary: 'Membalik transaksi (reversal)' })
@@ -97,6 +108,8 @@ export class TransactionsController {
   }
 
   @Post(':id/cancel')
+  @UseInterceptors(IdempotencyInterceptor)
+  @Idempotent()
   @HttpCode(HttpStatus.OK)
   @Throttle({ transaction: { limit: 60, ttl: 60000 } })
   @ApiOperation({ summary: 'Membatalkan transaksi terjadwal (SCHEDULED)' })

@@ -50,6 +50,7 @@ describe('Transactions E2E Test Suite (Supertest)', () => {
     scheduledService = app.get(ScheduledTransactionService);
 
     // Bersihkan test data lama
+    await prisma.asSystem().idempotencyKey.deleteMany();
     await prisma.asSystem().transactionAudit.deleteMany();
     await prisma.asSystem().transactionTag.deleteMany();
     await prisma.asSystem().transaction.deleteMany();
@@ -3433,6 +3434,295 @@ describe('Transactions E2E Test Suite (Supertest)', () => {
         shortfall: 15000,
         resolution_options: ['ADJUST_BALANCE', 'ALLOW_NEGATIVE'],
       });
+    });
+  });
+
+  describe('IDEMPOTENCY GLOBAL ENFORCEMENT (TASK-052)', () => {
+    it('AC-1: POST /transactions dengan client_tx_id sukses (201) -> retry identik via body & header menghasilkan 201 dengan body persis sama tanpa transaksi ganda', async () => {
+      // 1. Buat akun baru dengan saldo 100000
+      const acc = await prisma.asSystem().account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Akun Idempotency AC1',
+          type: 'BANK',
+          provider: 'BCA',
+          balance: 100000n,
+          opening_balance: 100000n,
+          opening_date: new Date('2026-01-01'),
+          allow_negative: false,
+        },
+      });
+
+      const key = generateTestUlid();
+      const payload = {
+        type: 'EXPENSE',
+        amount: 25000,
+        account_id: acc.id,
+        category_id: expenseCategoryA.id,
+        date: '2026-11-01',
+        client_tx_id: key,
+      };
+
+      // Request pertama
+      const res1 = await request(app.getHttpServer())
+        .post('/transactions')
+        .set(userAHeaders)
+        .send(payload);
+
+      expect(res1.status).toBe(201);
+      expect(res1.body.id).toBeDefined();
+      expect(res1.body.amount).toBe(25000);
+      expect(res1.body.client_tx_id).toBe(key);
+
+      // Cek database: baris IdempotencyKey tersimpan dengan TTL ~30 hari
+      const ikRow = await prisma.asSystem().idempotencyKey.findUnique({
+        where: {
+          user_id_client_tx_id: {
+            user_id: userAId,
+            client_tx_id: key,
+          },
+        },
+      });
+      expect(ikRow).not.toBeNull();
+      expect(ikRow?.response_status).toBe(201);
+      expect(ikRow?.response_body).toEqual(res1.body);
+      const daysUntilExpire = Math.round(
+        (ikRow!.ttl_expires_at.getTime() - Date.now()) / (1000 * 60 * 60 * 24),
+      );
+      expect(daysUntilExpire).toBe(30);
+
+      // Request kedua: retry identik via body
+      const res2 = await request(app.getHttpServer())
+        .post('/transactions')
+        .set(userAHeaders)
+        .send(payload);
+
+      expect(res2.status).toBe(201);
+      expect(res2.body).toEqual(res1.body);
+
+      // Request ketiga: retry identik via header Idempotency-Key (tanpa client_tx_id di body)
+      const { client_tx_id: _, ...payloadWithoutKey } = payload;
+      const res3 = await request(app.getHttpServer())
+        .post('/transactions')
+        .set(userAHeaders)
+        .set('idempotency-key', key)
+        .send(payloadWithoutKey);
+
+      expect(res3.status).toBe(201);
+      expect(res3.body).toEqual(res1.body);
+
+      // Verifikasi: hanya ada 1 transaksi di DB dan saldo akun hanya berkurang 1x (100000 - 25000 = 75000)
+      const txCount = await prisma.asSystem().transaction.count({
+        where: {
+          account_id: acc.id,
+        },
+      });
+      expect(txCount).toBe(1);
+
+      const accUpdated = await prisma.asSystem().account.findUnique({
+        where: { id: acc.id },
+      });
+      expect(Number(accUpdated?.balance)).toBe(75000);
+    });
+
+    it('AC-2: Menggunakan client_tx_id yang sudah dipakai untuk request dengan nominal/tipe berbeda -> 409 IDEMPOTENCY_KEY_REUSE_WITH_DIFFERENT_PAYLOAD', async () => {
+      const acc = await prisma.asSystem().account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Akun Idempotency AC2',
+          type: 'BANK',
+          provider: 'BCA',
+          balance: 100000n,
+          opening_balance: 100000n,
+          opening_date: new Date('2026-01-01'),
+          allow_negative: false,
+        },
+      });
+
+      const key = generateTestUlid();
+      const payload1 = {
+        type: 'EXPENSE',
+        amount: 20000,
+        account_id: acc.id,
+        category_id: expenseCategoryA.id,
+        date: '2026-11-01',
+        client_tx_id: key,
+      };
+
+      const res1 = await request(app.getHttpServer())
+        .post('/transactions')
+        .set(userAHeaders)
+        .send(payload1);
+      expect(res1.status).toBe(201);
+
+      // Request dengan nominal berbeda dan key sama
+      const payload2 = {
+        type: 'EXPENSE',
+        amount: 30000,
+        account_id: acc.id,
+        category_id: expenseCategoryA.id,
+        date: '2026-11-01',
+        client_tx_id: key,
+      };
+      const res2 = await request(app.getHttpServer())
+        .post('/transactions')
+        .set(userAHeaders)
+        .send(payload2);
+
+      expect(res2.status).toBe(409);
+      expect(res2.body.code).toBe('IDEMPOTENCY_KEY_REUSE_WITH_DIFFERENT_PAYLOAD');
+      expect(res2.body.message).toBe('client_tx_id sudah digunakan dengan payload berbeda');
+    });
+
+    it('AC-3: Memanggil mutasi transaksi tanpa client_tx_id & tanpa header Idempotency-Key -> 422 MISSING_CLIENT_TX_ID', async () => {
+      // 1. POST /transactions
+      const resPost = await request(app.getHttpServer())
+        .post('/transactions')
+        .set(userAHeaders)
+        .send({
+          type: 'EXPENSE',
+          amount: 10000,
+          account_id: userAAccount.id,
+          category_id: expenseCategoryA.id,
+          date: '2026-11-01',
+        });
+      expect(resPost.status).toBe(422);
+      expect(resPost.body.code).toBe('MISSING_CLIENT_TX_ID');
+
+      // 2. PATCH /transactions/:id
+      const resPatch = await request(app.getHttpServer())
+        .patch(`/transactions/${userAAccount.id}`)
+        .set(userAHeaders)
+        .send({
+          amount: 15000,
+        });
+      expect(resPatch.status).toBe(422);
+      expect(resPatch.body.code).toBe('MISSING_CLIENT_TX_ID');
+
+      // 3. POST /transactions/:id/reverse
+      const resRev = await request(app.getHttpServer())
+        .post(`/transactions/${userAAccount.id}/reverse`)
+        .set(userAHeaders)
+        .send({
+          reason: 'Alasan pembatalan',
+        });
+      expect(resRev.status).toBe(422);
+      expect(resRev.body.code).toBe('MISSING_CLIENT_TX_ID');
+
+      // 4. POST /transactions/:id/cancel
+      const resCancel = await request(app.getHttpServer())
+        .post(`/transactions/${userAAccount.id}/cancel`)
+        .set(userAHeaders)
+        .send({});
+      expect(resCancel.status).toBe(422);
+      expect(resCancel.body.code).toBe('MISSING_CLIENT_TX_ID');
+    });
+
+    it('AC-4: Isolasi tenant - User B dapat menggunakan client_tx_id yang sama dengan User A tanpa konflik', async () => {
+      const keyShared = generateTestUlid();
+
+      // User A membuat transaksi dengan keyShared
+      const resA = await request(app.getHttpServer())
+        .post('/transactions')
+        .set(userAHeaders)
+        .send({
+          type: 'EXPENSE',
+          amount: 15000,
+          account_id: userAAccount.id,
+          category_id: expenseCategoryA.id,
+          date: '2026-11-01',
+          client_tx_id: keyShared,
+        });
+      expect(resA.status).toBe(201);
+
+      // User B membuat transaksi dengan keyShared yang sama
+      const catB = await prisma.asSystem().category.findFirst({
+        where: { user_id: userBId, type: 'INCOME' },
+      });
+      const resB = await request(app.getHttpServer())
+        .post('/transactions')
+        .set(userBHeaders)
+        .send({
+          type: 'INCOME',
+          amount: 25000,
+          account_id: userBAccount.id,
+          category_id: catB!.id,
+          date: '2026-11-01',
+          client_tx_id: keyShared,
+        });
+      expect(resB.status).toBe(201);
+      expect(resB.body.amount).toBe(25000);
+
+      // Pastikan ada 2 baris idempotency_keys terpisah di DB untuk masing-masing user
+      const keysA = await prisma.asSystem().idempotencyKey.findMany({
+        where: { client_tx_id: keyShared },
+      });
+      expect(keysA.length).toBe(2);
+      expect(keysA.map((k) => k.user_id).sort()).toEqual([userAId, userBId].sort());
+    });
+
+    it('Replay pada PATCH dan POST reverse menghasilkan respons identik', async () => {
+      // 1. Buat transaksi EXPENSE untuk di-patch
+      const txKey = generateTestUlid();
+      const createRes = await request(app.getHttpServer())
+        .post('/transactions')
+        .set(userAHeaders)
+        .send({
+          type: 'EXPENSE',
+          amount: 50000,
+          account_id: userAAccount.id,
+          category_id: expenseCategoryA.id,
+          date: '2026-11-01',
+          client_tx_id: txKey,
+        });
+      expect(createRes.status).toBe(201);
+      const txId = createRes.body.id;
+
+      // 2. PATCH transaksi dengan patchKey
+      const patchKey = generateTestUlid();
+      const patchRes1 = await request(app.getHttpServer())
+        .patch(`/transactions/${txId}`)
+        .set(userAHeaders)
+        .send({
+          amount: 40000,
+          client_tx_id: patchKey,
+        });
+      expect(patchRes1.status).toBe(200);
+
+      // Retry PATCH dengan patchKey yang sama
+      const patchRes2 = await request(app.getHttpServer())
+        .patch(`/transactions/${txId}`)
+        .set(userAHeaders)
+        .send({
+          amount: 40000,
+          client_tx_id: patchKey,
+        });
+      expect(patchRes2.status).toBe(200);
+      expect(patchRes2.body).toEqual(patchRes1.body);
+
+      // 3. Reverse transaksi dengan reverseKey
+      const revKey = generateTestUlid();
+      const revRes1 = await request(app.getHttpServer())
+        .post(`/transactions/${txId}/reverse`)
+        .set(userAHeaders)
+        .send({
+          reason: 'Pembalikan untuk idempotensi e2e',
+          client_tx_id: revKey,
+        });
+      expect(revRes1.status).toBe(201);
+
+      // Retry reverse dengan revKey yang sama -> tetap 201 replayed (bukan 409 ALREADY_REVERSED!)
+      const revRes2 = await request(app.getHttpServer())
+        .post(`/transactions/${txId}/reverse`)
+        .set(userAHeaders)
+        .send({
+          reason: 'Pembalikan untuk idempotensi e2e',
+          client_tx_id: revKey,
+        });
+      expect(revRes2.status).toBe(201);
+      expect(revRes2.body).toEqual(revRes1.body);
     });
   });
 });
