@@ -2901,4 +2901,258 @@ describe('Transactions E2E Test Suite (Supertest)', () => {
       expect(resHeader.body.status).toBe('CANCELLED');
     });
   });
+
+  describe('TRANSACTION ATTACHMENTS (TASK-049)', () => {
+    const jpegHeaderBase64 = Buffer.from([
+      0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01,
+    ]).toString('base64');
+
+    const pngHeaderBase64 = Buffer.from([
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+    ]).toString('base64');
+
+    const webpHeaderBase64 = Buffer.from([
+      0x52, 0x49, 0x46, 0x46, 0x24, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50,
+    ]).toString('base64');
+
+    const fakeTextBase64 = Buffer.from('Not an image content at all').toString(
+      'base64',
+    );
+
+    it('AC-1 & AC-2: Presign valid (3 MB) -> 200 { upload_url, storage_key }; Presign > 5 MB -> 422 FILE_TOO_LARGE', async () => {
+      const tx = await prisma.asSystem().transaction.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          account_id: userAAccount.id,
+          type: 'EXPENSE',
+          amount: 50000n,
+          date: new Date('2026-11-01T00:00:00.000Z'),
+          status: 'POSTED',
+          category_id: expenseCategoryA.id,
+          client_tx_id: generateTestUlid(),
+        },
+      });
+
+      const resOk = await request(app.getHttpServer())
+        .post(`/transactions/${tx.id}/attachments/presign`)
+        .set(userAHeaders)
+        .send({ mime: 'image/jpeg', size: 3_000_000 });
+
+      expect(resOk.status).toBe(200);
+      expect(resOk.body.upload_url).toBeDefined();
+      expect(resOk.body.storage_key).toContain(`users/${userAId}/tx/${tx.id}/`);
+
+      const resLarge = await request(app.getHttpServer())
+        .post(`/transactions/${tx.id}/attachments/presign`)
+        .set(userAHeaders)
+        .send({ mime: 'image/jpeg', size: 6_000_000 });
+
+      expect(resLarge.status).toBe(422);
+      expect(resLarge.body.code).toBe('FILE_TOO_LARGE');
+    });
+
+    it('AC-3: Confirm dengan mime image/jpeg tetapi magic_bytes_base64 berisi teks/PNG -> 422 INVALID_FILE_TYPE, baris tidak disimpan', async () => {
+      const tx = await prisma.asSystem().transaction.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          account_id: userAAccount.id,
+          type: 'EXPENSE',
+          amount: 20000n,
+          date: new Date('2026-11-01T00:00:00.000Z'),
+          status: 'POSTED',
+          category_id: expenseCategoryA.id,
+          client_tx_id: generateTestUlid(),
+        },
+      });
+
+      const presignRes = await request(app.getHttpServer())
+        .post(`/transactions/${tx.id}/attachments/presign`)
+        .set(userAHeaders)
+        .send({ mime: 'image/jpeg', size: 500_000 });
+
+      const resText = await request(app.getHttpServer())
+        .post(`/transactions/${tx.id}/attachments`)
+        .set(userAHeaders)
+        .send({
+          storage_key: presignRes.body.storage_key,
+          mime: 'image/jpeg',
+          size_bytes: 500_000,
+          magic_bytes_base64: fakeTextBase64,
+        });
+
+      expect(resText.status).toBe(422);
+      expect(resText.body.code).toBe('INVALID_FILE_TYPE');
+
+      const resMismatch = await request(app.getHttpServer())
+        .post(`/transactions/${tx.id}/attachments`)
+        .set(userAHeaders)
+        .send({
+          storage_key: presignRes.body.storage_key,
+          mime: 'image/jpeg',
+          size_bytes: 500_000,
+          magic_bytes_base64: pngHeaderBase64,
+        });
+
+      expect(resMismatch.status).toBe(422);
+      expect(resMismatch.body.code).toBe('INVALID_FILE_TYPE');
+
+      const count = await prisma.asSystem().fileAttachment.count({
+        where: { transaction_id: tx.id },
+      });
+      expect(count).toBe(0);
+    });
+
+    it('AC-4 & AC-5: Confirm JPEG/PNG/WebP valid -> 201, ke-4 -> 409 ATTACHMENT_LIMIT_EXCEEDED, GET signed URL ~1 jam, DELETE -> 204', async () => {
+      if (throttlerStorage.storage) {
+        throttlerStorage.storage.clear();
+      }
+
+      const tx = await prisma.asSystem().transaction.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          account_id: userAAccount.id,
+          type: 'EXPENSE',
+          amount: 75000n,
+          date: new Date('2026-11-01T00:00:00.000Z'),
+          status: 'POSTED',
+          category_id: expenseCategoryA.id,
+          client_tx_id: generateTestUlid(),
+        },
+      });
+
+      const items = [
+        { mime: 'image/jpeg', magic: jpegHeaderBase64, size: 100_000 },
+        { mime: 'image/png', magic: pngHeaderBase64, size: 200_000 },
+        { mime: 'image/webp', magic: webpHeaderBase64, size: 150_000 },
+      ];
+
+      const confirmedIds: string[] = [];
+
+      for (const item of items) {
+        const presign = await request(app.getHttpServer())
+          .post(`/transactions/${tx.id}/attachments/presign`)
+          .set(userAHeaders)
+          .send({ mime: item.mime, size: item.size });
+        expect(presign.status).toBe(200);
+
+        const confirm = await request(app.getHttpServer())
+          .post(`/transactions/${tx.id}/attachments`)
+          .set(userAHeaders)
+          .send({
+            storage_key: presign.body.storage_key,
+            mime: item.mime,
+            size_bytes: item.size,
+            magic_bytes_base64: item.magic,
+          });
+        expect(confirm.status).toBe(201);
+        expect(confirm.body.attachment_id).toBeDefined();
+        expect(confirm.body.access_url).toBeDefined();
+        confirmedIds.push(confirm.body.attachment_id);
+      }
+
+      // Presign ke-4 -> 409 ATTACHMENT_LIMIT_EXCEEDED
+      const presign4 = await request(app.getHttpServer())
+        .post(`/transactions/${tx.id}/attachments/presign`)
+        .set(userAHeaders)
+        .send({ mime: 'image/jpeg', size: 100_000 });
+      expect(presign4.status).toBe(409);
+      expect(presign4.body.code).toBe('ATTACHMENT_LIMIT_EXCEEDED');
+
+      // Confirm ke-4 -> 409 ATTACHMENT_LIMIT_EXCEEDED
+      const confirm4 = await request(app.getHttpServer())
+        .post(`/transactions/${tx.id}/attachments`)
+        .set(userAHeaders)
+        .send({
+          storage_key: `users/${userAId}/tx/${tx.id}/fourth-file`,
+          mime: 'image/jpeg',
+          size_bytes: 100_000,
+          magic_bytes_base64: jpegHeaderBase64,
+        });
+      expect(confirm4.status).toBe(409);
+      expect(confirm4.body.code).toBe('ATTACHMENT_LIMIT_EXCEEDED');
+
+      // AC-5: GET signed URL 1 jam (+3600 detik)
+      const nowBefore = Date.now();
+      const urlRes = await request(app.getHttpServer())
+        .get(`/transactions/${tx.id}/attachments/${confirmedIds[0]}/url`)
+        .set(userAHeaders);
+      expect(urlRes.status).toBe(200);
+      expect(urlRes.body.access_url).toContain('image/authenticated/');
+      const expiresMs = new Date(urlRes.body.expires_at).getTime();
+      const diffSec = (expiresMs - nowBefore) / 1000;
+      expect(diffSec).toBeGreaterThanOrEqual(3595);
+      expect(diffSec).toBeLessThanOrEqual(3605);
+
+      // DELETE lampiran -> 204
+      const delRes = await request(app.getHttpServer())
+        .delete(`/transactions/${tx.id}/attachments/${confirmedIds[0]}`)
+        .set(userAHeaders);
+      expect(delRes.status).toBe(204);
+
+      const remaining = await prisma.asSystem().fileAttachment.count({
+        where: { transaction_id: tx.id },
+      });
+      expect(remaining).toBe(2);
+    });
+
+    it('AC-6 (isolasi): User B mengakses presign/confirm/get-url/delete pada transaksi User A -> 404', async () => {
+      if (throttlerStorage.storage) {
+        throttlerStorage.storage.clear();
+      }
+
+      const tx = await prisma.asSystem().transaction.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          account_id: userAAccount.id,
+          type: 'EXPENSE',
+          amount: 40000n,
+          date: new Date('2026-11-01T00:00:00.000Z'),
+          status: 'POSTED',
+          category_id: expenseCategoryA.id,
+          client_tx_id: generateTestUlid(),
+        },
+      });
+
+      const att = await prisma.asSystem().fileAttachment.create({
+        data: {
+          transaction_id: tx.id,
+          storage_key: `users/${userAId}/tx/${tx.id}/isolated-att`,
+          mime: 'image/jpeg',
+          size_bytes: 120000n,
+          uploaded_by: userAId,
+        },
+      });
+
+      const resPresign = await request(app.getHttpServer())
+        .post(`/transactions/${tx.id}/attachments/presign`)
+        .set(userBHeaders)
+        .send({ mime: 'image/jpeg', size: 100_000 });
+      expect(resPresign.status).toBe(404);
+
+      const resConfirm = await request(app.getHttpServer())
+        .post(`/transactions/${tx.id}/attachments`)
+        .set(userBHeaders)
+        .send({
+          storage_key: `users/${userAId}/tx/${tx.id}/attempt`,
+          mime: 'image/jpeg',
+          size_bytes: 100_000,
+          magic_bytes_base64: jpegHeaderBase64,
+        });
+      expect(resConfirm.status).toBe(404);
+
+      const resUrl = await request(app.getHttpServer())
+        .get(`/transactions/${tx.id}/attachments/${att.id}/url`)
+        .set(userBHeaders);
+      expect(resUrl.status).toBe(404);
+
+      const resDel = await request(app.getHttpServer())
+        .delete(`/transactions/${tx.id}/attachments/${att.id}`)
+        .set(userBHeaders);
+      expect(resDel.status).toBe(404);
+    });
+  });
 });

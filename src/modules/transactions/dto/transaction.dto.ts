@@ -301,3 +301,103 @@ export class CreateTransactionPipe implements PipeTransform {
     return parsed.data;
   }
 }
+
+export const ALLOWED_ATTACHMENT_MIMES = [
+  'image/jpeg',
+  'image/png',
+  'image/webp',
+] as const;
+export const MAX_ATTACHMENT_SIZE_BYTES = 5_242_880;
+export const MAX_ATTACHMENTS_PER_TRANSACTION = 3;
+
+export const presignAttachmentSchema = z
+  .object({
+    mime: z.enum(ALLOWED_ATTACHMENT_MIMES),
+    size: z.number().int().positive().max(MAX_ATTACHMENT_SIZE_BYTES),
+  })
+  .strict();
+
+export type PresignAttachmentDto = z.infer<typeof presignAttachmentSchema>;
+
+export const confirmAttachmentSchema = z
+  .object({
+    storage_key: z.string().trim().min(1),
+    mime: z.enum(ALLOWED_ATTACHMENT_MIMES),
+    size_bytes: z.number().int().positive().max(MAX_ATTACHMENT_SIZE_BYTES),
+    magic_bytes_base64: z.string().trim().min(1),
+  })
+  .strict();
+
+export type ConfirmAttachmentDto = z.infer<typeof confirmAttachmentSchema>;
+
+@Injectable()
+export class PresignAttachmentPipe implements PipeTransform {
+  transform(value: unknown) {
+    if (typeof value === 'object' && value !== null) {
+      const v = value as Record<string, any>;
+      if (
+        typeof v.size === 'number' &&
+        (v.size <= 0 || v.size > MAX_ATTACHMENT_SIZE_BYTES)
+      ) {
+        throw new UnprocessableEntityException({
+          code: 'FILE_TOO_LARGE',
+          message: 'Ukuran lampiran maksimal 5 MB',
+        });
+      }
+      if (
+        v.mime !== undefined &&
+        !ALLOWED_ATTACHMENT_MIMES.includes(v.mime)
+      ) {
+        throw new UnprocessableEntityException({
+          code: 'INVALID_FILE_TYPE',
+          message: 'Tipe file harus JPEG, PNG, atau WebP',
+        });
+      }
+    }
+    const parsed = presignAttachmentSchema.safeParse(value);
+    if (!parsed.success) {
+      throw new BadRequestException({
+        code: 'VALIDATION_ERROR',
+        message: 'Data tidak valid',
+        details: parsed.error.flatten().fieldErrors,
+      });
+    }
+    return parsed.data;
+  }
+}
+
+@Injectable()
+export class ConfirmAttachmentPipe implements PipeTransform {
+  transform(value: unknown) {
+    if (typeof value === 'object' && value !== null) {
+      const v = value as Record<string, any>;
+      if (
+        typeof v.size_bytes === 'number' &&
+        (v.size_bytes <= 0 || v.size_bytes > MAX_ATTACHMENT_SIZE_BYTES)
+      ) {
+        throw new UnprocessableEntityException({
+          code: 'FILE_TOO_LARGE',
+          message: 'Ukuran lampiran maksimal 5 MB',
+        });
+      }
+      if (
+        v.mime !== undefined &&
+        !ALLOWED_ATTACHMENT_MIMES.includes(v.mime)
+      ) {
+        throw new UnprocessableEntityException({
+          code: 'INVALID_FILE_TYPE',
+          message: 'Tipe file harus JPEG, PNG, atau WebP',
+        });
+      }
+    }
+    const parsed = confirmAttachmentSchema.safeParse(value);
+    if (!parsed.success) {
+      throw new BadRequestException({
+        code: 'VALIDATION_ERROR',
+        message: 'Data tidak valid',
+        details: parsed.error.flatten().fieldErrors,
+      });
+    }
+    return parsed.data;
+  }
+}

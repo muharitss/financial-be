@@ -3,11 +3,21 @@ import { PrismaModule } from '../../prisma/prisma.module.js';
 import { TransactionsController } from './transactions.controller.js';
 import { TransactionsService } from './transactions.service.js';
 import { ScheduledTransactionService } from './scheduled-transaction.service.js';
+import { TransactionAttachmentsController } from './transaction-attachments.controller.js';
+import { TransactionAttachmentsService } from './transaction-attachments.service.js';
 
 @Module({
   imports: [PrismaModule],
-  controllers: [TransactionsController],
-  providers: [TransactionsService, ScheduledTransactionService],
-  exports: [TransactionsService, ScheduledTransactionService],
+  controllers: [TransactionsController, TransactionAttachmentsController],
+  providers: [
+    TransactionsService,
+    ScheduledTransactionService,
+    TransactionAttachmentsService,
+  ],
+  exports: [
+    TransactionsService,
+    ScheduledTransactionService,
+    TransactionAttachmentsService,
+  ],
 })
 export class TransactionsModule {}
