@@ -10,6 +10,7 @@ import {
 import { Prisma, TransactionStatus } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service.js';
 import { todayInTz } from '../../common/utils/date.js';
+import { evaluateNegativeBalancePolicy } from './balance-policy.js';
 import {
   resolveClientTxId,
   type CreateTransactionDto,
@@ -329,17 +330,20 @@ export class TransactionsService {
 
         // 8. Update balance akun jika POSTED
         let finalBalance = account.balance;
+        let warning: string | undefined;
         if (status === 'POSTED') {
-          finalBalance = account.balance + BigInt(dto.amount);
+          const reserved = await getAccountReserved(tx, account.id);
+          const policy = evaluateNegativeBalancePolicy({
+            account,
+            reserved,
+            delta: BigInt(dto.amount),
+          });
+          finalBalance = policy.newBalance;
+          warning = policy.warning;
           await tx.account.update({
             where: { id: account.id, user_id: user.userId },
             data: { balance: finalBalance },
           });
-        }
-
-        let warning: string | undefined;
-        if (status === 'POSTED' && finalBalance < 0n) {
-          warning = 'NEGATIVE_BALANCE';
         }
 
         // 9. Buat TransactionAudit (C-06, NFR-TRX-005)
@@ -483,25 +487,17 @@ export class TransactionsService {
         const status: TransactionStatus = isScheduled ? 'SCHEDULED' : 'POSTED';
 
         // Pengecekan saldo hanya untuk transaksi efektif (status === POSTED)
+        let finalBalance = account.balance;
+        let warning: string | undefined;
         if (status === 'POSTED') {
           const reserved = await getAccountReserved(tx, account.id);
-          const available = account.balance - reserved;
-          const needed = BigInt(dto.amount);
-
-          if (
-            !account.allow_negative &&
-            (needed > available || account.balance - needed < 0n)
-          ) {
-            throw new ConflictException({
-              code: 'INSUFFICIENT_BALANCE',
-              message: 'Saldo tersedia tidak mencukupi',
-              details: {
-                available: Number(available),
-                needed: dto.amount,
-                account_id: account.id,
-              },
-            });
-          }
+          const policy = evaluateNegativeBalancePolicy({
+            account,
+            reserved,
+            delta: -BigInt(dto.amount),
+          });
+          finalBalance = policy.newBalance;
+          warning = policy.warning;
         }
 
         // 5. Buat Transaction
@@ -552,18 +548,11 @@ export class TransactionsService {
         }
 
         // 8. Update balance akun jika POSTED
-        let finalBalance = account.balance;
         if (status === 'POSTED') {
-          finalBalance = account.balance - BigInt(dto.amount);
           await tx.account.update({
             where: { id: account.id, user_id: user.userId },
             data: { balance: finalBalance },
           });
-        }
-
-        let warning: string | undefined;
-        if (status === 'POSTED' && finalBalance < 0n) {
-          warning = 'NEGATIVE_BALANCE';
         }
 
         // 9. Buat TransactionAudit (C-06, NFR-TRX-005)
@@ -755,24 +744,18 @@ export class TransactionsService {
         const amountReceivedBigInt = BigInt(amountReceived);
 
         // Pengecekan saldo sumber hanya untuk transaksi efektif (status === POSTED)
+        let fromFinalBalance = fromAccount.balance;
+        let warning: string | undefined;
         if (status === 'POSTED') {
           const fromReserved = await getAccountReserved(tx, fromAccount.id);
-          const fromAvailable = fromAccount.balance - fromReserved;
-
-          if (
-            !fromAccount.allow_negative &&
-            (fromAccount.balance < 0n || totalOut > fromAvailable || fromAccount.balance - totalOut < 0n)
-          ) {
-            throw new ConflictException({
-              code: 'INSUFFICIENT_BALANCE',
-              message: 'Saldo tersedia tidak mencukupi',
-              details: {
-                available: Number(fromAvailable),
-                needed: Number(totalOut),
-                account_id: fromAccount.id,
-              },
-            });
-          }
+          const policy = evaluateNegativeBalancePolicy({
+            account: fromAccount,
+            reserved: fromReserved,
+            delta: -totalOut,
+            isOutgoingTransfer: true,
+          });
+          fromFinalBalance = policy.newBalance;
+          warning = policy.warning;
         }
 
         const transferGroupId = isSeparateFee ? randomUUID() : null;
@@ -841,11 +824,9 @@ export class TransactionsService {
         }
 
         // 9. Update saldo kedua akun jika POSTED
-        let fromFinalBalance = fromAccount.balance;
         let toFinalBalance = toAccount.balance;
 
         if (status === 'POSTED') {
-          fromFinalBalance = fromAccount.balance - totalOut;
           toFinalBalance = toAccount.balance + amountReceivedBigInt;
 
           await tx.account.update({
@@ -857,11 +838,6 @@ export class TransactionsService {
             where: { id: toAccount.id, user_id: user.userId },
             data: { balance: toFinalBalance },
           });
-        }
-
-        let warning: string | undefined;
-        if (status === 'POSTED' && fromFinalBalance < 0n) {
-          warning = 'NEGATIVE_BALANCE';
         }
 
         // 10. Buat TransactionAudit untuk baris TRANSFER
@@ -962,25 +938,15 @@ export class TransactionsService {
         });
       }
 
-      // 2. Hitung newBalance = account.balance + BigInt(dto.amount)
-      const newBalance = account.balance + BigInt(dto.amount);
-
-      // 3. Cek saldo negatif
+      // 2. Evaluasi kebijakan saldo negatif
       const reserved = await getAccountReserved(tx, account.id);
-      const available = account.balance - reserved;
-
-      if (newBalance < 0n && !account.allow_negative) {
-        throw new ConflictException({
-          code: 'INSUFFICIENT_BALANCE',
-          message:
-            'Penyesuaian membuat saldo negatif pada akun yang tidak mengizinkannya',
-          details: {
-            available: Number(available),
-            needed: Math.abs(dto.amount),
-            account_id: account.id,
-          },
-        });
-      }
+      const policy = evaluateNegativeBalancePolicy({
+        account,
+        reserved,
+        delta: BigInt(dto.amount),
+      });
+      const newBalance = policy.newBalance;
+      const warning = policy.warning;
 
       // 4. Simpan Transaction
       const created = await tx.transaction.create({
@@ -1004,11 +970,6 @@ export class TransactionsService {
         where: { id: account.id, user_id: user.userId },
         data: { balance: newBalance },
       });
-
-      let warning: string | undefined;
-      if (newBalance < 0n) {
-        warning = 'NEGATIVE_BALANCE';
-      }
 
       // 6. Simpan TransactionAudit
       const response = toTransactionResponse(created, warning);
@@ -1353,42 +1314,24 @@ export class TransactionsService {
 
             if (fromDelta < 0n) {
               const fromReserved = await getAccountReserved(tx, fromAcc!.id);
-              const fromAvailable = fromAcc!.balance - fromReserved;
-              const newFromBal = fromAcc!.balance + fromDelta;
-              if (
-                !fromAcc!.allow_negative &&
-                (BigInt(-fromDelta) > fromAvailable || newFromBal < 0n)
-              ) {
-                throw new ConflictException({
-                  code: 'INSUFFICIENT_BALANCE',
-                  message: 'Saldo tersedia tidak mencukupi',
-                  details: {
-                    available: Number(fromAvailable),
-                    needed: Number(-fromDelta),
-                    account_id: fromAcc!.id,
-                  },
-                });
-              }
+              const fromPolicy = evaluateNegativeBalancePolicy({
+                account: fromAcc!,
+                reserved: fromReserved,
+                delta: fromDelta,
+                isOutgoingTransfer: true,
+              });
+              finalAccountBalance = fromPolicy.newBalance;
+            } else {
+              finalAccountBalance = fromAcc!.balance + fromDelta;
             }
 
             if (toDelta < 0n) {
               const toReserved = await getAccountReserved(tx, toAcc!.id);
-              const toAvailable = toAcc!.balance - toReserved;
-              const newToBal = toAcc!.balance + toDelta;
-              if (
-                !toAcc!.allow_negative &&
-                (BigInt(-toDelta) > toAvailable || newToBal < 0n)
-              ) {
-                throw new ConflictException({
-                  code: 'INSUFFICIENT_BALANCE',
-                  message: 'Saldo tersedia tidak mencukupi',
-                  details: {
-                    available: Number(toAvailable),
-                    needed: Number(-toDelta),
-                    account_id: toAcc!.id,
-                  },
-                });
-              }
+              evaluateNegativeBalancePolicy({
+                account: toAcc!,
+                reserved: toReserved,
+                delta: toDelta,
+              });
             }
 
             finalAccountBalance = fromAcc!.balance + fromDelta;
@@ -1428,26 +1371,13 @@ export class TransactionsService {
             }
 
             const delta = newEffect - oldEffect;
-            finalAccountBalance = account.balance + delta;
-
-            if (delta < 0n) {
-              const reserved = await getAccountReserved(tx, account.id);
-              const available = account.balance - reserved;
-              if (
-                !account.allow_negative &&
-                (BigInt(-delta) > available || finalAccountBalance < 0n)
-              ) {
-                throw new ConflictException({
-                  code: 'INSUFFICIENT_BALANCE',
-                  message: 'Saldo tersedia tidak mencukupi',
-                  details: {
-                    available: Number(available),
-                    needed: Number(-delta),
-                    account_id: account.id,
-                  },
-                });
-              }
-            }
+            const reserved = await getAccountReserved(tx, account.id);
+            const policy = evaluateNegativeBalancePolicy({
+              account,
+              reserved,
+              delta,
+            });
+            finalAccountBalance = policy.newBalance;
 
             await tx.account.update({
               where: { id: account.id, user_id: user.userId },
@@ -1672,28 +1602,13 @@ export class TransactionsService {
 
           const account = accounts[0];
           const reserved = await getAccountReserved(tx, account.id);
-          const available = account.balance - reserved;
-          const newBalance = account.balance - original.amount;
-
-          if (
-            !account.allow_negative &&
-            (original.amount > available || newBalance < 0n)
-          ) {
-            throw new ConflictException({
-              code: 'INSUFFICIENT_BALANCE',
-              message:
-                'Saldo tersedia tidak mencukupi untuk membalik transaksi pendapatan',
-              details: {
-                available: Number(available),
-                needed: Number(original.amount),
-                account_id: account.id,
-              },
-            });
-          }
-
-          if (newBalance < 0n) {
-            warning = 'NEGATIVE_BALANCE';
-          }
+          const policy = evaluateNegativeBalancePolicy({
+            account,
+            reserved,
+            delta: -original.amount,
+          });
+          const newBalance = policy.newBalance;
+          warning = policy.warning;
 
           await tx.account.update({
             where: { id: account.id, user_id: user.userId },
@@ -1711,7 +1626,16 @@ export class TransactionsService {
           >`SELECT id, financial_profile_id, balance, allow_negative, archived FROM accounts WHERE id = ${original.account_id}::uuid AND user_id = ${user.userId}::uuid FOR UPDATE`;
 
           const account = accounts[0];
-          const newBalance = account.balance + original.amount;
+          const reserved = await getAccountReserved(tx, account.id);
+          const policy = evaluateNegativeBalancePolicy({
+            account,
+            reserved,
+            delta: original.amount,
+          });
+          const newBalance = policy.newBalance;
+          if (policy.warning) {
+            warning = policy.warning;
+          }
 
           await tx.account.update({
             where: { id: account.id, user_id: user.userId },
@@ -1729,30 +1653,15 @@ export class TransactionsService {
           >`SELECT id, financial_profile_id, balance, allow_negative, archived FROM accounts WHERE id = ${original.account_id}::uuid AND user_id = ${user.userId}::uuid FOR UPDATE`;
 
           const account = accounts[0];
-          const newBalance = account.balance - original.amount;
-
-          if (original.amount > 0n) {
-            const reserved = await getAccountReserved(tx, account.id);
-            const available = account.balance - reserved;
-            if (
-              !account.allow_negative &&
-              (original.amount > available || newBalance < 0n)
-            ) {
-              throw new ConflictException({
-                code: 'INSUFFICIENT_BALANCE',
-                message:
-                  'Saldo tersedia tidak mencukupi untuk membalik transaksi penyesuaian',
-                details: {
-                  available: Number(available),
-                  needed: Number(original.amount),
-                  account_id: account.id,
-                },
-              });
-            }
-          }
-
-          if (newBalance < 0n) {
-            warning = 'NEGATIVE_BALANCE';
+          const reserved = await getAccountReserved(tx, account.id);
+          const policy = evaluateNegativeBalancePolicy({
+            account,
+            reserved,
+            delta: -original.amount,
+          });
+          const newBalance = policy.newBalance;
+          if (policy.warning) {
+            warning = policy.warning;
           }
 
           await tx.account.update({
@@ -1774,23 +1683,14 @@ export class TransactionsService {
           const toAccount = accounts.find((a) => a.id === original.to_account_id);
 
           const toReserved = await getAccountReserved(tx, toAccount!.id);
-          const toAvailable = toAccount!.balance - toReserved;
-          const newToBalance = toAccount!.balance - original.amount;
-
-          if (
-            !toAccount!.allow_negative &&
-            (original.amount > toAvailable || newToBalance < 0n)
-          ) {
-            throw new ConflictException({
-              code: 'INSUFFICIENT_BALANCE',
-              message:
-                'Saldo akun tujuan tidak mencukupi untuk pembalikan transfer',
-              details: {
-                available: Number(toAvailable),
-                needed: Number(original.amount),
-                account_id: toAccount!.id,
-              },
-            });
+          const toPolicy = evaluateNegativeBalancePolicy({
+            account: toAccount!,
+            reserved: toReserved,
+            delta: -original.amount,
+          });
+          const newToBalance = toPolicy.newBalance;
+          if (toPolicy.warning) {
+            warning = toPolicy.warning;
           }
 
           if (original.transfer_group_id) {

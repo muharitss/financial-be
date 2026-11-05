@@ -6,6 +6,7 @@ import { createHash } from 'node:crypto';
 import * as argon2 from '@node-rs/argon2';
 import { AuthService } from './auth.service.js';
 import { PrismaService } from '../../prisma/prisma.service.js';
+import { ScheduledTransactionService } from '../transactions/scheduled-transaction.service.js';
 
 describe('AuthService (Manual Auth)', () => {
   let service: AuthService;
@@ -50,6 +51,12 @@ describe('AuthService (Manual Auth)', () => {
         AuthService,
         { provide: PrismaService, useValue: prisma },
         { provide: JwtService, useValue: jwtService },
+        {
+          provide: ScheduledTransactionService,
+          useValue: {
+            processDueForUser: jest.fn().mockResolvedValue(undefined),
+          },
+        },
       ],
     }).compile();
 

@@ -545,11 +545,16 @@ describe('TransactionsService', () => {
       } catch (err: any) {
         expect(err.getResponse()).toEqual({
           code: 'INSUFFICIENT_BALANCE',
-          message: 'Saldo tersedia tidak mencukupi',
+          message:
+            'Saldo akun tidak mencukupi. Sesuaikan saldo atau izinkan saldo negatif untuk akun ini.',
           details: {
+            account_id: mockAccount.id,
+            ledger_balance: 100000,
+            reserved: 70000,
             available: 30000,
             needed: 50000,
-            account_id: mockAccount.id,
+            shortfall: 20000,
+            resolution_options: ['ADJUST_BALANCE', 'ALLOW_NEGATIVE'],
           },
         });
       }

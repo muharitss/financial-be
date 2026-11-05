@@ -690,9 +690,13 @@ describe('Transactions E2E Test Suite (Supertest)', () => {
       expect(res.status).toBe(409);
       expect(res.body.code).toBe('INSUFFICIENT_BALANCE');
       expect(res.body.details).toEqual({
+        account_id: acc.id,
+        ledger_balance: 100000,
+        reserved: 70000,
         available: 30000,
         needed: 50000,
-        account_id: acc.id,
+        shortfall: 20000,
+        resolution_options: ['ADJUST_BALANCE', 'ALLOW_NEGATIVE'],
       });
 
       // Saldo akun tidak berubah
@@ -1325,9 +1329,13 @@ describe('Transactions E2E Test Suite (Supertest)', () => {
       expect(res.status).toBe(409);
       expect(res.body.code).toBe('INSUFFICIENT_BALANCE');
       expect(res.body.details).toEqual({
+        account_id: acc.id,
+        ledger_balance: 100000,
+        reserved: 0,
         available: 100000,
         needed: 200000,
-        account_id: acc.id,
+        shortfall: 100000,
+        resolution_options: ['ADJUST_BALANCE', 'ALLOW_NEGATIVE'],
       });
 
       const accAfter = await prisma.account.findFirst({
@@ -3153,6 +3161,278 @@ describe('Transactions E2E Test Suite (Supertest)', () => {
         .delete(`/transactions/${tx.id}/attachments/${att.id}`)
         .set(userBHeaders);
       expect(resDel.status).toBe(404);
+    });
+  });
+
+  describe('FR-TRX-011: Saldo Negatif & Detail Resolusi (TASK-050)', () => {
+    it('AC-1: allow_negative = false, balance = 10000 -> EXPENSE 20000 -> 409 INSUFFICIENT_BALANCE dengan details lengkap & saldo tidak berubah', async () => {
+      const acc = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Akun Negatif AC1 ' + Date.now(),
+          type: 'BANK',
+          opening_balance: 10000n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 10000n,
+          allow_negative: false,
+        },
+      });
+
+      const res = await request(app.getHttpServer())
+        .post('/transactions')
+        .set(userAHeaders)
+        .send({
+          type: 'EXPENSE',
+          account_id: acc.id,
+          amount: 20000,
+          category_id: expenseCategoryA.id,
+          date: '2026-11-01',
+          client_tx_id: generateTestUlid(),
+        });
+
+      expect(res.status).toBe(409);
+      expect(res.body.code).toBe('INSUFFICIENT_BALANCE');
+      expect(res.body.message).toBe(
+        'Saldo akun tidak mencukupi. Sesuaikan saldo atau izinkan saldo negatif untuk akun ini.',
+      );
+      expect(res.body.details).toEqual({
+        account_id: acc.id,
+        ledger_balance: 10000,
+        reserved: 0,
+        available: 10000,
+        needed: 20000,
+        shortfall: 10000,
+        resolution_options: ['ADJUST_BALANCE', 'ALLOW_NEGATIVE'],
+      });
+
+      const accAfter = await prisma.account.findFirst({ where: { id: acc.id, user_id: userAId } });
+      expect(accAfter!.balance).toBe(10000n);
+    });
+
+    it('AC-2: Setelah user PATCH /accounts/:id/allow-negative { allow_negative: true }, EXPENSE 20000 berhasil 201 dengan warning NEGATIVE_BALANCE dan balance = -10000', async () => {
+      const acc = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Akun Negatif AC2 ' + Date.now(),
+          type: 'BANK',
+          opening_balance: 10000n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 10000n,
+          allow_negative: false,
+        },
+      });
+
+      // 1. Toggle allow_negative via endpoint
+      const patchRes = await request(app.getHttpServer())
+        .patch(`/accounts/${acc.id}/allow-negative`)
+        .set(userAHeaders)
+        .send({ allow_negative: true });
+      expect(patchRes.status).toBe(200);
+      expect(patchRes.body.allow_negative).toBe(true);
+
+      // Pastikan tercatat di audit_logs
+      const auditLog = await prisma.auditLog.findFirst({
+        where: {
+          resource_type: 'account',
+          resource_id: acc.id,
+          action: 'ACCOUNT_ALLOW_NEGATIVE_UPDATE',
+        },
+      });
+      expect(auditLog).toBeDefined();
+
+      // 2. Request EXPENSE 20000 yang sama
+      const expRes = await request(app.getHttpServer())
+        .post('/transactions')
+        .set(userAHeaders)
+        .send({
+          type: 'EXPENSE',
+          account_id: acc.id,
+          amount: 20000,
+          category_id: expenseCategoryA.id,
+          date: '2026-11-01',
+          client_tx_id: generateTestUlid(),
+        });
+
+      expect(expRes.status).toBe(201);
+      expect(expRes.body.warning).toBe('NEGATIVE_BALANCE');
+
+      const accAfter = await prisma.account.findFirst({ where: { id: acc.id, user_id: userAId } });
+      expect(accAfter!.balance).toBe(-10000n);
+    });
+
+    it('AC-3: Transfer keluar dari akun negatif (balance = -10000) berhasil dengan warning NEGATIVE_BALANCE bila allow_negative = true, dan ditolak 409 bila allow_negative = false', async () => {
+      // Akun asal negatif dengan allow_negative = false
+      const sourceAccFalse = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Akun Transfer Negatif False ' + Date.now(),
+          type: 'BANK',
+          opening_balance: -10000n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: -10000n,
+          allow_negative: false,
+        },
+      });
+
+      const destAcc = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Akun Tujuan Transfer ' + Date.now(),
+          type: 'BANK',
+          opening_balance: 50000n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 50000n,
+        },
+      });
+
+      // Transfer dari akun asal (allow_negative = false) -> ditolak 409
+      const resFalse = await request(app.getHttpServer())
+        .post('/transactions')
+        .set(userAHeaders)
+        .send({
+          type: 'TRANSFER',
+          account_id: sourceAccFalse.id,
+          to_account_id: destAcc.id,
+          amount: 5000,
+          date: '2026-11-01',
+          client_tx_id: generateTestUlid(),
+        });
+      expect(resFalse.status).toBe(409);
+      expect(resFalse.body.code).toBe('INSUFFICIENT_BALANCE');
+      expect(resFalse.body.details).toEqual({
+        account_id: sourceAccFalse.id,
+        ledger_balance: -10000,
+        reserved: 0,
+        available: -10000,
+        needed: 5000,
+        shortfall: 15000,
+        resolution_options: ['ADJUST_BALANCE', 'ALLOW_NEGATIVE'],
+      });
+
+      // Akun asal negatif dengan allow_negative = true
+      const sourceAccTrue = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Akun Transfer Negatif True ' + Date.now(),
+          type: 'BANK',
+          opening_balance: -10000n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: -10000n,
+          allow_negative: true,
+        },
+      });
+
+      // Transfer dari akun asal (allow_negative = true) -> 201 dengan warning
+      const resTrue = await request(app.getHttpServer())
+        .post('/transactions')
+        .set(userAHeaders)
+        .send({
+          type: 'TRANSFER',
+          account_id: sourceAccTrue.id,
+          to_account_id: destAcc.id,
+          amount: 5000,
+          date: '2026-11-01',
+          client_tx_id: generateTestUlid(),
+        });
+      expect(resTrue.status).toBe(201);
+      expect(resTrue.body.warning).toBe('NEGATIVE_BALANCE');
+
+      const sourceAfter = await prisma.account.findFirst({ where: { id: sourceAccTrue.id, user_id: userAId } });
+      expect(sourceAfter!.balance).toBe(-15000n);
+    });
+
+    it('AC-4: PATCH /transactions/:id dan POST /transactions/:id/reverse yang menyebabkan saldo < 0 pada allow_negative = false ditolak 409 INSUFFICIENT_BALANCE dengan details identik', async () => {
+      const acc = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Akun Patch Reverse AC4 ' + Date.now(),
+          type: 'BANK',
+          opening_balance: 10000n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 10000n,
+          allow_negative: false,
+        },
+      });
+
+      // 1. Buat income 20000 -> saldo jadi 30000
+      const incRes = await request(app.getHttpServer())
+        .post('/transactions')
+        .set(userAHeaders)
+        .send({
+          type: 'INCOME',
+          account_id: acc.id,
+          amount: 20000,
+          category_id: incomeCategoryA.id,
+          date: '2026-11-01',
+          client_tx_id: generateTestUlid(),
+        });
+      expect(incRes.status).toBe(201);
+
+      // 2. Buat expense 25000 -> saldo jadi 5000
+      const expRes = await request(app.getHttpServer())
+        .post('/transactions')
+        .set(userAHeaders)
+        .send({
+          type: 'EXPENSE',
+          account_id: acc.id,
+          amount: 25000,
+          category_id: expenseCategoryA.id,
+          date: '2026-11-01',
+          client_tx_id: generateTestUlid(),
+        });
+      expect(expRes.status).toBe(201);
+
+      // 3. PATCH expense dari 25000 menjadi 35000 (butuh tambahan 10000, tapi balance hanya 5000) -> 409
+      const patchRes = await request(app.getHttpServer())
+        .patch(`/transactions/${expRes.body.id}`)
+        .set(userAHeaders)
+        .send({
+          amount: 35000,
+          client_tx_id: generateTestUlid(),
+        });
+      expect(patchRes.status).toBe(409);
+      expect(patchRes.body.code).toBe('INSUFFICIENT_BALANCE');
+      expect(patchRes.body.message).toBe(
+        'Saldo akun tidak mencukupi. Sesuaikan saldo atau izinkan saldo negatif untuk akun ini.',
+      );
+      expect(patchRes.body.details).toEqual({
+        account_id: acc.id,
+        ledger_balance: 5000,
+        reserved: 0,
+        available: 5000,
+        needed: 10000,
+        shortfall: 5000,
+        resolution_options: ['ADJUST_BALANCE', 'ALLOW_NEGATIVE'],
+      });
+
+      // 4. POST reverse pada income 20000 (butuh 20000, saldo hanya 5000) -> 409
+      const revRes = await request(app.getHttpServer())
+        .post(`/transactions/${incRes.body.id}/reverse`)
+        .set(userAHeaders)
+        .send({
+          reason: 'Pembalikan income',
+          client_tx_id: generateTestUlid(),
+        });
+      expect(revRes.status).toBe(409);
+      expect(revRes.body.code).toBe('INSUFFICIENT_BALANCE');
+      expect(revRes.body.message).toBe(
+        'Saldo akun tidak mencukupi. Sesuaikan saldo atau izinkan saldo negatif untuk akun ini.',
+      );
+      expect(revRes.body.details).toEqual({
+        account_id: acc.id,
+        ledger_balance: 5000,
+        reserved: 0,
+        available: 5000,
+        needed: 20000,
+        shortfall: 15000,
+        resolution_options: ['ADJUST_BALANCE', 'ALLOW_NEGATIVE'],
+      });
     });
   });
 });
