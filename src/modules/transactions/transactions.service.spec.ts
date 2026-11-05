@@ -74,6 +74,10 @@ describe('TransactionsService', () => {
       transactionAudit: {
         create: jest.fn<any>(),
       },
+      fileAttachment: {
+        findMany: jest.fn<any>().mockResolvedValue([]),
+        deleteMany: jest.fn<any>(),
+      },
       budgetPeriod: {
         findFirst: jest.fn<any>(),
       },

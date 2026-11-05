@@ -167,16 +167,40 @@ export class ScheduledTransactionService {
 
       // Jika baris EXPENSE merupakan bagian dari transfer group, biarkan baris TRANSFER yang memprosesnya
       if (row.type === 'EXPENSE' && row.transfer_group_id) {
-        const transferRows = await tx.$queryRaw<Array<{ id: string }>>`
-          SELECT id FROM transactions
+        const transferRows = await tx.$queryRaw<Array<{ id: string; status: string }>>`
+          SELECT id, status FROM transactions
           WHERE transfer_group_id = ${row.transfer_group_id}::uuid
             AND type = 'TRANSFER'
-            AND status = 'SCHEDULED'
-            AND processed_at IS NULL
         `;
-        if (transferRows.length > 0) {
+        const transfer = transferRows[0];
+        if (!transfer || transfer.status === 'SCHEDULED') {
           return false;
         }
+        if (transfer.status === 'POSTED') {
+          // Saldo sumber sudah dipotong saat baris TRANSFER diposting.
+          // Cukup update status EXPENSE menjadi POSTED tanpa memotong saldo lagi.
+          const now = new Date();
+          await tx.transaction.update({
+            where: { id: row.id },
+            data: {
+              status: 'POSTED',
+              processed_at: now,
+              job_run_id: jobRunId,
+            },
+          });
+          await tx.transactionAudit.create({
+            data: {
+              transaction_id: row.id,
+              action: 'UPDATE',
+              before: { status: 'SCHEDULED', processed_at: null },
+              after: { status: 'POSTED', processed_at: now, job_run_id: jobRunId },
+              actor_user_id: row.user_id,
+              reason: 'Auto-posted scheduled transaction',
+            },
+          });
+          return true;
+        }
+        return false;
       }
 
       // 2. Lock akun terkait (ORDER BY id ASC FOR UPDATE)
@@ -292,9 +316,13 @@ export class ScheduledTransactionService {
               AND type = 'EXPENSE'
               AND status = 'SCHEDULED'
               AND processed_at IS NULL
-            FOR UPDATE SKIP LOCKED
+            FOR UPDATE
           `;
           feeExpenseRow = feeRows[0] ?? null;
+          if (!feeExpenseRow) {
+            // Pasangan fee tidak ditemukan atau sedang diproses; tunda posting transfer ini
+            return false;
+          }
         }
 
         const totalOut = isSeparate || isBundled

@@ -402,11 +402,16 @@ export class ConfirmAttachmentPipe implements PipeTransform {
   }
 }
 
-export function encodeCursor(item: {
-  date: Date | string;
-  created_at: Date | string;
-  id: string;
-}): string {
+export function encodeCursor(
+  item: {
+    date: Date | string;
+    created_at: Date | string;
+    id: string;
+    amount?: bigint | number;
+    category?: { name: string } | null;
+  },
+  sort?: 'date' | 'amount' | 'category',
+): string {
   const d =
     item.date instanceof Date
       ? item.date.toISOString().slice(0, 10)
@@ -415,7 +420,16 @@ export function encodeCursor(item: {
     item.created_at instanceof Date
       ? item.created_at.toISOString()
       : new Date(item.created_at).toISOString();
-  return Buffer.from(JSON.stringify({ d, c, id: item.id }), 'utf8').toString(
+
+  let v: string | number | undefined;
+  if (sort === 'amount' && item.amount !== undefined) {
+    v = Number(item.amount);
+  } else if (sort === 'category' && item.category) {
+    v = item.category.name;
+  }
+
+  const payload = v !== undefined ? { d, c, id: item.id, v } : { d, c, id: item.id };
+  return Buffer.from(JSON.stringify(payload), 'utf8').toString(
     'base64url',
   );
 }
@@ -424,6 +438,7 @@ export function decodeCursor(cursor: string): {
   d: string;
   c: string;
   id: string;
+  v?: any;
 } {
   try {
     const jsonStr = Buffer.from(cursor, 'base64url').toString('utf8');
@@ -431,7 +446,7 @@ export function decodeCursor(cursor: string): {
     if (!parsed || typeof parsed !== 'object') {
       throw new Error('Not an object');
     }
-    const { d, c, id } = parsed;
+    const { d, c, id, v } = parsed;
     if (typeof d !== 'string' || typeof c !== 'string' || typeof id !== 'string') {
       throw new Error('Missing fields');
     }
@@ -446,12 +461,43 @@ export function decodeCursor(cursor: string): {
     ) {
       throw new Error('Invalid UUID');
     }
-    return { d, c, id };
+    return { d, c, id, v };
   } catch {
     throw new BadRequestException({
       code: 'INVALID_CURSOR',
       message: 'Cursor pagination tidak valid',
     });
+  }
+}
+
+export const adjustToTargetSchema = z
+  .object({
+    target_balance: z.number().int(),
+    reason: z
+      .string()
+      .trim()
+      .min(10, { message: 'Alasan penyesuaian minimal 10 karakter' })
+      .max(500),
+    note: z.string().trim().max(500).optional(),
+    client_tx_id: z.string().regex(ULID_REGEX).optional(),
+  })
+  .strict();
+
+export type AdjustToTargetDto = z.infer<typeof adjustToTargetSchema>;
+
+@Injectable()
+export class AdjustToTargetPipe implements PipeTransform {
+  transform(value: unknown) {
+    const parsed = adjustToTargetSchema.safeParse(value);
+    if (!parsed.success) {
+      const fieldErrors = parsed.error.flatten().fieldErrors;
+      throw new BadRequestException({
+        code: 'VALIDATION_ERROR',
+        message: 'Data tidak valid',
+        details: fieldErrors,
+      });
+    }
+    return parsed.data;
   }
 }
 

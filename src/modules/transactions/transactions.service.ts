@@ -12,6 +12,10 @@ import { PrismaService } from '../../prisma/prisma.service.js';
 import { todayInTz } from '../../common/utils/date.js';
 import { evaluateNegativeBalancePolicy } from './balance-policy.js';
 import {
+  toAccountResponse,
+  type AccountResponse,
+} from '../accounts/accounts.service.js';
+import {
   resolveClientTxId,
   encodeCursor,
   decodeCursor,
@@ -25,6 +29,7 @@ import {
   type ReverseTransactionDto,
   type CancelTransactionDto,
   type SplitItemDto,
+  type AdjustToTargetDto,
 } from './dto/transaction.dto.js';
 
 export interface TransactionResponse {
@@ -1013,6 +1018,93 @@ export class TransactionsService {
     }
   }
 
+  async adjustToTarget(
+    user: { userId: string; role?: string },
+    accountId: string,
+    dto: AdjustToTargetDto,
+    headerIdempotencyKey?: string,
+  ): Promise<{
+    transaction_id: string;
+    amount: number;
+    account: AccountResponse;
+  }> {
+    const clientTxId = resolveClientTxId(dto.client_tx_id, headerIdempotencyKey);
+
+    const pref = await this.prisma.userPreference.findFirst({
+      where: { user_id: user.userId },
+    });
+    const tz = pref?.timezone ?? 'Asia/Jakarta';
+    const today = todayInTz(tz);
+
+    return this.prisma.$transaction(async (tx) => {
+      // 1. Kunci baris akun dengan SELECT ... FOR UPDATE (wajib ada user_id)
+      const accounts = await tx.$queryRaw<
+        Array<{
+          id: string;
+          financial_profile_id: string;
+          balance: bigint;
+          allow_negative: boolean;
+          archived: boolean;
+        }>
+      >`SELECT id, financial_profile_id, balance, allow_negative, archived FROM accounts WHERE id = ${accountId}::uuid AND user_id = ${user.userId}::uuid FOR UPDATE`;
+
+      const account = accounts[0];
+      if (!account) {
+        throw new NotFoundException({
+          code: 'ACCOUNT_NOT_FOUND',
+          message: 'Akun tidak ditemukan',
+        });
+      }
+
+      if (account.archived) {
+        throw new ConflictException({
+          code: 'ACCOUNT_ARCHIVED',
+          message: 'Akun telah diarsipkan',
+        });
+      }
+
+      const amountBigInt = BigInt(dto.target_balance) - account.balance;
+      if (amountBigInt === 0n) {
+        throw new UnprocessableEntityException({
+          code: 'NO_BALANCE_CHANGE',
+          message: 'Saldo sudah sama dengan saldo aktual',
+        });
+      }
+
+      if (dto.target_balance < 0 && !account.allow_negative) {
+        throw new ConflictException({
+          code: 'NEGATIVE_BALANCE_NOT_ALLOWED',
+          message: 'Akun ini tidak mengizinkan saldo negatif',
+        });
+      }
+
+      const adjustmentTx = await this.createAdjustment(
+        user,
+        {
+          type: 'ADJUSTMENT',
+          account_id: accountId,
+          amount: Number(amountBigInt),
+          date: today,
+          reason: dto.reason.trim(),
+          note: dto.note?.trim() || undefined,
+          client_tx_id: clientTxId,
+        },
+        tx,
+      );
+
+      const reserved = await getAccountReserved(tx, accountId);
+      const updatedAccount = await tx.account.findFirstOrThrow({
+        where: { id: accountId, user_id: user.userId },
+      });
+
+      return {
+        transaction_id: adjustmentTx.id,
+        amount: Number(amountBigInt),
+        account: toAccountResponse(updatedAccount, reserved),
+      };
+    });
+  }
+
   private async validateAndCreateSplits(
     tx: Prisma.TransactionClient,
     userId: string,
@@ -1290,6 +1382,7 @@ export class TransactionsService {
 
         // 8. Rekalkulasi selisih saldo secara atomik jika POSTED
         let finalAccountBalance: bigint | undefined;
+        let transferWarning: string | undefined;
         if (
           existing.status === 'POSTED' &&
           dto.amount !== undefined &&
@@ -1324,20 +1417,27 @@ export class TransactionsService {
                 isOutgoingTransfer: true,
               });
               finalAccountBalance = fromPolicy.newBalance;
+              transferWarning = fromPolicy.warning;
             } else {
               finalAccountBalance = fromAcc!.balance + fromDelta;
+              if (finalAccountBalance < 0n) transferWarning = 'NEGATIVE_BALANCE';
             }
 
+            let finalToBalance = toAcc!.balance + toDelta;
             if (toDelta < 0n) {
               const toReserved = await getAccountReserved(tx, toAcc!.id);
-              evaluateNegativeBalancePolicy({
+              const toPolicy = evaluateNegativeBalancePolicy({
                 account: toAcc!,
                 reserved: toReserved,
                 delta: toDelta,
               });
+              finalToBalance = toPolicy.newBalance;
+              if (toPolicy.warning) {
+                transferWarning = transferWarning || toPolicy.warning;
+              }
+            } else if (finalToBalance < 0n) {
+              transferWarning = transferWarning || 'NEGATIVE_BALANCE';
             }
-
-            finalAccountBalance = fromAcc!.balance + fromDelta;
 
             await tx.account.update({
               where: { id: fromAcc!.id, user_id: user.userId },
@@ -1345,7 +1445,7 @@ export class TransactionsService {
             });
             await tx.account.update({
               where: { id: toAcc!.id, user_id: user.userId },
-              data: { balance: toAcc!.balance + toDelta },
+              data: { balance: finalToBalance },
             });
           } else {
             const accounts = await tx.$queryRaw<
@@ -1414,6 +1514,10 @@ export class TransactionsService {
           }
         }
 
+        if (!warning && transferWarning) {
+          warning = transferWarning;
+        }
+
         if (!warning && finalAccountBalance !== undefined && finalAccountBalance < 0n) {
           warning = 'NEGATIVE_BALANCE';
         }
@@ -1443,7 +1547,29 @@ export class TransactionsService {
           updateData.reason = dto.reason;
         }
         if (dto.account_id !== undefined && existing.status === 'SCHEDULED') {
+          if (
+            existing.type === 'TRANSFER' &&
+            dto.account_id === existing.to_account_id
+          ) {
+            throw new UnprocessableEntityException({
+              code: 'SAME_ACCOUNT_TRANSFER',
+              message: 'Akun sumber dan tujuan tidak boleh sama',
+            });
+          }
           updateData.account = { connect: { id: dto.account_id } };
+          if (existing.transfer_group_id) {
+            await tx.transaction.updateMany({
+              where: {
+                transfer_group_id: existing.transfer_group_id,
+                user_id: user.userId,
+                id: { not: existing.id },
+                status: 'SCHEDULED',
+              },
+              data: {
+                account_id: dto.account_id,
+              },
+            });
+          }
         }
 
         const updated = await tx.transaction.update({
@@ -2002,6 +2128,32 @@ export class TransactionsService {
           },
         });
 
+        // Edge Case #20: Hapus lampiran pada transaksi SCHEDULED yang dibatalkan
+        if (tx.fileAttachment) {
+          const attachments = await tx.fileAttachment.findMany({
+            where: { transaction_id: row.id },
+          });
+          if (attachments.length > 0) {
+            await tx.fileAttachment.deleteMany({
+              where: { transaction_id: row.id },
+            });
+            for (const att of attachments) {
+              await tx.transactionAudit.create({
+                data: {
+                  transaction_id: row.id,
+                  action: 'UPDATE',
+                  before: {
+                    attachment_id: att.id,
+                    storage_key: att.storage_key,
+                  },
+                  after: { attachment_removed: att.id, reason: 'Transaction cancelled' },
+                  actor_user_id: user.userId,
+                },
+              });
+            }
+          }
+        }
+
         if (row.transfer_group_id) {
           let partners: Array<{
             id: string;
@@ -2052,6 +2204,34 @@ export class TransactionsService {
                   reason: dto?.reason?.trim() ?? null,
                 },
               });
+
+              if (tx.fileAttachment) {
+                const partnerAttachments = await tx.fileAttachment.findMany({
+                  where: { transaction_id: partner.id },
+                });
+                if (partnerAttachments.length > 0) {
+                  await tx.fileAttachment.deleteMany({
+                    where: { transaction_id: partner.id },
+                  });
+                  for (const att of partnerAttachments) {
+                    await tx.transactionAudit.create({
+                      data: {
+                        transaction_id: partner.id,
+                        action: 'UPDATE',
+                        before: {
+                          attachment_id: att.id,
+                          storage_key: att.storage_key,
+                        },
+                        after: {
+                          attachment_removed: att.id,
+                          reason: 'Transaction cancelled',
+                        },
+                        actor_user_id: user.userId,
+                      },
+                    });
+                  }
+                }
+              }
             }
           }
         }
@@ -2156,20 +2336,66 @@ export class TransactionsService {
       const cursorCreatedAt = new Date(decoded.c);
       const cursorId = decoded.id;
 
-      andConditions.push({
-        OR: [
-          { date: { lt: cursorDate } },
-          {
-            date: cursorDate,
-            created_at: { lt: cursorCreatedAt },
-          },
-          {
-            date: cursorDate,
-            created_at: cursorCreatedAt,
-            id: { lt: cursorId },
-          },
-        ],
-      });
+      if (query.sort === 'amount' && decoded.v !== undefined) {
+        const cursorAmount = BigInt(decoded.v);
+        andConditions.push({
+          OR: [
+            { amount: { lt: cursorAmount } },
+            {
+              amount: cursorAmount,
+              date: { lt: cursorDate },
+            },
+            {
+              amount: cursorAmount,
+              date: cursorDate,
+              created_at: { lt: cursorCreatedAt },
+            },
+            {
+              amount: cursorAmount,
+              date: cursorDate,
+              created_at: cursorCreatedAt,
+              id: { lt: cursorId },
+            },
+          ],
+        });
+      } else if (query.sort === 'category' && typeof decoded.v === 'string') {
+        const cursorCategory = decoded.v;
+        andConditions.push({
+          OR: [
+            { category: { name: { gt: cursorCategory } } },
+            {
+              category: { name: cursorCategory },
+              date: { lt: cursorDate },
+            },
+            {
+              category: { name: cursorCategory },
+              date: cursorDate,
+              created_at: { lt: cursorCreatedAt },
+            },
+            {
+              category: { name: cursorCategory },
+              date: cursorDate,
+              created_at: cursorCreatedAt,
+              id: { lt: cursorId },
+            },
+          ],
+        });
+      } else {
+        andConditions.push({
+          OR: [
+            { date: { lt: cursorDate } },
+            {
+              date: cursorDate,
+              created_at: { lt: cursorCreatedAt },
+            },
+            {
+              date: cursorDate,
+              created_at: cursorCreatedAt,
+              id: { lt: cursorId },
+            },
+          ],
+        });
+      }
     }
 
     const where: Prisma.TransactionWhereInput = {
@@ -2245,7 +2471,7 @@ export class TransactionsService {
     const sliced = hasMore ? results.slice(0, limit) : results;
     const next_cursor =
       hasMore && sliced.length > 0
-        ? encodeCursor(sliced[sliced.length - 1])
+        ? encodeCursor(sliced[sliced.length - 1], query.sort)
         : null;
 
     const items = sliced.map((item) => ({

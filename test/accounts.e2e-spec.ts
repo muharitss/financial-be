@@ -980,4 +980,267 @@ describe('Accounts E2E Test Suite (Supertest)', () => {
       expect(acc?.allow_negative).toBe(false);
     });
   });
+
+  describe('POST /accounts/:id/adjust (TASK-034)', () => {
+    function generateUlid(): string {
+      const chars = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+      let str = '0';
+      for (let i = 1; i < 26; i++) {
+        str += chars[Math.floor(Math.random() * chars.length)];
+      }
+      return str;
+    }
+
+    it('AC-1 & AC-2: adjust target balance -> 201, update balance, buat Transaction ADJUSTMENT dan TransactionAudit', async () => {
+      const resCreate = await request(app.getHttpServer())
+        .post('/accounts')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          name: 'Akun Adjust AC-1',
+          type: 'BANK',
+          opening_balance: 1000000,
+        });
+      expect(resCreate.status).toBe(201);
+      const accountId = resCreate.body.id;
+
+      const clientTxId = generateUlid();
+      const resAdjust = await request(app.getHttpServer())
+        .post(`/accounts/${accountId}/adjust`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          target_balance: 950000,
+          reason: 'Selisih hitung kas fisik',
+          client_tx_id: clientTxId,
+        });
+
+      expect(resAdjust.status).toBe(201);
+      expect(resAdjust.body.amount).toBe(-50000);
+      expect(resAdjust.body.account.balance).toBe(950000);
+      expect(resAdjust.body.transaction_id).toBeDefined();
+
+      const txRecord = await prisma.asSystem().transaction.findUnique({
+        where: { id: resAdjust.body.transaction_id },
+      });
+      expect(txRecord).toBeDefined();
+      expect(txRecord?.type).toBe('ADJUSTMENT');
+      expect(Number(txRecord?.amount)).toBe(-50000);
+      expect(txRecord?.reason).toBe('Selisih hitung kas fisik');
+
+      const auditRecord = await prisma.asSystem().transactionAudit.findFirst({
+        where: { transaction_id: resAdjust.body.transaction_id },
+      });
+      expect(auditRecord).toBeDefined();
+      expect(auditRecord!.action).toBe('CREATE');
+      expect((auditRecord!.before as any).account_balance).toBe(1000000);
+      expect((auditRecord!.after as any).account_balance).toBe(950000);
+    });
+
+    it('AC-3: target_balance sama dengan saldo sekarang -> 422 NO_BALANCE_CHANGE', async () => {
+      const resCreate = await request(app.getHttpServer())
+        .post('/accounts')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          name: 'Akun Adjust AC-3',
+          type: 'BANK',
+          opening_balance: 500000,
+        });
+      expect(resCreate.status).toBe(201);
+      const accountId = resCreate.body.id;
+
+      const resAdjust = await request(app.getHttpServer())
+        .post(`/accounts/${accountId}/adjust`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          target_balance: 500000,
+          reason: 'Saldo tidak berubah sama sekali',
+          client_tx_id: generateUlid(),
+        });
+
+      expect(resAdjust.status).toBe(422);
+      expect(resAdjust.body.code).toBe('NO_BALANCE_CHANGE');
+    });
+
+    it('AC-4: reason < 10 karakter -> 400 VALIDATION_ERROR', async () => {
+      const resCreate = await request(app.getHttpServer())
+        .post('/accounts')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          name: 'Akun Adjust AC-4',
+          type: 'BANK',
+          opening_balance: 500000,
+        });
+      expect(resCreate.status).toBe(201);
+      const accountId = resCreate.body.id;
+
+      const resAdjust = await request(app.getHttpServer())
+        .post(`/accounts/${accountId}/adjust`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          target_balance: 450000,
+          reason: 'pendek',
+          client_tx_id: generateUlid(),
+        });
+
+      expect(resAdjust.status).toBe(400);
+      expect(resAdjust.body.code).toBe('VALIDATION_ERROR');
+    });
+
+    it('AC-5: target_balance negatif pada allow_negative = false -> 409 NEGATIVE_BALANCE_NOT_ALLOWED, pada true -> 201', async () => {
+      const resCreate = await request(app.getHttpServer())
+        .post('/accounts')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          name: 'Akun Adjust AC-5',
+          type: 'BANK',
+          opening_balance: 100000,
+        });
+      expect(resCreate.status).toBe(201);
+      const accountId = resCreate.body.id;
+
+      // 1. allow_negative = false -> 409
+      const resNegBlocked = await request(app.getHttpServer())
+        .post(`/accounts/${accountId}/adjust`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          target_balance: -10000,
+          reason: 'Penyesuaian kas minus belum diizinkan',
+          client_tx_id: generateUlid(),
+        });
+
+      expect(resNegBlocked.status).toBe(409);
+      expect(resNegBlocked.body.code).toBe('NEGATIVE_BALANCE_NOT_ALLOWED');
+
+      // 2. Aktifkan allow_negative -> 201
+      await request(app.getHttpServer())
+        .patch(`/accounts/${accountId}/allow-negative`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({ allow_negative: true });
+
+      const resNegAllowed = await request(app.getHttpServer())
+        .post(`/accounts/${accountId}/adjust`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          target_balance: -10000,
+          reason: 'Penyesuaian kas minus diizinkan',
+          client_tx_id: generateUlid(),
+        });
+
+      expect(resNegAllowed.status).toBe(201);
+      expect(resNegAllowed.body.account.balance).toBe(-10000);
+    });
+
+    it('AC-6: Akun diarsipkan -> 409 ACCOUNT_ARCHIVED', async () => {
+      const resCreate = await request(app.getHttpServer())
+        .post('/accounts')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          name: 'Akun Adjust AC-6 Arsip',
+          type: 'BANK',
+          opening_balance: 100000,
+        });
+      expect(resCreate.status).toBe(201);
+      const accountId = resCreate.body.id;
+
+      await request(app.getHttpServer())
+        .post(`/accounts/${accountId}/archive`)
+        .set('Cookie', userAHeaders.cookie);
+
+      const resAdjust = await request(app.getHttpServer())
+        .post(`/accounts/${accountId}/adjust`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          target_balance: 50000,
+          reason: 'Penyesuaian akun arsip ditolak',
+          client_tx_id: generateUlid(),
+        });
+
+      expect(resAdjust.status).toBe(409);
+      expect(resAdjust.body.code).toBe('ACCOUNT_ARCHIVED');
+    });
+
+    it('AC-7: Retry request identik dengan client_tx_id sama -> respons identik replayed', async () => {
+      const resCreate = await request(app.getHttpServer())
+        .post('/accounts')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          name: 'Akun Adjust AC-7 Idempoten',
+          type: 'BANK',
+          opening_balance: 300000,
+        });
+      expect(resCreate.status).toBe(201);
+      const accountId = resCreate.body.id;
+
+      const clientTxId = generateUlid();
+      const payload = {
+        target_balance: 200000,
+        reason: 'Penyesuaian saldo idempoten',
+        client_tx_id: clientTxId,
+      };
+
+      const res1 = await request(app.getHttpServer())
+        .post(`/accounts/${accountId}/adjust`)
+        .set('Cookie', userAHeaders.cookie)
+        .send(payload);
+      expect(res1.status).toBe(201);
+
+      const res2 = await request(app.getHttpServer())
+        .post(`/accounts/${accountId}/adjust`)
+        .set('Cookie', userAHeaders.cookie)
+        .send(payload);
+      expect(res2.status).toBe(201);
+      expect(res2.body.transaction_id).toBe(res1.body.transaction_id);
+    });
+
+    it('AC-8: Tanpa client_tx_id maupun header Idempotency-Key -> 422 MISSING_CLIENT_TX_ID', async () => {
+      const resCreate = await request(app.getHttpServer())
+        .post('/accounts')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          name: 'Akun Adjust AC-8 Missing Key',
+          type: 'BANK',
+          opening_balance: 300000,
+        });
+      expect(resCreate.status).toBe(201);
+      const accountId = resCreate.body.id;
+
+      const resAdjust = await request(app.getHttpServer())
+        .post(`/accounts/${accountId}/adjust`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          target_balance: 250000,
+          reason: 'Tanpa client_tx_id atau header',
+        });
+
+      expect(resAdjust.status).toBe(422);
+      expect(resAdjust.body.code).toBe('MISSING_CLIENT_TX_ID');
+    });
+
+    it('AC-9 (isolasi): User B adjust akun milik User A -> 404 ACCOUNT_NOT_FOUND', async () => {
+      const resCreate = await request(app.getHttpServer())
+        .post('/accounts')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          name: 'Akun Adjust AC-9 Private',
+          type: 'BANK',
+          opening_balance: 200000,
+        });
+      expect(resCreate.status).toBe(201);
+      const accountId = resCreate.body.id;
+
+      const resAttack = await request(app.getHttpServer())
+        .post(`/accounts/${accountId}/adjust`)
+        .set('Cookie', userBHeaders.cookie)
+        .send({
+          target_balance: 50000,
+          reason: 'Penyerang mencoba adjust akun',
+          client_tx_id: generateUlid(),
+        });
+
+      expect(resAttack.status).toBe(404);
+      expect(resAttack.body.code).toBe('ACCOUNT_NOT_FOUND');
+
+      const acc = await prisma.account.findFirst({ where: { id: accountId, user_id: userAId } });
+      expect(acc?.balance).toBe(200000n);
+    });
+  });
 });
