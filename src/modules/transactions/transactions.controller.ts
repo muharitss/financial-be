@@ -21,6 +21,8 @@ import {
   type UpdateTransactionDto,
   ReverseTransactionPipe,
   type ReverseTransactionDto,
+  CancelTransactionPipe,
+  type CancelTransactionDto,
 } from './dto/transaction.dto.js';
 import {
   TransactionsService,
@@ -92,5 +94,24 @@ export class TransactionsController {
     warning?: string;
   }> {
     return this.transactionsService.reverse(user, id, dto, headerIdempotencyKey);
+  }
+
+  @Post(':id/cancel')
+  @HttpCode(HttpStatus.OK)
+  @Throttle({ transaction: { limit: 60, ttl: 60000 } })
+  @ApiOperation({ summary: 'Membatalkan transaksi terjadwal (SCHEDULED)' })
+  @ApiResponse({ status: 200, description: 'Transaksi terjadwal berhasil dibatalkan' })
+  @ApiResponse({ status: 400, description: 'Data tidak valid' })
+  @ApiResponse({ status: 401, description: 'Sesi tidak valid' })
+  @ApiResponse({ status: 404, description: 'Transaksi tidak ditemukan' })
+  @ApiResponse({ status: 409, description: 'Status konflik (NOT_SCHEDULED, RACE_CONDITION)' })
+  @ApiResponse({ status: 422, description: 'Validasi bisnis gagal (MISSING_CLIENT_TX_ID)' })
+  async cancel(
+    @CurrentUser() user: { userId: string; role?: string },
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body(new CancelTransactionPipe()) dto: CancelTransactionDto,
+    @Headers('idempotency-key') headerIdempotencyKey?: string,
+  ): Promise<{ id: string; status: 'CANCELLED'; cancelled_at: Date }> {
+    return this.transactionsService.cancel(user, id, dto, headerIdempotencyKey);
   }
 }

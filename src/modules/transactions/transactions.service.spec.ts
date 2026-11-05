@@ -2004,4 +2004,199 @@ describe('TransactionsService', () => {
       });
     });
   });
+
+  describe('cancel (TASK-048)', () => {
+    const scheduledExpense = {
+      id: 'tx-scheduled-1111-1111-111111111111',
+      financial_profile_id: mockAccount.financial_profile_id,
+      user_id: user.userId,
+      account_id: mockAccount.id,
+      to_account_id: null,
+      type: 'EXPENSE',
+      amount: 50000n,
+      date: new Date('2026-11-10T00:00:00.000Z'),
+      status: 'SCHEDULED',
+      category_id: mockCategory.id,
+      transfer_group_id: null,
+      transfer_fee: 0n,
+      fee_mode: null,
+      parent_transaction_id: null,
+      reason: null,
+      note: 'Belanja besok',
+      client_tx_id: validUlid,
+      processed_at: null,
+      cancelled_at: null,
+      created_at: new Date('2026-11-01T00:00:00.000Z'),
+      updated_at: new Date('2026-11-01T00:00:00.000Z'),
+    };
+
+    it('AC-1: Transaksi EXPENSE status = SCHEDULED -> cancel -> 200 { id, status: CANCELLED, cancelled_at }, saldo tidak berubah, 1 audit CANCEL', async () => {
+      prisma.$queryRaw.mockResolvedValueOnce([scheduledExpense]);
+      prisma.transaction.update.mockResolvedValueOnce({
+        ...scheduledExpense,
+        status: 'CANCELLED',
+        cancelled_at: new Date(),
+        reason: 'Batal beli',
+      });
+      prisma.transactionAudit.create.mockResolvedValueOnce({ id: 'audit-cancel-1' });
+
+      const res = await service.cancel(
+        user,
+        scheduledExpense.id,
+        { client_tx_id: validUlid, reason: 'Batal beli' },
+      );
+
+      expect(res.id).toBe(scheduledExpense.id);
+      expect(res.status).toBe('CANCELLED');
+      expect(res.cancelled_at).toBeInstanceOf(Date);
+
+      // Verify no account balance changes
+      expect(prisma.account.update).not.toHaveBeenCalled();
+
+      // Verify transaction status updated
+      expect(prisma.transaction.update).toHaveBeenCalledWith({
+        where: { id: scheduledExpense.id, user_id: user.userId },
+        data: {
+          status: 'CANCELLED',
+          cancelled_at: expect.any(Date),
+          reason: 'Batal beli',
+        },
+      });
+
+      // Verify TransactionAudit created
+      expect(prisma.transactionAudit.create).toHaveBeenCalledWith({
+        data: {
+          transaction_id: scheduledExpense.id,
+          action: 'CANCEL',
+          before: { status: 'SCHEDULED' },
+          after: { status: 'CANCELLED', cancelled_at: expect.any(Date) },
+          actor_user_id: user.userId,
+          reason: 'Batal beli',
+        },
+      });
+    });
+
+    it('AC-2: Memanggil cancel pada transaksi POSTED -> 409 NOT_SCHEDULED', async () => {
+      prisma.$queryRaw.mockResolvedValueOnce([
+        { ...scheduledExpense, status: 'POSTED' },
+      ]);
+
+      await expect(
+        service.cancel(user, scheduledExpense.id, { client_tx_id: validUlid }),
+      ).rejects.toMatchObject({
+        response: { code: 'NOT_SCHEDULED' },
+      });
+    });
+
+    it('AC-2: Memanggil cancel pada transaksi REVERSED -> 409 NOT_SCHEDULED', async () => {
+      prisma.$queryRaw.mockResolvedValueOnce([
+        { ...scheduledExpense, status: 'REVERSED' },
+      ]);
+
+      await expect(
+        service.cancel(user, scheduledExpense.id, { client_tx_id: validUlid }),
+      ).rejects.toMatchObject({
+        response: { code: 'NOT_SCHEDULED' },
+      });
+    });
+
+    it('AC-2: Memanggil cancel pada transaksi yang sudah CANCELLED -> 409 NOT_SCHEDULED', async () => {
+      prisma.$queryRaw.mockResolvedValueOnce([
+        { ...scheduledExpense, status: 'CANCELLED' },
+      ]);
+
+      await expect(
+        service.cancel(user, scheduledExpense.id, { client_tx_id: validUlid }),
+      ).rejects.toMatchObject({
+        response: { code: 'NOT_SCHEDULED' },
+      });
+    });
+
+    it('AC-3: Baris sedang dikunci (error 55P03) -> 409 RACE_CONDITION', async () => {
+      const lockError = new Error('could not obtain lock on row in relation "transactions"');
+      (lockError as any).code = '55P03';
+      prisma.$queryRaw.mockRejectedValueOnce(lockError);
+
+      await expect(
+        service.cancel(user, scheduledExpense.id, { client_tx_id: validUlid }),
+      ).rejects.toMatchObject({
+        response: { code: 'RACE_CONDITION' },
+      });
+    });
+
+    it('AC-4 (isolasi): User B membatalkan transaksi milik User A -> 404 TRANSACTION_NOT_FOUND', async () => {
+      prisma.$queryRaw.mockResolvedValueOnce([]);
+
+      await expect(
+        service.cancel(
+          { userId: 'user-b-id' },
+          scheduledExpense.id,
+          { client_tx_id: validUlid },
+        ),
+      ).rejects.toMatchObject({
+        response: { code: 'TRANSACTION_NOT_FOUND' },
+      });
+    });
+
+    it('Batalkan scheduled transfer Metode A -> membatalkan TRANSFER dan EXPENSE fee atomic', async () => {
+      const transferGroupId = 'group-scheduled-1111-1111-111111111111';
+      const mainTransfer = {
+        ...scheduledExpense,
+        id: 'tx-transfer-main',
+        type: 'TRANSFER',
+        transfer_group_id: transferGroupId,
+      };
+      const feeExpense = {
+        ...scheduledExpense,
+        id: 'tx-fee-partner',
+        type: 'EXPENSE',
+        transfer_group_id: transferGroupId,
+        reason: null,
+      };
+
+      prisma.$queryRaw
+        .mockResolvedValueOnce([mainTransfer])
+        .mockResolvedValueOnce([feeExpense]);
+
+      prisma.transaction.update.mockResolvedValue({});
+      prisma.transactionAudit.create.mockResolvedValue({});
+
+      const res = await service.cancel(
+        user,
+        mainTransfer.id,
+        { client_tx_id: validUlid, reason: 'Batal transfer' },
+      );
+
+      expect(res.id).toBe(mainTransfer.id);
+      expect(res.status).toBe('CANCELLED');
+
+      expect(prisma.transaction.update).toHaveBeenCalledWith({
+        where: { id: mainTransfer.id, user_id: user.userId },
+        data: {
+          status: 'CANCELLED',
+          cancelled_at: expect.any(Date),
+          reason: 'Batal transfer',
+        },
+      });
+
+      expect(prisma.transaction.update).toHaveBeenCalledWith({
+        where: { id: feeExpense.id, user_id: user.userId },
+        data: {
+          status: 'CANCELLED',
+          cancelled_at: expect.any(Date),
+          reason: 'Batal transfer',
+        },
+      });
+
+      expect(prisma.transactionAudit.create).toHaveBeenCalledTimes(2);
+    });
+
+    it('Melempar 422 MISSING_CLIENT_TX_ID jika client_tx_id dan header Idempotency-Key tidak disertakan', async () => {
+      await expect(
+        service.cancel(user, scheduledExpense.id, {} as any),
+      ).rejects.toMatchObject({
+        response: { code: 'MISSING_CLIENT_TX_ID' },
+      });
+    });
+  });
 });

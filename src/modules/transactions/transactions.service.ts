@@ -19,6 +19,7 @@ import {
   type CreateAdjustmentDto,
   type UpdateTransactionDto,
   type ReverseTransactionDto,
+  type CancelTransactionDto,
   type SplitItemDto,
 } from './dto/transaction.dto.js';
 
@@ -2005,6 +2006,167 @@ export class TransactionsService {
         });
       }
       throw error;
+    }
+  }
+
+  private isLockNotAvailable(err: any): boolean {
+    if (!err) return false;
+    if (err.code === '55P03') return true;
+    if (err.meta?.code === '55P03') return true;
+    const metaMsg = typeof err.meta?.message === 'string' ? err.meta.message : '';
+    if (metaMsg.includes('55P03') || metaMsg.includes('could not obtain lock')) return true;
+    const msg = typeof err.message === 'string' ? err.message : '';
+    return msg.includes('55P03') || msg.includes('could not obtain lock');
+  }
+
+  async cancel(
+    user: { userId: string; role?: string },
+    transactionId: string,
+    dto: CancelTransactionDto,
+    headerIdempotencyKey?: string,
+  ): Promise<{
+    id: string;
+    status: 'CANCELLED';
+    cancelled_at: Date;
+  }> {
+    resolveClientTxId(dto?.client_tx_id, headerIdempotencyKey);
+
+    const now = new Date();
+
+    try {
+      return await this.prisma.$transaction(async (tx) => {
+        let rows: Array<{
+          id: string;
+          status: string;
+          transfer_group_id: string | null;
+          reason: string | null;
+        }>;
+
+        try {
+          rows = await tx.$queryRaw<
+            Array<{
+              id: string;
+              status: string;
+              transfer_group_id: string | null;
+              reason: string | null;
+            }>
+          >`SELECT id, status, transfer_group_id, reason FROM transactions WHERE id = ${transactionId}::uuid AND user_id = ${user.userId}::uuid FOR UPDATE NOWAIT`;
+        } catch (rawError: any) {
+          if (this.isLockNotAvailable(rawError)) {
+            throw new ConflictException({
+              code: 'RACE_CONDITION',
+              message: 'Transaksi sedang diproses oleh sistem',
+            });
+          }
+          throw rawError;
+        }
+
+        const row = rows[0];
+        if (!row) {
+          throw new NotFoundException({
+            code: 'TRANSACTION_NOT_FOUND',
+            message: 'Transaksi tidak ditemukan',
+          });
+        }
+
+        if (row.status !== 'SCHEDULED') {
+          throw new ConflictException({
+            code: 'NOT_SCHEDULED',
+            message:
+              'Hanya transaksi terjadwal (SCHEDULED) yang dapat dibatalkan',
+          });
+        }
+
+        const mainReason = dto?.reason?.trim() ? dto.reason.trim() : row.reason;
+
+        await tx.transaction.update({
+          where: { id: row.id, user_id: user.userId },
+          data: {
+            status: 'CANCELLED',
+            cancelled_at: now,
+            reason: mainReason,
+          },
+        });
+
+        await tx.transactionAudit.create({
+          data: {
+            transaction_id: row.id,
+            action: 'CANCEL',
+            before: { status: 'SCHEDULED' },
+            after: { status: 'CANCELLED', cancelled_at: now },
+            actor_user_id: user.userId,
+            reason: dto?.reason?.trim() ?? null,
+          },
+        });
+
+        if (row.transfer_group_id) {
+          let partners: Array<{
+            id: string;
+            status: string;
+            reason: string | null;
+          }>;
+
+          try {
+            partners = await tx.$queryRaw<
+              Array<{
+                id: string;
+                status: string;
+                reason: string | null;
+              }>
+            >`SELECT id, status, reason FROM transactions WHERE transfer_group_id = ${row.transfer_group_id}::uuid AND user_id = ${user.userId}::uuid AND id != ${row.id}::uuid FOR UPDATE NOWAIT`;
+          } catch (partnerError: any) {
+            if (this.isLockNotAvailable(partnerError)) {
+              throw new ConflictException({
+                code: 'RACE_CONDITION',
+                message: 'Transaksi sedang diproses oleh sistem',
+              });
+            }
+            throw partnerError;
+          }
+
+          for (const partner of partners) {
+            if (partner.status === 'SCHEDULED') {
+              const partnerReason = dto?.reason?.trim()
+                ? dto.reason.trim()
+                : partner.reason;
+
+              await tx.transaction.update({
+                where: { id: partner.id, user_id: user.userId },
+                data: {
+                  status: 'CANCELLED',
+                  cancelled_at: now,
+                  reason: partnerReason,
+                },
+              });
+
+              await tx.transactionAudit.create({
+                data: {
+                  transaction_id: partner.id,
+                  action: 'CANCEL',
+                  before: { status: 'SCHEDULED' },
+                  after: { status: 'CANCELLED', cancelled_at: now },
+                  actor_user_id: user.userId,
+                  reason: dto?.reason?.trim() ?? null,
+                },
+              });
+            }
+          }
+        }
+
+        return {
+          id: row.id,
+          status: 'CANCELLED',
+          cancelled_at: now,
+        };
+      });
+    } catch (err: any) {
+      if (this.isLockNotAvailable(err)) {
+        throw new ConflictException({
+          code: 'RACE_CONDITION',
+          message: 'Transaksi sedang diproses oleh sistem',
+        });
+      }
+      throw err;
     }
   }
 }

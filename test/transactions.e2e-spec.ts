@@ -2552,4 +2552,353 @@ describe('Transactions E2E Test Suite (Supertest)', () => {
       expect(res.body.code).toBe('TRANSACTION_NOT_FOUND');
     });
   });
+
+  describe('CANCEL SCHEDULED TRANSACTION (TASK-048)', () => {
+    it('AC-1: Transaksi EXPENSE status = SCHEDULED -> POST /transactions/:id/cancel -> 200 { id, status: CANCELLED, cancelled_at }, saldo tidak berubah, 1 audit CANCEL', async () => {
+      const acc = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Akun Cancel AC-1',
+          type: 'BANK',
+          opening_balance: 500000n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 500000n,
+        },
+      });
+
+      const tx = await prisma.asSystem().transaction.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          account_id: acc.id,
+          type: 'EXPENSE',
+          amount: 50000n,
+          date: new Date('2026-11-15T00:00:00.000Z'),
+          status: 'SCHEDULED',
+          category_id: expenseCategoryA.id,
+          client_tx_id: generateTestUlid(),
+        },
+      });
+
+      const cancelUlid = generateTestUlid();
+      const res = await request(app.getHttpServer())
+        .post(`/transactions/${tx.id}/cancel`)
+        .set(userAHeaders)
+        .send({
+          client_tx_id: cancelUlid,
+          reason: 'Batal beli',
+        });
+
+      expect(res.status).toBe(200);
+      expect(res.body.id).toBe(tx.id);
+      expect(res.body.status).toBe('CANCELLED');
+      expect(res.body.cancelled_at).toBeDefined();
+
+      // Saldo akun tidak berubah
+      const accAfter = await prisma.account.findFirst({
+        where: { id: acc.id, user_id: userAId },
+      });
+      expect(accAfter!.balance).toBe(500000n);
+
+      // Transaksi berstatus CANCELLED di DB
+      const txAfter = await prisma.asSystem().transaction.findUnique({
+        where: { id: tx.id },
+      });
+      expect(txAfter!.status).toBe('CANCELLED');
+      expect(txAfter!.cancelled_at).not.toBeNull();
+      expect(txAfter!.reason).toBe('Batal beli');
+
+      // 1 baris TransactionAudit action = CANCEL
+      const audits = await prisma.asSystem().transactionAudit.findMany({
+        where: { transaction_id: tx.id },
+      });
+      expect(audits).toHaveLength(1);
+      expect(audits[0].action).toBe('CANCEL');
+      expect(audits[0].reason).toBe('Batal beli');
+      expect(audits[0].before).toMatchObject({ status: 'SCHEDULED' });
+      expect(audits[0].after).toMatchObject({ status: 'CANCELLED' });
+    });
+
+    it('AC-2: Memanggil POST /transactions/:id/cancel pada transaksi POSTED -> 409 NOT_SCHEDULED', async () => {
+      const acc = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Akun Cancel AC-2',
+          type: 'BANK',
+          opening_balance: 500000n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 450000n,
+        },
+      });
+
+      const tx = await prisma.asSystem().transaction.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          account_id: acc.id,
+          type: 'EXPENSE',
+          amount: 50000n,
+          date: new Date('2026-11-01T00:00:00.000Z'),
+          status: 'POSTED',
+          category_id: expenseCategoryA.id,
+          client_tx_id: generateTestUlid(),
+        },
+      });
+
+      const res = await request(app.getHttpServer())
+        .post(`/transactions/${tx.id}/cancel`)
+        .set(userAHeaders)
+        .send({
+          client_tx_id: generateTestUlid(),
+        });
+
+      expect(res.status).toBe(409);
+      expect(res.body.code).toBe('NOT_SCHEDULED');
+    });
+
+    it('AC-3: Jika baris sedang dikunci (55P03), endpoint mengembalikan 409 RACE_CONDITION tanpa lost update', async () => {
+      const acc = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Akun Cancel AC-3',
+          type: 'BANK',
+          opening_balance: 500000n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 500000n,
+        },
+      });
+
+      const scheduledTx = await prisma.asSystem().transaction.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          account_id: acc.id,
+          type: 'EXPENSE',
+          amount: 50000n,
+          date: new Date('2026-11-20T00:00:00.000Z'),
+          status: 'SCHEDULED',
+          category_id: expenseCategoryA.id,
+          client_tx_id: generateTestUlid(),
+        },
+      });
+
+      let releaseLock: () => void;
+      const lockPromise = new Promise<void>((resolve) => {
+        releaseLock = resolve;
+      });
+
+      // Tahan row lock di PostgreSQL via transaksi DB terpisah
+      const lockHolder = prisma.$transaction(async (tx) => {
+        await tx.$executeRawUnsafe(
+          `SELECT id FROM transactions WHERE id = '${scheduledTx.id}'::uuid FOR UPDATE`,
+        );
+        await lockPromise;
+      });
+
+      // Beri jeda kecil agar kueri lock telah dieksekusi di database
+      await new Promise((r) => setTimeout(r, 100));
+
+      const res = await request(app.getHttpServer())
+        .post(`/transactions/${scheduledTx.id}/cancel`)
+        .set(userAHeaders)
+        .send({
+          client_tx_id: generateTestUlid(),
+        });
+
+      // Lepas lock
+      releaseLock!();
+      await lockHolder;
+
+      expect(res.status).toBe(409);
+      expect(res.body.code).toBe('RACE_CONDITION');
+
+      // Pastikan transaksi tidak mengalami lost update
+      const intactTx = await prisma.asSystem().transaction.findUnique({
+        where: { id: scheduledTx.id },
+      });
+      expect(intactTx!.status).toBe('SCHEDULED');
+      expect(intactTx!.cancelled_at).toBeNull();
+    });
+
+    it('AC-4 (isolasi): User B membatalkan transaksi SCHEDULED milik User A -> 404 TRANSACTION_NOT_FOUND', async () => {
+      const acc = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Akun Cancel AC-4',
+          type: 'BANK',
+          opening_balance: 500000n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 500000n,
+        },
+      });
+
+      const tx = await prisma.asSystem().transaction.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          account_id: acc.id,
+          type: 'EXPENSE',
+          amount: 50000n,
+          date: new Date('2026-11-20T00:00:00.000Z'),
+          status: 'SCHEDULED',
+          category_id: expenseCategoryA.id,
+          client_tx_id: generateTestUlid(),
+        },
+      });
+
+      const res = await request(app.getHttpServer())
+        .post(`/transactions/${tx.id}/cancel`)
+        .set(userBHeaders)
+        .send({
+          client_tx_id: generateTestUlid(),
+        });
+
+      expect(res.status).toBe(404);
+      expect(res.body.code).toBe('TRANSACTION_NOT_FOUND');
+    });
+
+    it('Batalkan scheduled transfer Metode A -> membatalkan TRANSFER dan EXPENSE fee atomic', async () => {
+      const fromAcc = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Akun Cancel Transfer Dari',
+          type: 'BANK',
+          opening_balance: 1000000n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 1000000n,
+        },
+      });
+      const toAcc = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Akun Cancel Transfer Ke',
+          type: 'EWALLET',
+          opening_balance: 0n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 0n,
+        },
+      });
+
+      const transferGroupId = '00000000-0000-4000-8000-000000000048';
+      const transferTx = await prisma.asSystem().transaction.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          account_id: fromAcc.id,
+          to_account_id: toAcc.id,
+          type: 'TRANSFER',
+          amount: 100000n,
+          date: new Date('2026-11-25T00:00:00.000Z'),
+          status: 'SCHEDULED',
+          transfer_group_id: transferGroupId,
+          transfer_fee: 6500n,
+          fee_mode: 'SEPARATE',
+          client_tx_id: generateTestUlid(),
+        },
+      });
+
+      const feeTx = await prisma.asSystem().transaction.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          account_id: fromAcc.id,
+          type: 'EXPENSE',
+          amount: 6500n,
+          date: new Date('2026-11-25T00:00:00.000Z'),
+          status: 'SCHEDULED',
+          category_id: expenseCategoryA.id,
+          transfer_group_id: transferGroupId,
+          client_tx_id: generateTestUlid(),
+        },
+      });
+
+      const res = await request(app.getHttpServer())
+        .post(`/transactions/${transferTx.id}/cancel`)
+        .set(userAHeaders)
+        .send({
+          client_tx_id: generateTestUlid(),
+          reason: 'Batal kirim uang',
+        });
+
+      expect(res.status).toBe(200);
+      expect(res.body.id).toBe(transferTx.id);
+      expect(res.body.status).toBe('CANCELLED');
+
+      const updatedTransfer = await prisma.asSystem().transaction.findUnique({
+        where: { id: transferTx.id },
+      });
+      const updatedFee = await prisma.asSystem().transaction.findUnique({
+        where: { id: feeTx.id },
+      });
+      expect(updatedTransfer!.status).toBe('CANCELLED');
+      expect(updatedFee!.status).toBe('CANCELLED');
+      expect(updatedTransfer!.reason).toBe('Batal kirim uang');
+      expect(updatedFee!.reason).toBe('Batal kirim uang');
+
+      // Saldo kedua akun tetap tidak berubah
+      const checkFrom = await prisma.account.findFirst({
+        where: { id: fromAcc.id, user_id: userAId },
+      });
+      const checkTo = await prisma.account.findFirst({
+        where: { id: toAcc.id, user_id: userAId },
+      });
+      expect(checkFrom!.balance).toBe(1000000n);
+      expect(checkTo!.balance).toBe(0n);
+    });
+
+    it('Tolak 422 MISSING_CLIENT_TX_ID tanpa client_tx_id & tanpa header Idempotency-Key; terima 200 dengan Idempotency-Key header', async () => {
+      const acc = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Akun Cancel Idemp',
+          type: 'BANK',
+          opening_balance: 500000n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 500000n,
+        },
+      });
+
+      const tx = await prisma.asSystem().transaction.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          account_id: acc.id,
+          type: 'EXPENSE',
+          amount: 25000n,
+          date: new Date('2026-11-20T00:00:00.000Z'),
+          status: 'SCHEDULED',
+          category_id: expenseCategoryA.id,
+          client_tx_id: generateTestUlid(),
+        },
+      });
+
+      // 1. Tanpa client_tx_id dan tanpa header
+      const resMissing = await request(app.getHttpServer())
+        .post(`/transactions/${tx.id}/cancel`)
+        .set(userAHeaders)
+        .send({});
+
+      expect(resMissing.status).toBe(422);
+      expect(resMissing.body.code).toBe('MISSING_CLIENT_TX_ID');
+
+      // 2. Dengan header Idempotency-Key (tanpa body)
+      const resHeader = await request(app.getHttpServer())
+        .post(`/transactions/${tx.id}/cancel`)
+        .set({
+          ...userAHeaders,
+          'Idempotency-Key': generateTestUlid(),
+        })
+        .send({});
+
+      expect(resHeader.status).toBe(200);
+      expect(resHeader.body.status).toBe('CANCELLED');
+    });
+  });
 });
