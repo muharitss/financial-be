@@ -1857,4 +1857,355 @@ describe('Transactions E2E Test Suite (Supertest)', () => {
       expect(checkAcc!.balance).toBe(170000n);
     });
   });
+
+  describe('EDIT TRANSACTION WITH AUDIT (TASK-046)', () => {
+    it('AC-1: Transaksi POSTED EXPENSE 100000 (saldo akun 900000) -> PATCH amount 80000 -> 200, saldo 920000, audit tersimpan', async () => {
+      const acc = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Akun Edit AC-1',
+          type: 'BANK',
+          opening_balance: 1000000n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 900000n,
+        },
+      });
+
+      const tx = await prisma.asSystem().transaction.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          account_id: acc.id,
+          type: 'EXPENSE',
+          amount: 100000n,
+          date: new Date('2026-11-01T00:00:00.000Z'),
+          status: 'POSTED',
+          category_id: expenseCategoryA.id,
+          client_tx_id: generateTestUlid(),
+        },
+      });
+
+      const clientTxId = generateTestUlid();
+      const res = await request(app.getHttpServer())
+        .patch(`/transactions/${tx.id}`)
+        .set(userAHeaders)
+        .send({
+          amount: 80000,
+          client_tx_id: clientTxId,
+        });
+
+      expect(res.status).toBe(200);
+      expect(res.body.transaction.amount).toBe(80000);
+      expect(res.body.audit_id).toBeDefined();
+
+      const updatedAcc = await prisma.account.findFirst({
+        where: { id: acc.id, user_id: userAId },
+      });
+      expect(updatedAcc!.balance).toBe(920000n);
+
+      const audit = await prisma.asSystem().transactionAudit.findUnique({
+        where: { id: res.body.audit_id },
+      });
+      expect(audit).not.toBeNull();
+      expect(audit!.action).toBe('UPDATE');
+      expect((audit!.before as any).amount).toBe(100000);
+      expect((audit!.after as any).amount).toBe(80000);
+    });
+
+    it('AC-2: PATCH transaksi POSTED dengan account_id berbeda -> 422 ACCOUNT_CHANGE_NOT_ALLOWED', async () => {
+      const acc1 = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Akun Edit AC-2-1',
+          type: 'BANK',
+          opening_balance: 500000n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 500000n,
+        },
+      });
+      const acc2 = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Akun Edit AC-2-2',
+          type: 'BANK',
+          opening_balance: 500000n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 500000n,
+        },
+      });
+
+      const tx = await prisma.asSystem().transaction.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          account_id: acc1.id,
+          type: 'EXPENSE',
+          amount: 50000n,
+          date: new Date('2026-11-01T00:00:00.000Z'),
+          status: 'POSTED',
+          category_id: expenseCategoryA.id,
+          client_tx_id: generateTestUlid(),
+        },
+      });
+
+      const res = await request(app.getHttpServer())
+        .patch(`/transactions/${tx.id}`)
+        .set(userAHeaders)
+        .send({
+          account_id: acc2.id,
+          client_tx_id: generateTestUlid(),
+        });
+
+      expect(res.status).toBe(422);
+      expect(res.body.code).toBe('ACCOUNT_CHANGE_NOT_ALLOWED');
+    });
+
+    it('AC-3: PATCH transaksi berstatus REVERSED -> 409 ALREADY_REVERSED', async () => {
+      const acc = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Akun Edit AC-3',
+          type: 'BANK',
+          opening_balance: 500000n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 500000n,
+        },
+      });
+
+      const tx = await prisma.asSystem().transaction.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          account_id: acc.id,
+          type: 'EXPENSE',
+          amount: 50000n,
+          date: new Date('2026-11-01T00:00:00.000Z'),
+          status: 'REVERSED',
+          category_id: expenseCategoryA.id,
+          client_tx_id: generateTestUlid(),
+        },
+      });
+
+      const res = await request(app.getHttpServer())
+        .patch(`/transactions/${tx.id}`)
+        .set(userAHeaders)
+        .send({
+          note: 'ubah note',
+          client_tx_id: generateTestUlid(),
+        });
+
+      expect(res.status).toBe(409);
+      expect(res.body.code).toBe('ALREADY_REVERSED');
+    });
+
+    it('AC-4: Menaikkan amount EXPENSE melebihi available pada akun allow_negative = false -> 409 INSUFFICIENT_BALANCE', async () => {
+      const acc = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Akun Edit AC-4',
+          type: 'BANK',
+          opening_balance: 100000n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 50000n,
+          allow_negative: false,
+        },
+      });
+
+      const tx = await prisma.asSystem().transaction.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          account_id: acc.id,
+          type: 'EXPENSE',
+          amount: 50000n,
+          date: new Date('2026-11-01T00:00:00.000Z'),
+          status: 'POSTED',
+          category_id: expenseCategoryA.id,
+          client_tx_id: generateTestUlid(),
+        },
+      });
+
+      const res = await request(app.getHttpServer())
+        .patch(`/transactions/${tx.id}`)
+        .set(userAHeaders)
+        .send({
+          amount: 150000, // butuh tambahan 100000, tapi balance hanya 50000
+          client_tx_id: generateTestUlid(),
+        });
+
+      expect(res.status).toBe(409);
+      expect(res.body.code).toBe('INSUFFICIENT_BALANCE');
+
+      const checkAcc = await prisma.account.findFirst({
+        where: { id: acc.id, user_id: userAId },
+      });
+      expect(checkAcc!.balance).toBe(50000n);
+    });
+
+    it('AC-5: Edit note pada transaksi yang kategorinya telah diarsipkan tetap 200; mengganti category_id ke kategori arsip lain -> 422 CATEGORY_ARCHIVED', async () => {
+      const catArchived1 = await prisma.category.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Kategori Arsip 1',
+          type: 'EXPENSE',
+          archived: true,
+          archived_at: new Date(),
+        },
+      });
+
+      const catArchived2 = await prisma.category.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Kategori Arsip 2',
+          type: 'EXPENSE',
+          archived: true,
+          archived_at: new Date(),
+        },
+      });
+
+      const acc = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Akun Edit AC-5',
+          type: 'BANK',
+          opening_balance: 500000n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 500000n,
+        },
+      });
+
+      const tx = await prisma.asSystem().transaction.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          account_id: acc.id,
+          type: 'EXPENSE',
+          amount: 30000n,
+          date: new Date('2026-11-01T00:00:00.000Z'),
+          status: 'POSTED',
+          category_id: catArchived1.id,
+          client_tx_id: generateTestUlid(),
+        },
+      });
+
+      // 1. Edit note saja pada transaksi dengan kategori arsip -> 200
+      const res1 = await request(app.getHttpServer())
+        .patch(`/transactions/${tx.id}`)
+        .set(userAHeaders)
+        .send({
+          note: 'catatan update arsip',
+          client_tx_id: generateTestUlid(),
+        });
+
+      expect(res1.status).toBe(200);
+      expect(res1.body.transaction.note).toBe('catatan update arsip');
+
+      // 2. Ganti ke kategori arsip lain -> 422 CATEGORY_ARCHIVED
+      const res2 = await request(app.getHttpServer())
+        .patch(`/transactions/${tx.id}`)
+        .set(userAHeaders)
+        .send({
+          category_id: catArchived2.id,
+          client_tx_id: generateTestUlid(),
+        });
+
+      expect(res2.status).toBe(422);
+      expect(res2.body.code).toBe('CATEGORY_ARCHIVED');
+    });
+
+    it('AC-6 (isolasi): User B PATCH transaksi milik User A -> 404 TRANSACTION_NOT_FOUND', async () => {
+      const acc = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Akun Isolasi AC-6',
+          type: 'BANK',
+          opening_balance: 500000n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 500000n,
+        },
+      });
+
+      const tx = await prisma.asSystem().transaction.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          account_id: acc.id,
+          type: 'EXPENSE',
+          amount: 25000n,
+          date: new Date('2026-11-01T00:00:00.000Z'),
+          status: 'POSTED',
+          category_id: expenseCategoryA.id,
+          client_tx_id: generateTestUlid(),
+        },
+      });
+
+      // User B mencoba PATCH
+      const res = await request(app.getHttpServer())
+        .patch(`/transactions/${tx.id}`)
+        .set(userBHeaders)
+        .send({
+          note: 'hacked by User B',
+          client_tx_id: generateTestUlid(),
+        });
+
+      expect(res.status).toBe(404);
+      expect(res.body.code).toBe('TRANSACTION_NOT_FOUND');
+    });
+
+    it('Tolak 400 VALIDATION_ERROR jika tidak ada field perubahan, tolak 422 MISSING_CLIENT_TX_ID tanpa client_tx_id', async () => {
+      const acc = await prisma.account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Akun Val AC',
+          type: 'BANK',
+          opening_balance: 500000n,
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
+          balance: 500000n,
+        },
+      });
+
+      const tx = await prisma.asSystem().transaction.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          account_id: acc.id,
+          type: 'EXPENSE',
+          amount: 20000n,
+          date: new Date('2026-11-01T00:00:00.000Z'),
+          status: 'POSTED',
+          category_id: expenseCategoryA.id,
+          client_tx_id: generateTestUlid(),
+        },
+      });
+
+      // Tanpa field mutasi
+      const res1 = await request(app.getHttpServer())
+        .patch(`/transactions/${tx.id}`)
+        .set(userAHeaders)
+        .send({
+          client_tx_id: generateTestUlid(),
+        });
+      expect(res1.status).toBe(400);
+
+      // Tanpa client_tx_id
+      const res2 = await request(app.getHttpServer())
+        .patch(`/transactions/${tx.id}`)
+        .set(userAHeaders)
+        .send({
+          note: 'note baru',
+        });
+      expect(res2.status).toBe(422);
+      expect(res2.body.code).toBe('MISSING_CLIENT_TX_ID');
+    });
+  });
 });

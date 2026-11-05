@@ -52,19 +52,28 @@ describe('TransactionsService', () => {
         findMany: jest.fn<any>(),
       },
       account: {
+        findFirst: jest.fn<any>(),
         update: jest.fn<any>(),
       },
       transaction: {
         create: jest.fn<any>(),
+        update: jest.fn<any>(),
       },
       transactionSplit: {
+        findMany: jest.fn<any>().mockResolvedValue([]),
+        deleteMany: jest.fn<any>(),
         createMany: jest.fn<any>(),
       },
       transactionTag: {
+        findMany: jest.fn<any>().mockResolvedValue([]),
+        deleteMany: jest.fn<any>(),
         createMany: jest.fn<any>(),
       },
       transactionAudit: {
         create: jest.fn<any>(),
+      },
+      budgetPeriod: {
+        findFirst: jest.fn<any>(),
       },
       savingsAllocation: {
         groupBy: jest.fn<any>().mockResolvedValue([]),
@@ -1569,6 +1578,191 @@ describe('TransactionsService', () => {
       await expect(service.create(user, dto)).rejects.toMatchObject({
         response: { code: 'CATEGORY_ARCHIVED' },
       });
+    });
+  });
+
+  describe('update (TASK-046)', () => {
+    const existingTx = {
+      id: 'tx-11111111-1111-1111-1111-111111111111',
+      financial_profile_id: mockAccount.financial_profile_id,
+      user_id: user.userId,
+      account_id: mockAccount.id,
+      to_account_id: null,
+      type: 'EXPENSE',
+      amount: 100000n,
+      date: new Date('2026-11-01T00:00:00.000Z'),
+      status: 'POSTED',
+      category_id: mockCategory.id,
+      transfer_group_id: null,
+      transfer_fee: 0n,
+      fee_mode: null,
+      parent_transaction_id: null,
+      reason: null,
+      note: 'Catatan lama',
+      client_tx_id: validUlid,
+      processed_at: null,
+      cancelled_at: null,
+      created_at: new Date('2026-11-01T00:00:00.000Z'),
+      updated_at: new Date('2026-11-01T00:00:00.000Z'),
+    };
+
+    it('AC-1: Transaksi POSTED EXPENSE 100000 (saldo akun 900000) -> edit amount 80000 -> saldo 920000, audit tersimpan', async () => {
+      const accountBefore = { ...mockAccount, balance: 900000n };
+      prisma.$queryRaw
+        .mockResolvedValueOnce([existingTx])
+        .mockResolvedValueOnce([accountBefore]);
+
+      prisma.transactionSplit.findMany.mockResolvedValue([]);
+      prisma.transactionTag.findMany.mockResolvedValue([]);
+      prisma.budgetPeriod.findFirst.mockResolvedValue(null);
+
+      prisma.transaction.update.mockImplementation((args: any) => ({
+        ...existingTx,
+        ...args.data,
+      }));
+      prisma.transactionAudit.create.mockResolvedValue({ id: 'audit-123' });
+
+      const res = await service.update(user, existingTx.id, {
+        amount: 80000,
+        client_tx_id: '01ARZ3NDEKTSV4RRFFQ69G5FA9',
+      });
+
+      expect(res.transaction.amount).toBe(80000);
+      expect(res.audit_id).toBe('audit-123');
+      expect(prisma.account.update).toHaveBeenCalledWith({
+        where: { id: mockAccount.id, user_id: user.userId },
+        data: { balance: 920000n },
+      });
+      expect(prisma.transactionAudit.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            action: 'UPDATE',
+            before: expect.objectContaining({ amount: 100000 }),
+            after: expect.objectContaining({ amount: 80000 }),
+          }),
+        }),
+      );
+    });
+
+    it('AC-2: PATCH transaksi POSTED dengan account_id berbeda -> 422 ACCOUNT_CHANGE_NOT_ALLOWED', async () => {
+      prisma.$queryRaw.mockResolvedValueOnce([existingTx]);
+
+      await expect(
+        service.update(user, existingTx.id, {
+          account_id: '99999999-9999-9999-9999-999999999999',
+          client_tx_id: validUlid,
+        }),
+      ).rejects.toMatchObject({
+        response: { code: 'ACCOUNT_CHANGE_NOT_ALLOWED' },
+      });
+    });
+
+    it('AC-3: PATCH transaksi berstatus REVERSED -> 409 ALREADY_REVERSED', async () => {
+      prisma.$queryRaw.mockResolvedValueOnce([{ ...existingTx, status: 'REVERSED' }]);
+
+      await expect(
+        service.update(user, existingTx.id, {
+          note: 'ubah catatan',
+          client_tx_id: validUlid,
+        }),
+      ).rejects.toMatchObject({
+        response: { code: 'ALREADY_REVERSED' },
+      });
+    });
+
+    it('AC-4: Menaikkan amount EXPENSE melebihi available pada allow_negative=false -> 409 INSUFFICIENT_BALANCE', async () => {
+      const accountBefore = { ...mockAccount, balance: 50000n, allow_negative: false };
+      prisma.$queryRaw
+        .mockResolvedValueOnce([existingTx])
+        .mockResolvedValueOnce([accountBefore]);
+      prisma.savingsAllocation.groupBy.mockResolvedValue([]);
+
+      await expect(
+        service.update(user, existingTx.id, {
+          amount: 200000,
+          client_tx_id: validUlid,
+        }),
+      ).rejects.toMatchObject({
+        response: { code: 'INSUFFICIENT_BALANCE' },
+      });
+    });
+
+    it('AC-5: Edit note pada transaksi yang kategorinya telah diarsipkan tetap 200; ganti ke kategori arsip lain -> 422 CATEGORY_ARCHIVED', async () => {
+      // 1. Edit note tanpa ganti kategori
+      prisma.$queryRaw.mockResolvedValueOnce([existingTx]);
+      prisma.transactionSplit.findMany.mockResolvedValue([]);
+      prisma.transactionTag.findMany.mockResolvedValue([]);
+      prisma.transaction.update.mockImplementation((args: any) => ({
+        ...existingTx,
+        ...args.data,
+      }));
+      prisma.transactionAudit.create.mockResolvedValue({ id: 'audit-note' });
+
+      const res = await service.update(user, existingTx.id, {
+        note: 'note baru',
+        client_tx_id: validUlid,
+      });
+      expect(res.transaction.note).toBe('note baru');
+
+      // 2. Ganti category_id ke kategori yang diarsipkan
+      const archivedCatId = '88888888-8888-8888-8888-888888888888';
+      prisma.$queryRaw.mockResolvedValueOnce([existingTx]);
+      prisma.transactionSplit.findMany.mockResolvedValue([]);
+      prisma.transactionTag.findMany.mockResolvedValue([]);
+      prisma.category.findFirst.mockResolvedValue({
+        id: archivedCatId,
+        user_id: user.userId,
+        archived: true,
+        type: 'EXPENSE',
+      });
+
+      await expect(
+        service.update(user, existingTx.id, {
+          category_id: archivedCatId,
+          client_tx_id: validUlid,
+        }),
+      ).rejects.toMatchObject({
+        response: { code: 'CATEGORY_ARCHIVED' },
+      });
+    });
+
+    it('AC-6 (isolasi): User B PATCH transaksi milik User A -> 404 TRANSACTION_NOT_FOUND', async () => {
+      prisma.$queryRaw.mockResolvedValueOnce([]);
+
+      await expect(
+        service.update({ userId: 'user-b-id' }, existingTx.id, {
+          note: 'hacked',
+          client_tx_id: validUlid,
+        }),
+      ).rejects.toMatchObject({
+        response: { code: 'TRANSACTION_NOT_FOUND' },
+      });
+    });
+
+    it('Peringatan periode budget terkunci jika EXPENSE diubah menyentuh locked period', async () => {
+      const accountBefore = { ...mockAccount, balance: 900000n };
+      prisma.$queryRaw
+        .mockResolvedValueOnce([existingTx])
+        .mockResolvedValueOnce([accountBefore]);
+      prisma.transactionSplit.findMany.mockResolvedValue([]);
+      prisma.transactionTag.findMany.mockResolvedValue([]);
+      prisma.budgetPeriod.findFirst.mockResolvedValue({
+        id: 'bp-locked',
+        locked_at: new Date(),
+      });
+      prisma.transaction.update.mockImplementation((args: any) => ({
+        ...existingTx,
+        ...args.data,
+      }));
+      prisma.transactionAudit.create.mockResolvedValue({ id: 'audit-locked' });
+
+      const res = await service.update(user, existingTx.id, {
+        amount: 80000,
+        client_tx_id: '01ARZ3NDEKTSV4RRFFQ69G5FA8',
+      });
+
+      expect(res.warning).toBe('LOCKED_BUDGET_PERIOD_AFFECTED');
+      expect(res.transaction.warning).toBe('LOCKED_BUDGET_PERIOD_AFFECTED');
     });
   });
 });

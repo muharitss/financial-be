@@ -1,11 +1,14 @@
 import {
   Controller,
   Post,
+  Patch,
+  Param,
   Body,
   Headers,
   UseGuards,
   HttpStatus,
   HttpCode,
+  ParseUUIDPipe,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse, ApiCookieAuth } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
@@ -14,6 +17,8 @@ import { CurrentUser } from '../../common/decorators/current-user.decorator.js';
 import {
   CreateTransactionPipe,
   type CreateTransactionDto,
+  UpdateTransactionPipe,
+  type UpdateTransactionDto,
 } from './dto/transaction.dto.js';
 import {
   TransactionsService,
@@ -43,5 +48,24 @@ export class TransactionsController {
     @Headers('idempotency-key') headerIdempotencyKey?: string,
   ): Promise<TransactionResponse> {
     return this.transactionsService.create(user, dto, headerIdempotencyKey);
+  }
+
+  @Patch(':id')
+  @HttpCode(HttpStatus.OK)
+  @Throttle({ transaction: { limit: 60, ttl: 60000 } })
+  @ApiOperation({ summary: 'Mengubah transaksi dengan audit log' })
+  @ApiResponse({ status: 200, description: 'Transaksi berhasil diubah' })
+  @ApiResponse({ status: 400, description: 'Data tidak valid atau kategori salah tipe' })
+  @ApiResponse({ status: 401, description: 'Sesi tidak valid' })
+  @ApiResponse({ status: 404, description: 'Transaksi tidak ditemukan' })
+  @ApiResponse({ status: 409, description: 'Status konflik (ALREADY_REVERSED, CANCELLED, INSUFFICIENT_BALANCE)' })
+  @ApiResponse({ status: 422, description: 'Validasi bisnis gagal (ACCOUNT_CHANGE_NOT_ALLOWED, CATEGORY_ARCHIVED, dll)' })
+  async update(
+    @CurrentUser() user: { userId: string; role?: string },
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body(new UpdateTransactionPipe()) dto: UpdateTransactionDto,
+    @Headers('idempotency-key') headerIdempotencyKey?: string,
+  ): Promise<{ transaction: TransactionResponse; audit_id: string; warning?: string }> {
+    return this.transactionsService.update(user, id, dto, headerIdempotencyKey);
   }
 }

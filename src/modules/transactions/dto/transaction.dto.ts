@@ -150,6 +150,63 @@ export const createAdjustmentSchema = z
 
 export type CreateAdjustmentDto = z.infer<typeof createAdjustmentSchema>;
 
+export const updateTransactionSchema = z
+  .object({
+    amount: z.number().int().optional(),
+    date: z.iso.date().optional(),
+    category_id: z.uuid().nullable().optional(),
+    note: z.string().trim().max(500).nullable().optional(),
+    reason: z.string().trim().max(500).optional(),
+    splits: z.array(splitItemSchema).min(2).max(20).nullable().optional(),
+    tags: z.array(z.uuid()).max(10).optional(),
+    account_id: z.uuid().optional(),
+    client_tx_id: z.string().regex(ULID_REGEX).optional(),
+  })
+  .strict()
+  .superRefine((data, ctx) => {
+    const mutableFields = [
+      data.amount,
+      data.date,
+      data.category_id,
+      data.note,
+      data.splits,
+      data.tags,
+      data.account_id,
+    ];
+    if (mutableFields.every((f) => f === undefined)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'Minimal satu field perubahan harus dikirim',
+      });
+    }
+  });
+
+export type UpdateTransactionDto = z.infer<typeof updateTransactionSchema>;
+
+@Injectable()
+export class UpdateTransactionPipe implements PipeTransform {
+  transform(value: unknown) {
+    if (typeof value === 'object' && value !== null) {
+      const valObj = value as Record<string, any>;
+      if (Array.isArray(valObj.tags) && valObj.tags.length > 10) {
+        throw new UnprocessableEntityException({
+          code: 'TOO_MANY_TAGS',
+          message: 'Maksimal 10 tag per transaksi',
+        });
+      }
+    }
+    const parsed = updateTransactionSchema.safeParse(value);
+    if (!parsed.success) {
+      throw new BadRequestException({
+        code: 'VALIDATION_ERROR',
+        message: 'Data tidak valid',
+        details: parsed.error.flatten().fieldErrors,
+      });
+    }
+    return parsed.data;
+  }
+}
+
 export const createTransactionSchema = z.discriminatedUnion('type', [
   createIncomeSchema,
   createExpenseSchema,

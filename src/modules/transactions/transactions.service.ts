@@ -17,6 +17,7 @@ import {
   type CreateExpenseDto,
   type CreateTransferDto,
   type CreateAdjustmentDto,
+  type UpdateTransactionDto,
   type SplitItemDto,
 } from './dto/transaction.dto.js';
 
@@ -1085,6 +1086,481 @@ export class TransactionsService {
         code: 'INVALID_CATEGORY_TYPE',
         message: `Kategori harus bertipe ${txType}`,
       });
+    }
+  }
+
+  async update(
+    user: { userId: string; role?: string },
+    transactionId: string,
+    dto: UpdateTransactionDto,
+    headerIdempotencyKey?: string,
+  ): Promise<{
+    transaction: TransactionResponse;
+    audit_id: string;
+    warning?: string;
+  }> {
+    const clientTxId = resolveClientTxId(dto.client_tx_id, headerIdempotencyKey);
+
+    try {
+      return await this.prisma.$transaction(async (tx) => {
+        // 1. Kunci baris transaksi dengan SELECT ... FOR UPDATE (isolasi user_id)
+        const existingTxs = await tx.$queryRaw<
+          Array<{
+            id: string;
+            financial_profile_id: string;
+            user_id: string;
+            account_id: string;
+            to_account_id: string | null;
+            type: string;
+            amount: bigint;
+            date: Date;
+            status: string;
+            category_id: string | null;
+            transfer_group_id: string | null;
+            transfer_fee: bigint;
+            fee_mode: string | null;
+            parent_transaction_id: string | null;
+            reason: string | null;
+            note: string | null;
+            client_tx_id: string;
+            processed_at: Date | null;
+            cancelled_at: Date | null;
+            created_at: Date;
+            updated_at: Date;
+          }>
+        >`SELECT id, financial_profile_id, user_id, account_id, to_account_id, type, amount, date, status, category_id, transfer_group_id, transfer_fee, fee_mode, parent_transaction_id, reason, note, client_tx_id, processed_at, cancelled_at, created_at, updated_at FROM transactions WHERE id = ${transactionId}::uuid AND user_id = ${user.userId}::uuid FOR UPDATE`;
+
+        const existing = existingTxs[0];
+        if (!existing) {
+          throw new NotFoundException({
+            code: 'TRANSACTION_NOT_FOUND',
+            message: 'Transaksi tidak ditemukan',
+          });
+        }
+
+        // 2. Restriksi status
+        if (existing.status === 'REVERSED' || existing.type === 'REVERSAL') {
+          throw new ConflictException({
+            code: 'ALREADY_REVERSED',
+            message: 'Transaksi yang sudah di-reverse tidak dapat diedit',
+          });
+        }
+        if (existing.status === 'CANCELLED') {
+          throw new ConflictException({
+            code: 'TRANSACTION_CANCELLED',
+            message: 'Transaksi yang dibatalkan tidak dapat diedit',
+          });
+        }
+
+        // 3. Larangan mengubah akun pada POSTED
+        if (existing.status === 'POSTED') {
+          if (dto.account_id !== undefined && dto.account_id !== existing.account_id) {
+            throw new UnprocessableEntityException({
+              code: 'ACCOUNT_CHANGE_NOT_ALLOWED',
+              message:
+                'Akun pada transaksi POSTED tidak dapat diubah; gunakan reversal dan buat transaksi baru',
+            });
+          }
+        } else if (
+          existing.status === 'SCHEDULED' &&
+          dto.account_id !== undefined &&
+          dto.account_id !== existing.account_id
+        ) {
+          const targetAccount = await tx.account.findFirst({
+            where: { id: dto.account_id, user_id: user.userId },
+          });
+          if (!targetAccount) {
+            throw new NotFoundException({
+              code: 'ACCOUNT_NOT_FOUND',
+              message: 'Akun tidak ditemukan',
+            });
+          }
+          if (targetAccount.archived) {
+            throw new ConflictException({
+              code: 'ACCOUNT_ARCHIVED',
+              message: 'Akun telah diarsipkan',
+            });
+          }
+        }
+
+        // 4. Validasi nominal
+        if (dto.amount !== undefined) {
+          if (existing.type === 'ADJUSTMENT') {
+            if (dto.amount === 0) {
+              throw new UnprocessableEntityException({
+                code: 'VALIDATION_ERROR',
+                message: 'Nominal penyesuaian tidak boleh 0',
+              });
+            }
+          } else {
+            if (dto.amount <= 0) {
+              throw new UnprocessableEntityException({
+                code: 'VALIDATION_ERROR',
+                message: 'Nominal harus lebih besar dari 0',
+              });
+            }
+          }
+        }
+
+        // 5. Snapshot before
+        const existingSplits = await tx.transactionSplit.findMany({
+          where: { transaction_id: existing.id },
+        });
+        const existingTags = await tx.transactionTag.findMany({
+          where: { transaction_id: existing.id },
+        });
+        const beforeResponse = toTransactionResponse({
+          ...existing,
+          splits: existingSplits,
+          tags: existingTags.map((t) => t.tag_id),
+        });
+
+        // 6. Validasi & penanganan splits / category
+        const newAmount = dto.amount !== undefined ? dto.amount : Number(existing.amount);
+
+        if (dto.splits !== undefined) {
+          if (dto.splits && dto.splits.length > 0) {
+            await this.validateAndCreateSplits(
+              tx,
+              user.userId,
+              existing.type as 'INCOME' | 'EXPENSE',
+              newAmount,
+              dto.splits,
+            );
+            await tx.transactionSplit.deleteMany({
+              where: { transaction_id: existing.id },
+            });
+            await tx.transactionSplit.createMany({
+              data: dto.splits.map((s) => ({
+                id: randomUUID(),
+                transaction_id: existing.id,
+                category_id: s.category_id,
+                amount: BigInt(s.amount),
+              })),
+            });
+          } else if (dto.splits === null) {
+            if (!dto.category_id && !existing.category_id) {
+              throw new BadRequestException({
+                code: 'VALIDATION_ERROR',
+                message: 'category_id wajib disertakan jika splits dihapus',
+              });
+            }
+            await tx.transactionSplit.deleteMany({
+              where: { transaction_id: existing.id },
+            });
+          }
+        } else {
+          if (
+            existingSplits.length > 0 &&
+            dto.amount !== undefined &&
+            BigInt(dto.amount) !== existing.amount
+          ) {
+            throw new UnprocessableEntityException({
+              code: 'SPLIT_SUM_MISMATCH',
+              message:
+                'Transaksi memiliki split, splits harus dikirim ulang saat mengubah amount',
+            });
+          }
+          if (dto.category_id !== undefined) {
+            if (dto.category_id !== null && dto.category_id !== existing.category_id) {
+              const category = await tx.category.findFirst({
+                where: { id: dto.category_id, user_id: user.userId },
+              });
+              if (!category) {
+                throw new NotFoundException({
+                  code: 'CATEGORY_NOT_FOUND',
+                  message: 'Kategori tidak ditemukan',
+                });
+              }
+              if (category.archived) {
+                throw new UnprocessableEntityException({
+                  code: 'CATEGORY_ARCHIVED',
+                  message: 'Kategori telah diarsipkan',
+                });
+              }
+              if (category.type !== existing.type) {
+                throw new BadRequestException({
+                  code: 'INVALID_CATEGORY_TYPE',
+                  message: `Kategori harus bertipe ${existing.type}`,
+                });
+              }
+            }
+          }
+        }
+
+        // 7. Penanganan tags
+        let tagIds: string[] | undefined;
+        if (dto.tags !== undefined) {
+          tagIds = Array.from(new Set(dto.tags));
+          if (tagIds.length > 0) {
+            const tags = await tx.tag.findMany({
+              where: { id: { in: tagIds }, user_id: user.userId },
+            });
+            if (tags.length !== tagIds.length) {
+              throw new NotFoundException({
+                code: 'TAG_NOT_FOUND',
+                message: 'Tag tidak ditemukan',
+              });
+            }
+            if (tags.some((t) => t.archived)) {
+              throw new UnprocessableEntityException({
+                code: 'TAG_ARCHIVED',
+                message: 'Tag telah diarsipkan',
+              });
+            }
+          }
+          await tx.transactionTag.deleteMany({
+            where: { transaction_id: existing.id },
+          });
+          if (tagIds.length > 0) {
+            await tx.transactionTag.createMany({
+              data: tagIds.map((tag_id) => ({
+                transaction_id: existing.id,
+                tag_id,
+              })),
+            });
+          }
+        }
+
+        // 8. Rekalkulasi selisih saldo secara atomik jika POSTED
+        let finalAccountBalance: bigint | undefined;
+        if (
+          existing.status === 'POSTED' &&
+          dto.amount !== undefined &&
+          BigInt(dto.amount) !== existing.amount
+        ) {
+          const newAmountBigInt = BigInt(dto.amount);
+          const oldAmountBigInt = existing.amount;
+
+          if (existing.type === 'TRANSFER') {
+            const accounts = await tx.$queryRaw<
+              Array<{
+                id: string;
+                financial_profile_id: string;
+                balance: bigint;
+                allow_negative: boolean;
+                archived: boolean;
+              }>
+            >`SELECT id, financial_profile_id, balance, allow_negative, archived FROM accounts WHERE id IN (${existing.account_id}::uuid, ${existing.to_account_id}::uuid) AND user_id = ${user.userId}::uuid ORDER BY id ASC FOR UPDATE`;
+
+            const fromAcc = accounts.find((a) => a.id === existing.account_id);
+            const toAcc = accounts.find((a) => a.id === existing.to_account_id);
+
+            const fromDelta = -(newAmountBigInt - oldAmountBigInt);
+            const toDelta = newAmountBigInt - oldAmountBigInt;
+
+            if (fromDelta < 0n) {
+              const fromReserved = await getAccountReserved(tx, fromAcc!.id);
+              const fromAvailable = fromAcc!.balance - fromReserved;
+              const newFromBal = fromAcc!.balance + fromDelta;
+              if (
+                !fromAcc!.allow_negative &&
+                (BigInt(-fromDelta) > fromAvailable || newFromBal < 0n)
+              ) {
+                throw new ConflictException({
+                  code: 'INSUFFICIENT_BALANCE',
+                  message: 'Saldo tersedia tidak mencukupi',
+                  details: {
+                    available: Number(fromAvailable),
+                    needed: Number(-fromDelta),
+                    account_id: fromAcc!.id,
+                  },
+                });
+              }
+            }
+
+            if (toDelta < 0n) {
+              const toReserved = await getAccountReserved(tx, toAcc!.id);
+              const toAvailable = toAcc!.balance - toReserved;
+              const newToBal = toAcc!.balance + toDelta;
+              if (
+                !toAcc!.allow_negative &&
+                (BigInt(-toDelta) > toAvailable || newToBal < 0n)
+              ) {
+                throw new ConflictException({
+                  code: 'INSUFFICIENT_BALANCE',
+                  message: 'Saldo tersedia tidak mencukupi',
+                  details: {
+                    available: Number(toAvailable),
+                    needed: Number(-toDelta),
+                    account_id: toAcc!.id,
+                  },
+                });
+              }
+            }
+
+            finalAccountBalance = fromAcc!.balance + fromDelta;
+
+            await tx.account.update({
+              where: { id: fromAcc!.id, user_id: user.userId },
+              data: { balance: finalAccountBalance },
+            });
+            await tx.account.update({
+              where: { id: toAcc!.id, user_id: user.userId },
+              data: { balance: toAcc!.balance + toDelta },
+            });
+          } else {
+            const accounts = await tx.$queryRaw<
+              Array<{
+                id: string;
+                financial_profile_id: string;
+                balance: bigint;
+                allow_negative: boolean;
+                archived: boolean;
+              }>
+            >`SELECT id, financial_profile_id, balance, allow_negative, archived FROM accounts WHERE id = ${existing.account_id}::uuid AND user_id = ${user.userId}::uuid FOR UPDATE`;
+
+            const account = accounts[0];
+            let oldEffect = 0n;
+            let newEffect = 0n;
+
+            if (existing.type === 'INCOME') {
+              oldEffect = oldAmountBigInt;
+              newEffect = newAmountBigInt;
+            } else if (existing.type === 'EXPENSE') {
+              oldEffect = -oldAmountBigInt;
+              newEffect = -newAmountBigInt;
+            } else if (existing.type === 'ADJUSTMENT') {
+              oldEffect = oldAmountBigInt;
+              newEffect = newAmountBigInt;
+            }
+
+            const delta = newEffect - oldEffect;
+            finalAccountBalance = account.balance + delta;
+
+            if (delta < 0n) {
+              const reserved = await getAccountReserved(tx, account.id);
+              const available = account.balance - reserved;
+              if (
+                !account.allow_negative &&
+                (BigInt(-delta) > available || finalAccountBalance < 0n)
+              ) {
+                throw new ConflictException({
+                  code: 'INSUFFICIENT_BALANCE',
+                  message: 'Saldo tersedia tidak mencukupi',
+                  details: {
+                    available: Number(available),
+                    needed: Number(-delta),
+                    account_id: account.id,
+                  },
+                });
+              }
+            }
+
+            await tx.account.update({
+              where: { id: account.id, user_id: user.userId },
+              data: { balance: finalAccountBalance },
+            });
+          }
+        }
+
+        // 9. Peringatan periode budget terkunci
+        let warning: string | undefined;
+        if (
+          existing.type === 'EXPENSE' &&
+          existing.status === 'POSTED' &&
+          (dto.amount !== undefined || dto.date !== undefined)
+        ) {
+          const oldMonth = existing.date.toISOString().slice(0, 7);
+          const newDateStr = dto.date ?? existing.date.toISOString().slice(0, 10);
+          const newMonth = newDateStr.slice(0, 7);
+          const periods = Array.from(new Set([oldMonth, newMonth]));
+
+          const lockedPeriod = await tx.budgetPeriod.findFirst({
+            where: {
+              period: { in: periods },
+              locked_at: { not: null },
+              budget: { user_id: user.userId },
+            },
+          });
+
+          if (lockedPeriod) {
+            warning = 'LOCKED_BUDGET_PERIOD_AFFECTED';
+          }
+        }
+
+        if (!warning && finalAccountBalance !== undefined && finalAccountBalance < 0n) {
+          warning = 'NEGATIVE_BALANCE';
+        }
+
+        // 10. Update baris Transaction
+        const updateData: Prisma.TransactionUpdateInput = {
+          client_tx_id: clientTxId,
+        };
+        if (dto.amount !== undefined) {
+          updateData.amount = BigInt(dto.amount);
+        }
+        if (dto.date !== undefined) {
+          updateData.date = new Date(`${dto.date}T00:00:00.000Z`);
+        }
+        if (dto.category_id !== undefined) {
+          updateData.category = dto.category_id
+            ? { connect: { id: dto.category_id } }
+            : { disconnect: true };
+        }
+        if (dto.splits && dto.splits.length > 0) {
+          updateData.category = { disconnect: true };
+        }
+        if (dto.note !== undefined) {
+          updateData.note = dto.note;
+        }
+        if (dto.reason !== undefined) {
+          updateData.reason = dto.reason;
+        }
+        if (dto.account_id !== undefined && existing.status === 'SCHEDULED') {
+          updateData.account = { connect: { id: dto.account_id } };
+        }
+
+        const updated = await tx.transaction.update({
+          where: { id: existing.id, user_id: user.userId },
+          data: updateData,
+        });
+
+        // 11. Snapshot after & TransactionAudit
+        const finalSplits = await tx.transactionSplit.findMany({
+          where: { transaction_id: existing.id },
+        });
+        const finalTags = await tx.transactionTag.findMany({
+          where: { transaction_id: existing.id },
+        });
+
+        const afterResponse = toTransactionResponse(
+          {
+            ...updated,
+            splits: finalSplits,
+            tags: finalTags.map((t) => t.tag_id),
+          },
+          warning,
+        );
+
+        const audit = await tx.transactionAudit.create({
+          data: {
+            transaction_id: existing.id,
+            action: 'UPDATE',
+            before: beforeResponse as unknown as Prisma.InputJsonValue,
+            after: afterResponse as unknown as Prisma.InputJsonValue,
+            actor_user_id: user.userId,
+            reason: dto.reason?.trim() ?? null,
+          },
+        });
+
+        return {
+          transaction: afterResponse,
+          audit_id: audit.id,
+          ...(warning ? { warning } : {}),
+        };
+      });
+    } catch (error: any) {
+      if (
+        error instanceof Prisma.PrismaClientKnownRequestError &&
+        error.code === 'P2002'
+      ) {
+        throw new ConflictException({
+          code: 'CLIENT_TX_ID_DUPLICATE',
+          message: 'client_tx_id sudah pernah digunakan',
+        });
+      }
+      throw error;
     }
   }
 }
