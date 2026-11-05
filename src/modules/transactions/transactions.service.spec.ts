@@ -59,6 +59,7 @@ describe('TransactionsService', () => {
         create: jest.fn<any>(),
         update: jest.fn<any>(),
         findMany: jest.fn<any>(),
+        findFirst: jest.fn<any>(),
       },
       transactionSplit: {
         findMany: jest.fn<any>().mockResolvedValue([]),
@@ -2201,6 +2202,200 @@ describe('TransactionsService', () => {
         service.cancel(user, scheduledExpense.id, {} as any),
       ).rejects.toMatchObject({
         response: { code: 'MISSING_CLIENT_TX_ID' },
+      });
+    });
+  });
+
+  describe('LIST AND DETAIL TRANSACTIONS (TASK-053)', () => {
+    const dummyDate = new Date('2026-01-15T00:00:00.000Z');
+    const dummyCreated = new Date('2026-01-15T10:00:00.000Z');
+
+    const sampleTx = {
+      id: 'a0000000-0000-0000-0000-000000000001',
+      financial_profile_id: 'p0000000-0000-0000-0000-000000000001',
+      user_id: user.userId,
+      account_id: mockAccount.id,
+      to_account_id: null,
+      type: 'EXPENSE',
+      amount: 50000n,
+      date: dummyDate,
+      status: 'POSTED',
+      category_id: mockCategory.id,
+      transfer_group_id: null,
+      transfer_fee: 0n,
+      fee_mode: null,
+      parent_transaction_id: null,
+      reason: null,
+      note: 'Makan siang enak',
+      client_tx_id: validUlid,
+      processed_at: null,
+      cancelled_at: null,
+      created_at: dummyCreated,
+      updated_at: dummyCreated,
+      category: {
+        id: mockCategory.id,
+        name: 'Makanan',
+        icon: 'food',
+        color: 'red',
+      },
+      splits: [],
+      tags: [
+        {
+          tag: {
+            id: 't0000000-0000-0000-0000-000000000001',
+            name: 'Kuliah',
+            color: 'blue',
+            archived: false,
+          },
+        },
+      ],
+      attachments: [],
+      audits: [],
+    };
+
+    it('AC-1: list mendukung limit dan cursor pagination', async () => {
+      const tx2 = {
+        ...sampleTx,
+        id: 'a0000000-0000-0000-0000-000000000002',
+        date: new Date('2026-01-14T00:00:00.000Z'),
+      };
+      const tx3 = {
+        ...sampleTx,
+        id: 'a0000000-0000-0000-0000-000000000003',
+        date: new Date('2026-01-13T00:00:00.000Z'),
+      };
+
+      // Mock returning 3 items when take is 2 + 1 = 3
+      prisma.transaction.findMany.mockResolvedValueOnce([sampleTx, tx2, tx3]);
+
+      const res1 = await service.list(user.userId, {
+        limit: 2,
+        type: ['EXPENSE'],
+        date_from: '2026-01-01',
+        date_to: '2026-01-31',
+      } as any);
+
+      expect(res1.items.length).toBe(2);
+      expect(res1.next_cursor).toBeTruthy();
+
+      // Page 2 with cursor
+      prisma.transaction.findMany.mockResolvedValueOnce([tx3]);
+
+      const res2 = await service.list(user.userId, {
+        limit: 2,
+        cursor: res1.next_cursor!,
+      } as any);
+
+      expect(res2.items.length).toBe(1);
+      expect(res2.next_cursor).toBeNull();
+    });
+
+    it('AC-2 & AC-3 & AC-4: list menyaring dengan filter q, status SCHEDULED, dan AND tag_id', async () => {
+      prisma.transaction.findMany.mockResolvedValueOnce([
+        {
+          ...sampleTx,
+          status: 'SCHEDULED',
+        },
+      ]);
+
+      const res = await service.list(user.userId, {
+        q: 'makan',
+        status: ['SCHEDULED'],
+        tag_id: [
+          't0000000-0000-0000-0000-000000000001',
+          't0000000-0000-0000-0000-000000000002',
+        ],
+      } as any);
+
+      expect(res.items.length).toBe(1);
+      expect(res.items[0].is_scheduled).toBe(true);
+
+      const findManyCall = prisma.transaction.findMany.mock.calls[prisma.transaction.findMany.mock.calls.length - 1][0];
+      expect(findManyCall.where.user_id).toBe(user.userId);
+      expect(findManyCall.where.AND).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            OR: expect.arrayContaining([
+              { note: { contains: 'makan', mode: 'insensitive' } },
+            ]),
+          }),
+          { status: { in: ['SCHEDULED'] } },
+          { tags: { some: { tag_id: 't0000000-0000-0000-0000-000000000001' } } },
+          { tags: { some: { tag_id: 't0000000-0000-0000-0000-000000000002' } } },
+        ]),
+      );
+    });
+
+    it('AC-5: decodeCursor yang gagal melempar 400 INVALID_CURSOR', async () => {
+      await expect(
+        service.list(user.userId, { cursor: 'bukan-cursor-valid' } as any),
+      ).rejects.toMatchObject({
+        response: { code: 'INVALID_CURSOR' },
+      });
+    });
+
+    it('AC-6: findOne mengembalikan transaction, splits, tags, attachments, audit', async () => {
+      const fullTx = {
+        ...sampleTx,
+        splits: [
+          {
+            id: 's1',
+            category_id: mockCategory.id,
+            amount: 50000n,
+            category: {
+              id: mockCategory.id,
+              name: 'Makanan',
+              icon: 'food',
+              color: 'red',
+            },
+          },
+        ],
+        attachments: [
+          {
+            id: 'att-1',
+            transaction_id: sampleTx.id,
+            storage_key: 'tx/sample.jpg',
+            mime: 'image/jpeg',
+            size_bytes: 12345n,
+            uploaded_at: dummyCreated,
+            uploaded_by: user.userId,
+          },
+        ],
+        audits: [
+          {
+            id: 'aud-1',
+            transaction_id: sampleTx.id,
+            action: 'CREATE',
+            before: null,
+            after: {},
+            actor_user_id: user.userId,
+            reason: null,
+            created_at: dummyCreated,
+          },
+        ],
+      };
+
+      prisma.transaction.findFirst.mockResolvedValueOnce(fullTx);
+
+      const res = await service.findOne(user.userId, sampleTx.id);
+
+      expect(res.transaction.id).toBe(sampleTx.id);
+      expect(res.transaction.amount).toBe(50000);
+      expect(res.splits.length).toBe(1);
+      expect(res.splits[0].amount).toBe(50000);
+      expect(res.tags.length).toBe(1);
+      expect(res.attachments.length).toBe(1);
+      expect(res.attachments[0].size_bytes).toBe(12345);
+      expect(res.audit.length).toBe(1);
+    });
+
+    it('AC-6 (isolasi): findOne jika milik user lain atau tidak ada melempar 404 TRANSACTION_NOT_FOUND', async () => {
+      prisma.transaction.findFirst.mockResolvedValueOnce(null);
+
+      await expect(
+        service.findOne(user.userId, '00000000-0000-0000-0000-000000000099'),
+      ).rejects.toMatchObject({
+        response: { code: 'TRANSACTION_NOT_FOUND' },
       });
     });
   });

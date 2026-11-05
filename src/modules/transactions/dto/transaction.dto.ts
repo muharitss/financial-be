@@ -401,3 +401,136 @@ export class ConfirmAttachmentPipe implements PipeTransform {
     return parsed.data;
   }
 }
+
+export function encodeCursor(item: {
+  date: Date | string;
+  created_at: Date | string;
+  id: string;
+}): string {
+  const d =
+    item.date instanceof Date
+      ? item.date.toISOString().slice(0, 10)
+      : String(item.date).slice(0, 10);
+  const c =
+    item.created_at instanceof Date
+      ? item.created_at.toISOString()
+      : new Date(item.created_at).toISOString();
+  return Buffer.from(JSON.stringify({ d, c, id: item.id }), 'utf8').toString(
+    'base64url',
+  );
+}
+
+export function decodeCursor(cursor: string): {
+  d: string;
+  c: string;
+  id: string;
+} {
+  try {
+    const jsonStr = Buffer.from(cursor, 'base64url').toString('utf8');
+    const parsed = JSON.parse(jsonStr);
+    if (!parsed || typeof parsed !== 'object') {
+      throw new Error('Not an object');
+    }
+    const { d, c, id } = parsed;
+    if (typeof d !== 'string' || typeof c !== 'string' || typeof id !== 'string') {
+      throw new Error('Missing fields');
+    }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(d) || isNaN(Date.parse(d))) {
+      throw new Error('Invalid date');
+    }
+    if (isNaN(Date.parse(c))) {
+      throw new Error('Invalid timestamp');
+    }
+    if (
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)
+    ) {
+      throw new Error('Invalid UUID');
+    }
+    return { d, c, id };
+  } catch {
+    throw new BadRequestException({
+      code: 'INVALID_CURSOR',
+      message: 'Cursor pagination tidak valid',
+    });
+  }
+}
+
+const toArrayHelper = (val: unknown): string[] | undefined => {
+  if (val === undefined || val === null || val === '') return undefined;
+  if (Array.isArray(val)) {
+    return val.flatMap((v) =>
+      typeof v === 'string'
+        ? v.split(',').map((s) => s.trim()).filter(Boolean)
+        : [],
+    );
+  }
+  if (typeof val === 'string') {
+    return val.split(',').map((s) => s.trim()).filter(Boolean);
+  }
+  return undefined;
+};
+
+const emptyToUndefined = (val: unknown) => (val === '' ? undefined : val);
+
+export const listTransactionsQuerySchema = z.object({
+  q: z.preprocess(emptyToUndefined, z.string().trim().max(100).optional()),
+  type: z.preprocess(
+    toArrayHelper,
+    z
+      .array(
+        z.enum(['INCOME', 'EXPENSE', 'TRANSFER', 'ADJUSTMENT', 'REVERSAL']),
+      )
+      .optional(),
+  ),
+  status: z.preprocess(
+    toArrayHelper,
+    z.array(z.enum(['POSTED', 'SCHEDULED', 'CANCELLED', 'REVERSED'])).optional(),
+  ),
+  account_id: z.preprocess(
+    toArrayHelper,
+    z.array(z.uuid()).optional(),
+  ),
+  category_id: z.preprocess(
+    toArrayHelper,
+    z.array(z.uuid()).optional(),
+  ),
+  tag_id: z.preprocess(
+    toArrayHelper,
+    z.array(z.uuid()).optional(),
+  ),
+  date_from: z.preprocess(emptyToUndefined, z.iso.date().optional()),
+  date_to: z.preprocess(emptyToUndefined, z.iso.date().optional()),
+  amount_min: z.preprocess(
+    emptyToUndefined,
+    z.coerce.number().int().nonnegative().optional(),
+  ),
+  amount_max: z.preprocess(
+    emptyToUndefined,
+    z.coerce.number().int().nonnegative().optional(),
+  ),
+  sort: z.enum(['date', 'amount', 'category']).default('date'),
+  cursor: z.preprocess(emptyToUndefined, z.string().optional()),
+  limit: z.preprocess(
+    emptyToUndefined,
+    z.coerce.number().int().min(1).max(200).default(50),
+  ),
+});
+
+export type ListTransactionsQueryDto = z.infer<
+  typeof listTransactionsQuerySchema
+>;
+
+@Injectable()
+export class ListTransactionsPipe implements PipeTransform {
+  transform(value: unknown) {
+    const parsed = listTransactionsQuerySchema.safeParse(value);
+    if (!parsed.success) {
+      throw new BadRequestException({
+        code: 'VALIDATION_ERROR',
+        message: 'Parameter query tidak valid',
+        details: parsed.error.flatten().fieldErrors,
+      });
+    }
+    return parsed.data;
+  }
+}

@@ -13,6 +13,9 @@ import { todayInTz } from '../../common/utils/date.js';
 import { evaluateNegativeBalancePolicy } from './balance-policy.js';
 import {
   resolveClientTxId,
+  encodeCursor,
+  decodeCursor,
+  type ListTransactionsQueryDto,
   type CreateTransactionDto,
   type CreateIncomeDto,
   type CreateExpenseDto,
@@ -2068,5 +2071,385 @@ export class TransactionsService {
       }
       throw err;
     }
+  }
+
+  async list(
+    userId: string,
+    query: ListTransactionsQueryDto,
+  ): Promise<{ items: any[]; next_cursor: string | null }> {
+    const andConditions: Prisma.TransactionWhereInput[] = [];
+
+    if (query.q) {
+      const qTrimmed = query.q.trim();
+      if (qTrimmed) {
+        andConditions.push({
+          OR: [
+            { note: { contains: qTrimmed, mode: 'insensitive' } },
+            { reason: { contains: qTrimmed, mode: 'insensitive' } },
+            { category: { name: { contains: qTrimmed, mode: 'insensitive' } } },
+            { splits: { some: { category: { name: { contains: qTrimmed, mode: 'insensitive' } } } } },
+            { tags: { some: { tag: { name: { contains: qTrimmed, mode: 'insensitive' } } } } },
+          ],
+        });
+      }
+    }
+
+    if (query.type && query.type.length > 0) {
+      andConditions.push({ type: { in: query.type } });
+    }
+
+    if (query.status && query.status.length > 0) {
+      andConditions.push({ status: { in: query.status } });
+    }
+
+    if (query.account_id && query.account_id.length > 0) {
+      andConditions.push({
+        OR: [
+          { account_id: { in: query.account_id } },
+          { to_account_id: { in: query.account_id } },
+        ],
+      });
+    }
+
+    if (query.category_id && query.category_id.length > 0) {
+      andConditions.push({
+        OR: [
+          { category_id: { in: query.category_id } },
+          { splits: { some: { category_id: { in: query.category_id } } } },
+        ],
+      });
+    }
+
+    if (query.tag_id && query.tag_id.length > 0) {
+      query.tag_id.forEach((tid) => {
+        andConditions.push({
+          tags: { some: { tag_id: tid } },
+        });
+      });
+    }
+
+    if (query.date_from || query.date_to) {
+      const dateFilter: Prisma.DateTimeFilter = {};
+      if (query.date_from) {
+        dateFilter.gte = new Date(`${query.date_from}T00:00:00.000Z`);
+      }
+      if (query.date_to) {
+        dateFilter.lte = new Date(`${query.date_to}T23:59:59.999Z`);
+      }
+      andConditions.push({ date: dateFilter });
+    }
+
+    if (query.amount_min !== undefined || query.amount_max !== undefined) {
+      const amountFilter: Prisma.BigIntFilter = {};
+      if (query.amount_min !== undefined) {
+        amountFilter.gte = BigInt(query.amount_min);
+      }
+      if (query.amount_max !== undefined) {
+        amountFilter.lte = BigInt(query.amount_max);
+      }
+      andConditions.push({ amount: amountFilter });
+    }
+
+    if (query.cursor) {
+      const decoded = decodeCursor(query.cursor);
+      const cursorDate = new Date(`${decoded.d}T00:00:00.000Z`);
+      const cursorCreatedAt = new Date(decoded.c);
+      const cursorId = decoded.id;
+
+      andConditions.push({
+        OR: [
+          { date: { lt: cursorDate } },
+          {
+            date: cursorDate,
+            created_at: { lt: cursorCreatedAt },
+          },
+          {
+            date: cursorDate,
+            created_at: cursorCreatedAt,
+            id: { lt: cursorId },
+          },
+        ],
+      });
+    }
+
+    const where: Prisma.TransactionWhereInput = {
+      user_id: userId,
+      ...(andConditions.length > 0 ? { AND: andConditions } : {}),
+    };
+
+    const limit = query.limit ?? 50;
+
+    let orderBy: Prisma.TransactionOrderByWithRelationInput[] = [
+      { date: 'desc' },
+      { created_at: 'desc' },
+      { id: 'desc' },
+    ];
+
+    if (query.sort === 'amount') {
+      orderBy = [
+        { amount: 'desc' },
+        { date: 'desc' },
+        { created_at: 'desc' },
+        { id: 'desc' },
+      ];
+    } else if (query.sort === 'category') {
+      orderBy = [
+        { category: { name: 'asc' } },
+        { date: 'desc' },
+        { created_at: 'desc' },
+        { id: 'desc' },
+      ];
+    }
+
+    const results = await this.prisma.transaction.findMany({
+      where,
+      orderBy,
+      take: limit + 1,
+      include: {
+        category: {
+          select: {
+            id: true,
+            name: true,
+            icon: true,
+            color: true,
+          },
+        },
+        splits: {
+          include: {
+            category: {
+              select: {
+                id: true,
+                name: true,
+                icon: true,
+                color: true,
+              },
+            },
+          },
+        },
+        tags: {
+          include: {
+            tag: {
+              select: {
+                id: true,
+                name: true,
+                color: true,
+                archived: true,
+              },
+            },
+          },
+        },
+      },
+    });
+
+    const hasMore = results.length > limit;
+    const sliced = hasMore ? results.slice(0, limit) : results;
+    const next_cursor =
+      hasMore && sliced.length > 0
+        ? encodeCursor(sliced[sliced.length - 1])
+        : null;
+
+    const items = sliced.map((item) => ({
+      id: item.id,
+      financial_profile_id: item.financial_profile_id,
+      user_id: item.user_id,
+      account_id: item.account_id,
+      to_account_id: item.to_account_id ?? null,
+      type: item.type,
+      amount: Number(item.amount),
+      date:
+        item.date instanceof Date
+          ? item.date.toISOString().slice(0, 10)
+          : String(item.date).slice(0, 10),
+      status: item.status,
+      is_scheduled: item.status === 'SCHEDULED',
+      category_id: item.category_id ?? null,
+      category: item.category
+        ? {
+            id: item.category.id,
+            name: item.category.name,
+            icon: item.category.icon,
+            color: item.category.color,
+          }
+        : null,
+      transfer_group_id: item.transfer_group_id ?? null,
+      transfer_fee: Number(item.transfer_fee ?? 0),
+      fee_mode: item.fee_mode ?? null,
+      parent_transaction_id: item.parent_transaction_id ?? null,
+      reason: item.reason ?? null,
+      note: item.note ?? null,
+      client_tx_id: item.client_tx_id,
+      tags: item.tags
+        ? item.tags.map((t: any) => ({
+            id: t.tag?.id ?? t.id ?? t.tag_id,
+            name: t.tag?.name,
+            color: t.tag?.color,
+            archived: t.tag?.archived,
+          }))
+        : [],
+      splits: item.splits
+        ? item.splits.map((s: any) => ({
+            id: s.id,
+            category_id: s.category_id,
+            amount: Number(s.amount),
+            category: s.category
+              ? {
+                  id: s.category.id,
+                  name: s.category.name,
+                  icon: s.category.icon,
+                  color: s.category.color,
+                }
+              : null,
+          }))
+        : [],
+      processed_at: item.processed_at ?? null,
+      cancelled_at: item.cancelled_at ?? null,
+      created_at: item.created_at,
+      updated_at: item.updated_at,
+    }));
+
+    return { items, next_cursor };
+  }
+
+  async findOne(
+    userId: string,
+    transactionId: string,
+  ): Promise<{
+    transaction: any;
+    splits: any[];
+    tags: any[];
+    attachments: any[];
+    audit: any[];
+  }> {
+    const tx = await this.prisma.transaction.findFirst({
+      where: {
+        id: transactionId,
+        user_id: userId,
+      },
+      include: {
+        category: {
+          select: {
+            id: true,
+            name: true,
+            icon: true,
+            color: true,
+          },
+        },
+        splits: {
+          include: {
+            category: {
+              select: {
+                id: true,
+                name: true,
+                icon: true,
+                color: true,
+              },
+            },
+          },
+        },
+        tags: {
+          include: {
+            tag: {
+              select: {
+                id: true,
+                name: true,
+                color: true,
+                archived: true,
+              },
+            },
+          },
+        },
+        attachments: true,
+        audits: {
+          orderBy: { created_at: 'desc' },
+        },
+      },
+    });
+
+    if (!tx) {
+      throw new NotFoundException({
+        code: 'TRANSACTION_NOT_FOUND',
+        message: 'Transaksi tidak ditemukan',
+      });
+    }
+
+    const transaction = {
+      id: tx.id,
+      financial_profile_id: tx.financial_profile_id,
+      user_id: tx.user_id,
+      account_id: tx.account_id,
+      to_account_id: tx.to_account_id ?? null,
+      type: tx.type,
+      amount: Number(tx.amount),
+      date:
+        tx.date instanceof Date
+          ? tx.date.toISOString().slice(0, 10)
+          : String(tx.date).slice(0, 10),
+      status: tx.status,
+      is_scheduled: tx.status === 'SCHEDULED',
+      category_id: tx.category_id ?? null,
+      category: tx.category
+        ? {
+            id: tx.category.id,
+            name: tx.category.name,
+            icon: tx.category.icon,
+            color: tx.category.color,
+          }
+        : null,
+      transfer_group_id: tx.transfer_group_id ?? null,
+      transfer_fee: Number(tx.transfer_fee ?? 0),
+      fee_mode: tx.fee_mode ?? null,
+      parent_transaction_id: tx.parent_transaction_id ?? null,
+      reason: tx.reason ?? null,
+      note: tx.note ?? null,
+      client_tx_id: tx.client_tx_id,
+      processed_at: tx.processed_at ?? null,
+      cancelled_at: tx.cancelled_at ?? null,
+      created_at: tx.created_at,
+      updated_at: tx.updated_at,
+    };
+
+    const splits = tx.splits.map((s) => ({
+      id: s.id,
+      category_id: s.category_id,
+      amount: Number(s.amount),
+      category: s.category
+        ? {
+            id: s.category.id,
+            name: s.category.name,
+            icon: s.category.icon,
+            color: s.category.color,
+          }
+        : null,
+    }));
+
+    const tags = tx.tags.map((t) => ({
+      id: t.tag.id,
+      name: t.tag.name,
+      color: t.tag.color,
+      archived: t.tag.archived,
+    }));
+
+    const attachments = tx.attachments.map((a) => ({
+      id: a.id,
+      transaction_id: a.transaction_id,
+      storage_key: a.storage_key,
+      mime: a.mime,
+      size_bytes: Number(a.size_bytes),
+      uploaded_at: a.uploaded_at,
+      uploaded_by: a.uploaded_by,
+    }));
+
+    const audit = tx.audits.map((au) => ({
+      id: au.id,
+      transaction_id: au.transaction_id,
+      action: au.action,
+      before: au.before,
+      after: au.after,
+      actor_user_id: au.actor_user_id,
+      reason: au.reason,
+      created_at: au.created_at,
+    }));
+
+    return { transaction, splits, tags, attachments, audit };
   }
 }

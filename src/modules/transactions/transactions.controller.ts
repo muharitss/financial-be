@@ -1,8 +1,10 @@
 import {
   Controller,
+  Get,
   Post,
   Patch,
   Param,
+  Query,
   Body,
   Headers,
   UseGuards,
@@ -28,6 +30,8 @@ import {
   type ReverseTransactionDto,
   CancelTransactionPipe,
   type CancelTransactionDto,
+  ListTransactionsPipe,
+  type ListTransactionsQueryDto,
 } from './dto/transaction.dto.js';
 import {
   TransactionsService,
@@ -126,5 +130,29 @@ export class TransactionsController {
     @Headers('idempotency-key') headerIdempotencyKey?: string,
   ): Promise<{ id: string; status: 'CANCELLED'; cancelled_at: Date }> {
     return this.transactionsService.cancel(user, id, dto, headerIdempotencyKey);
+  }
+
+  @Get()
+  @ApiOperation({ summary: 'Mendapatkan daftar transaksi dengan filter dan cursor pagination' })
+  @ApiResponse({ status: 200, description: 'Daftar transaksi berhasil diambil' })
+  @ApiResponse({ status: 400, description: 'Cursor tidak valid atau query salah' })
+  @ApiResponse({ status: 401, description: 'Sesi tidak valid' })
+  async list(
+    @CurrentUser() user: { userId: string; role?: string },
+    @Query(new ListTransactionsPipe()) query: ListTransactionsQueryDto,
+  ) {
+    return this.transactionsService.list(user.userId, query);
+  }
+
+  @Get(':id')
+  @ApiOperation({ summary: 'Mendapatkan detail transaksi beserta splits, tags, attachments, dan audit' })
+  @ApiResponse({ status: 200, description: 'Detail transaksi berhasil diambil' })
+  @ApiResponse({ status: 401, description: 'Sesi tidak valid' })
+  @ApiResponse({ status: 404, description: 'Transaksi tidak ditemukan' })
+  async findOne(
+    @CurrentUser() user: { userId: string; role?: string },
+    @Param('id', ParseUUIDPipe) id: string,
+  ) {
+    return this.transactionsService.findOne(user.userId, id);
   }
 }

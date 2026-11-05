@@ -3725,4 +3725,242 @@ describe('Transactions E2E Test Suite (Supertest)', () => {
       expect(revRes2.body).toEqual(revRes1.body);
     });
   });
+
+  describe('LIST AND DETAIL TRANSACTIONS (TASK-053)', () => {
+    let tag1: any;
+    let tag2: any;
+    let listAcc: any;
+
+    beforeAll(async () => {
+      listAcc = await prisma.asSystem().account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Akun List Test',
+          type: 'BANK',
+          provider: 'BCA',
+          balance: 1000000n,
+          opening_balance: 1000000n,
+          opening_date: new Date('2026-01-01'),
+          allow_negative: false,
+        },
+      });
+
+      tag1 = await prisma.asSystem().tag.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'TagOne-' + Date.now(),
+          color: 'blue',
+          archived: false,
+        },
+      });
+
+      tag2 = await prisma.asSystem().tag.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'TagTwo-' + Date.now(),
+          color: 'emerald',
+          archived: false,
+        },
+      });
+    });
+
+    it('AC-1: GET /transactions cursor pagination mengembalikan limit item dan halaman ke-2 menyisakan sisa dengan next_cursor null', async () => {
+      // Buat 3 transaksi EXPENSE di bulan Januari 2026
+      for (const d of ['2026-01-10', '2026-01-15', '2026-01-20']) {
+        const res = await request(app.getHttpServer())
+          .post('/transactions')
+          .set(userAHeaders)
+          .send({
+            type: 'EXPENSE',
+            amount: 10000,
+            account_id: listAcc.id,
+            category_id: expenseCategoryA.id,
+            date: d,
+            client_tx_id: generateTestUlid(),
+          });
+        expect(res.status).toBe(201);
+      }
+
+      // Query page 1 limit 2
+      const resPage1 = await request(app.getHttpServer())
+        .get('/transactions')
+        .set(userAHeaders)
+        .query({
+          type: 'EXPENSE',
+          date_from: '2026-01-01',
+          date_to: '2026-01-31',
+          limit: 2,
+        });
+
+      expect(resPage1.status).toBe(200);
+      expect(resPage1.body.items.length).toBe(2);
+      expect(resPage1.body.next_cursor).toBeTruthy();
+
+      // Query page 2 dengan cursor
+      const resPage2 = await request(app.getHttpServer())
+        .get('/transactions')
+        .set(userAHeaders)
+        .query({
+          type: 'EXPENSE',
+          date_from: '2026-01-01',
+          date_to: '2026-01-31',
+          limit: 2,
+          cursor: resPage1.body.next_cursor,
+        });
+
+      expect(resPage2.status).toBe(200);
+      expect(resPage2.body.items.length).toBe(1);
+      expect(resPage2.body.next_cursor).toBeNull();
+    });
+
+    it('AC-2: GET /transactions?q=makan menemukan transaksi case-insensitive pada note/category/tag', async () => {
+      const qTx = await request(app.getHttpServer())
+        .post('/transactions')
+        .set(userAHeaders)
+        .send({
+          type: 'EXPENSE',
+          amount: 25000,
+          account_id: listAcc.id,
+          category_id: expenseCategoryA.id,
+          date: '2026-02-01',
+          note: 'Makan siang warteg',
+          client_tx_id: generateTestUlid(),
+        });
+      expect(qTx.status).toBe(201);
+
+      const res = await request(app.getHttpServer())
+        .get('/transactions')
+        .set(userAHeaders)
+        .query({ q: 'makan' });
+
+      expect(res.status).toBe(200);
+      const found = res.body.items.find((i: any) => i.id === qTx.body.id);
+      expect(found).toBeDefined();
+      expect(found.note).toContain('Makan');
+    });
+
+    it('AC-3: GET /transactions?status=SCHEDULED hanya mengembalikan transaksi terjadwal', async () => {
+      const schRes = await request(app.getHttpServer())
+        .post('/transactions')
+        .set(userAHeaders)
+        .send({
+          type: 'EXPENSE',
+          amount: 30000,
+          account_id: listAcc.id,
+          category_id: expenseCategoryA.id,
+          date: '2026-12-25', // Masa depan -> SCHEDULED
+          client_tx_id: generateTestUlid(),
+        });
+      expect(schRes.status).toBe(201);
+      expect(schRes.body.status).toBe('SCHEDULED');
+
+      const res = await request(app.getHttpServer())
+        .get('/transactions')
+        .set(userAHeaders)
+        .query({ status: 'SCHEDULED' });
+
+      expect(res.status).toBe(200);
+      expect(res.body.items.length).toBeGreaterThanOrEqual(1);
+      for (const item of res.body.items) {
+        expect(item.status).toBe('SCHEDULED');
+        expect(item.is_scheduled).toBe(true);
+      }
+    });
+
+    it('AC-4: GET /transactions?tag_id=t1&tag_id=t2 menggunakan multi-tag AND semantics', async () => {
+      // Transaksi A: punya tag1 dan tag2
+      const txBoth = await request(app.getHttpServer())
+        .post('/transactions')
+        .set(userAHeaders)
+        .send({
+          type: 'EXPENSE',
+          amount: 40000,
+          account_id: listAcc.id,
+          category_id: expenseCategoryA.id,
+          date: '2026-03-01',
+          tags: [tag1.id, tag2.id],
+          client_tx_id: generateTestUlid(),
+        });
+      expect(txBoth.status).toBe(201);
+
+      // Transaksi B: hanya punya tag1
+      const txOnly1 = await request(app.getHttpServer())
+        .post('/transactions')
+        .set(userAHeaders)
+        .send({
+          type: 'EXPENSE',
+          amount: 45000,
+          account_id: listAcc.id,
+          category_id: expenseCategoryA.id,
+          date: '2026-03-02',
+          tags: [tag1.id],
+          client_tx_id: generateTestUlid(),
+        });
+      expect(txOnly1.status).toBe(201);
+
+      // Query tag_id=tag1.id&tag_id=tag2.id -> hanya txBoth yang cocok
+      const res = await request(app.getHttpServer())
+        .get(`/transactions?tag_id=${tag1.id}&tag_id=${tag2.id}`)
+        .set(userAHeaders);
+
+      expect(res.status).toBe(200);
+      const ids = res.body.items.map((i: any) => i.id);
+      expect(ids).toContain(txBoth.body.id);
+      expect(ids).not.toContain(txOnly1.body.id);
+    });
+
+    it('AC-5: GET /transactions?cursor=bukan-cursor-valid -> 400 INVALID_CURSOR', async () => {
+      const res = await request(app.getHttpServer())
+        .get('/transactions?cursor=bukan-cursor-valid')
+        .set(userAHeaders);
+
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe('INVALID_CURSOR');
+    });
+
+    it('AC-6: GET /transactions/:id mengembalikan detail lengkap dan menolak 404 pada transaksi milik user lain', async () => {
+      // 1. Buat transaksi dengan split dan tag
+      const txRes = await request(app.getHttpServer())
+        .post('/transactions')
+        .set(userAHeaders)
+        .send({
+          type: 'EXPENSE',
+          amount: 60000,
+          account_id: listAcc.id,
+          date: '2026-03-10',
+          splits: [
+            { category_id: expenseCategoryA.id, amount: 40000 },
+            { category_id: expenseCategoryA.id, amount: 20000 },
+          ],
+          tags: [tag1.id],
+          client_tx_id: generateTestUlid(),
+        });
+      expect(txRes.status).toBe(201);
+      const txId = txRes.body.id;
+
+      // 2. GET detail oleh User A
+      const detailRes = await request(app.getHttpServer())
+        .get(`/transactions/${txId}`)
+        .set(userAHeaders);
+
+      expect(detailRes.status).toBe(200);
+      expect(detailRes.body.transaction.id).toBe(txId);
+      expect(detailRes.body.splits.length).toBe(2);
+      expect(detailRes.body.tags.length).toBe(1);
+      expect(detailRes.body.tags[0].name).toBe(tag1.name);
+      expect(Array.isArray(detailRes.body.attachments)).toBe(true);
+      expect(Array.isArray(detailRes.body.audit)).toBe(true);
+
+      // 3. User B mengakses detail transaksi User A -> 404 TRANSACTION_NOT_FOUND
+      const userBDetailRes = await request(app.getHttpServer())
+        .get(`/transactions/${txId}`)
+        .set(userBHeaders);
+
+      expect(userBDetailRes.status).toBe(404);
+      expect(userBDetailRes.body.code).toBe('TRANSACTION_NOT_FOUND');
+    });
+  });
 });
