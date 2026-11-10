@@ -3,6 +3,7 @@ import { PassportModule } from '@nestjs/passport';
 import { JwtModule } from '@nestjs/jwt';
 import { JwtStrategy } from '../../common/strategies/jwt.strategy.js';
 import { TransactionsModule } from '../transactions/transactions.module.js';
+import { BudgetsModule } from '../budgets/budgets.module.js';
 import { JwksController } from './jwks.controller.js';
 import { AuthController } from './auth.controller.js';
 import { AuthService } from './auth.service.js';
@@ -15,6 +16,7 @@ import { AuthService } from './auth.service.js';
       signOptions: { expiresIn: '15m', algorithm: 'HS256' },
     }),
     TransactionsModule,
+    BudgetsModule,
   ],
   controllers: [AuthController, JwksController],
   providers: [AuthService, JwtStrategy],

@@ -1,16 +1,20 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { randomUUID } from 'node:crypto';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service.js';
 import { todayInTz } from '../../common/utils/date.js';
 import { getAccountReserved } from './transactions.service.js';
+import { BudgetWarningService } from '../budgets/budget-warning.service.js';
 
 @Injectable()
 export class ScheduledTransactionService {
   private readonly logger = new Logger(ScheduledTransactionService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    @Optional() private readonly budgetWarningService?: BudgetWarningService,
+  ) {}
 
   @Cron('5 0 * * *', { timeZone: 'Asia/Jakarta' })
   async runDailyScheduledPosting(): Promise<{
@@ -142,7 +146,9 @@ export class ScheduledTransactionService {
     txId: string,
     jobRunId: string,
   ): Promise<boolean> {
-    return this.prisma.asSystem().$transaction(async (tx) => {
+    const warningContext: { userId?: string; period?: string } = {};
+
+    const posted = await this.prisma.asSystem().$transaction(async (tx) => {
       // 1. Lock baris transactions dengan FOR UPDATE SKIP LOCKED
       const rows = await tx.$queryRaw<
         Array<{
@@ -152,17 +158,31 @@ export class ScheduledTransactionService {
           to_account_id: string | null;
           type: string;
           amount: bigint;
+          date: Date;
           transfer_fee: bigint;
           fee_mode: string | null;
           transfer_group_id: string | null;
           status: string;
           processed_at: Date | null;
         }>
-      >`SELECT id, user_id, account_id, to_account_id, type, amount, transfer_fee, fee_mode, transfer_group_id, status, processed_at FROM transactions WHERE id = ${txId}::uuid AND status = 'SCHEDULED' AND processed_at IS NULL FOR UPDATE SKIP LOCKED`;
+      >`SELECT id, user_id, account_id, to_account_id, type, amount, date, transfer_fee, fee_mode, transfer_group_id, status, processed_at FROM transactions WHERE id = ${txId}::uuid AND status = 'SCHEDULED' AND processed_at IS NULL FOR UPDATE SKIP LOCKED`;
 
       const row = rows[0];
       if (!row || row.status !== 'SCHEDULED' || row.processed_at !== null) {
         return false;
+      }
+
+      if (
+        row.type === 'EXPENSE' ||
+        (row.type === 'TRANSFER' && row.fee_mode === 'SEPARATE' && row.transfer_fee > 0n)
+      ) {
+        warningContext.userId = row.user_id;
+        if (row.date) {
+          warningContext.period =
+            typeof row.date === 'string'
+              ? (row.date as string).slice(0, 7)
+              : (row.date as Date).toISOString().slice(0, 7);
+        }
       }
 
       // Jika baris EXPENSE merupakan bagian dari transfer group, biarkan baris TRANSFER yang memprosesnya
@@ -401,5 +421,20 @@ export class ScheduledTransactionService {
 
       return false;
     });
+
+    if (posted && warningContext.userId && warningContext.period) {
+      try {
+        await this.budgetWarningService?.evaluateForPeriod(
+          warningContext.userId,
+          warningContext.period,
+        );
+      } catch (err: any) {
+        this.logger.warn(
+          `Failed to evaluate budget warnings for user ${warningContext.userId}: ${err.message}`,
+        );
+      }
+    }
+
+    return posted;
   }
 }

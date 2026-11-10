@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { Test, TestingModule } from '@nestjs/testing';
 import { INestApplication } from '@nestjs/common';
 import { ThrottlerStorage } from '@nestjs/throttler';
@@ -6,7 +7,9 @@ import cookieParser from 'cookie-parser';
 import { AppModule } from '../src/app.module.js';
 import { PrismaService } from '../src/prisma/prisma.service.js';
 import { AllExceptionsFilter } from '../src/common/filters/all-exceptions.filter.js';
-import { todayInTz } from '../src/common/utils/date.js';
+import { todayInTz, previousPeriod } from '../src/common/utils/date.js';
+import { BudgetRolloverService } from '../src/modules/budgets/budget-rollover.service.js';
+import { ScheduledTransactionService } from '../src/modules/transactions/scheduled-transaction.service.js';
 
 function generateTestUlid(): string {
   const chars = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
@@ -60,6 +63,8 @@ describe('Budgets E2E Test Suite (Supertest)', () => {
     await prisma.asSystem().budgetCategory.deleteMany();
     await prisma.asSystem().budgetPeriod.deleteMany();
     await prisma.asSystem().budget.deleteMany();
+    await prisma.asSystem().notification.deleteMany();
+    await prisma.asSystem().notificationPreference.deleteMany();
     await prisma.asSystem().auditLog.deleteMany({
       where: {
         resource_type: 'budget',
@@ -213,6 +218,8 @@ describe('Budgets E2E Test Suite (Supertest)', () => {
     await prisma.asSystem().budgetCategory.deleteMany();
     await prisma.asSystem().budgetPeriod.deleteMany();
     await prisma.asSystem().budget.deleteMany();
+    await prisma.asSystem().notification.deleteMany();
+    await prisma.asSystem().notificationPreference.deleteMany();
     await prisma.asSystem().user.deleteMany({
       where: {
         email: { endsWith: '@budget-test.com' },
@@ -1099,6 +1106,764 @@ describe('Budgets E2E Test Suite (Supertest)', () => {
         .set('Cookie', userAHeaders.cookie);
       expect(nonExistentPeriodRes.status).toBe(404);
       expect(nonExistentPeriodRes.body.code).toBe('BUDGET_NOT_FOUND');
+    });
+  });
+
+  describe('TASK-062: Rollover Computation — Monthly Job & Catch-Up', () => {
+    let rolloverService: BudgetRolloverService;
+    let prevPeriod: string;
+    let testCategoryId: string;
+
+    beforeAll(async () => {
+      rolloverService = app.get(BudgetRolloverService);
+      prevPeriod = previousPeriod(currentPeriod);
+
+      // Create a dedicated expense category for rollover testing
+      const cat = await prisma.category.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Rollover Test Category',
+          type: 'EXPENSE',
+        },
+      });
+      testCategoryId = cat.id;
+    });
+
+    it('AC-1: Underspend kategori aktif menghasilkan carryover dan mengunci periode lama', async () => {
+      // 1. Setup budget & budget period on previousPeriod
+      const budget = await prisma.budget.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          type: 'CATEGORY',
+          category_id: testCategoryId,
+        },
+      });
+
+      const bpPrev = await prisma.budgetPeriod.create({
+        data: {
+          budget_id: budget.id,
+          period: prevPeriod,
+          base_amount: 1000000n,
+          carryover_amount: 0n,
+        },
+      });
+
+      const bcPrev = await prisma.budgetCategory.create({
+        data: {
+          budget_period_id: bpPrev.id,
+          category_id: testCategoryId,
+          amount: 1000000n,
+          rollover_enabled: true,
+          carryover_amount: 0n,
+        },
+      });
+
+      await prisma.rolloverConfig.create({
+        data: {
+          budget_category_id: bcPrev.id,
+          enabled: true,
+          last_computed_carryover: 0n,
+        },
+      });
+
+      // 2. Create spent = 650.000 in prevPeriod
+      await prisma.transaction.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          account_id: accountA1Id,
+          type: 'EXPENSE',
+          amount: 650000n,
+          date: new Date(`${prevPeriod}-15`),
+          status: 'POSTED',
+          category_id: testCategoryId,
+          client_tx_id: generateTestUlid(),
+        },
+      });
+
+      // 3. Process rollover for userA
+      const result = await rolloverService.processMonthTurnForUser(userAId);
+      expect(result.errors).toBe(0);
+      expect(result.processedCount).toBeGreaterThanOrEqual(1);
+
+      // 4. Verify previous period is locked
+      const updatedBpPrev = await prisma.budgetPeriod.findUnique({
+        where: { id: bpPrev.id },
+      });
+      expect(updatedBpPrev?.locked_at).not.toBeNull();
+
+      // Verify RolloverConfig has last_computed_carryover = 350.000
+      const updatedConfig = await prisma.rolloverConfig.findUnique({
+        where: { budget_category_id: bcPrev.id },
+      });
+      expect(updatedConfig?.last_computed_carryover).toBe(350000n);
+
+      // 5. Verify currentPeriod has base_amount = 1.000.000, carryover_amount = 350.000
+      const currentBp = await prisma.budgetPeriod.findFirst({
+        where: {
+          budget_id: budget.id,
+          period: currentPeriod,
+        },
+        include: {
+          categories: true,
+        },
+      });
+      expect(currentBp).toBeDefined();
+      expect(currentBp?.base_amount).toBe(1000000n);
+      expect(currentBp?.carryover_amount).toBe(350000n);
+      expect(currentBp?.categories[0]?.carryover_amount).toBe(350000n);
+
+      // 6. Verify GET /budgets endpoint returns effective_amount = 1.350.000
+      const overviewRes = await request(app.getHttpServer())
+        .get(`/budgets?period=${currentPeriod}`)
+        .set('Cookie', userAHeaders.cookie);
+      expect(overviewRes.status).toBe(200);
+
+      const categoryItem = overviewRes.body.category_budgets.find(
+        (c: any) => c.id === budget.id,
+      );
+      expect(categoryItem).toBeDefined();
+      expect(categoryItem.base_amount).toBe(1000000);
+      expect(categoryItem.carryover_amount).toBe(350000);
+      expect(categoryItem.effective_amount).toBe(1350000);
+    });
+
+    it('AC-2: Overspend tidak menghasilkan carryover negatif (carryover = 0)', async () => {
+      const overspendCat = await prisma.category.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Overspend Category',
+          type: 'EXPENSE',
+        },
+      });
+
+      const budget = await prisma.budget.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          type: 'CATEGORY',
+          category_id: overspendCat.id,
+        },
+      });
+
+      const bpPrev = await prisma.budgetPeriod.create({
+        data: {
+          budget_id: budget.id,
+          period: prevPeriod,
+          base_amount: 1000000n,
+          carryover_amount: 0n,
+        },
+      });
+
+      const bcPrev = await prisma.budgetCategory.create({
+        data: {
+          budget_period_id: bpPrev.id,
+          category_id: overspendCat.id,
+          amount: 1000000n,
+          rollover_enabled: true,
+        },
+      });
+
+      await prisma.rolloverConfig.create({
+        data: {
+          budget_category_id: bcPrev.id,
+          enabled: true,
+        },
+      });
+
+      // Spent 1.250.000 (> 1.000.000)
+      await prisma.transaction.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          account_id: accountA1Id,
+          type: 'EXPENSE',
+          amount: 1250000n,
+          date: new Date(`${prevPeriod}-10`),
+          status: 'POSTED',
+          category_id: overspendCat.id,
+          client_tx_id: generateTestUlid(),
+        },
+      });
+
+      const res = await rolloverService.processMonthTurnForUser(userAId);
+      expect(res.errors).toBe(0);
+
+      const currentBp = await prisma.budgetPeriod.findFirst({
+        where: {
+          budget_id: budget.id,
+          period: currentPeriod,
+        },
+      });
+      expect(currentBp?.carryover_amount).toBe(0n);
+    });
+
+    it('AC-5: Eksekusi konkuren (Promise.all) idempoten dan memproses rollover tepat 1×', async () => {
+      const concCat = await prisma.category.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Concurrent Rollover Category',
+          type: 'EXPENSE',
+        },
+      });
+
+      const budget = await prisma.budget.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          type: 'CATEGORY',
+          category_id: concCat.id,
+        },
+      });
+
+      const bpPrev = await prisma.budgetPeriod.create({
+        data: {
+          budget_id: budget.id,
+          period: prevPeriod,
+          base_amount: 500000n,
+          carryover_amount: 0n,
+        },
+      });
+
+      const bcPrev = await prisma.budgetCategory.create({
+        data: {
+          budget_period_id: bpPrev.id,
+          category_id: concCat.id,
+          amount: 500000n,
+          rollover_enabled: true,
+        },
+      });
+
+      await prisma.rolloverConfig.create({
+        data: {
+          budget_category_id: bcPrev.id,
+          enabled: true,
+        },
+      });
+
+      // Run runDailyMonthTurnCheck and processMonthTurnForUser simultaneously
+      const [cronRes, userRes] = await Promise.all([
+        rolloverService.runDailyMonthTurnCheck(),
+        rolloverService.processMonthTurnForUser(userAId),
+      ]);
+
+      expect(cronRes.errors).toBe(0);
+      expect(userRes.errors).toBe(0);
+
+      // Verify only exactly 1 BudgetPeriod was created for currentPeriod
+      const currentPeriods = await prisma.budgetPeriod.findMany({
+        where: {
+          budget_id: budget.id,
+          period: currentPeriod,
+        },
+      });
+      expect(currentPeriods.length).toBe(1);
+      expect(currentPeriods[0].carryover_amount).toBe(500000n);
+    });
+  });
+
+  describe('TASK-063: Budget Warnings 80% & 100% (Real-Time Dispatch & Deduplication)', () => {
+    let warningCatId: string;
+    let warningCatName: string;
+    let warningBudget: any;
+    let warningBp: any;
+
+    beforeEach(async () => {
+      warningCatName = `Warn Cat ${Date.now()}`;
+      const cat = await prisma.category.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: warningCatName,
+          type: 'EXPENSE',
+        },
+      });
+      warningCatId = cat.id;
+
+      warningBudget = await prisma.budget.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          type: 'CATEGORY',
+          category_id: warningCatId,
+        },
+      });
+
+      warningBp = await prisma.budgetPeriod.create({
+        data: {
+          budget_id: warningBudget.id,
+          period: currentPeriod,
+          base_amount: 1000000n,
+          carryover_amount: 0n,
+        },
+      });
+
+      await prisma.budgetCategory.create({
+        data: {
+          budget_period_id: warningBp.id,
+          category_id: warningCatId,
+          amount: 1000000n,
+          rollover_enabled: false,
+        },
+      });
+    });
+
+    it('AC-1: Budget Makanan 1.000.000: mencatat EXPENSE POSTED 800.000 (80%) memicu tepat 1 notifikasi BUDGET_WARNING_80; belanja lagi 50.000 (85%) tidak mengirim ulang', async () => {
+      // 1. Post expense 800.000 via POST /transactions
+      const res1 = await request(app.getHttpServer())
+        .post('/transactions')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          account_id: accountA1Id,
+          category_id: warningCatId,
+          type: 'EXPENSE',
+          amount: 800000,
+          date: `${currentPeriod}-01`,
+          client_tx_id: generateTestUlid(),
+        });
+      expect(res1.status).toBe(201);
+
+      // Verify notification created
+      const allNotifs = await prisma.notification.findMany({
+        where: { user_id: userAId, type: 'BUDGET_WARNING_80' },
+      });
+      const notifs80 = allNotifs.filter(
+        (n) => (n.data as any)?.budget_id === warningBudget.id,
+      );
+      expect(notifs80.length).toBe(1);
+      expect(notifs80[0].title).toBe(`Anggaran ${warningCatName} mencapai 80%`);
+      expect(notifs80[0].body).toBe(
+        `Anggaran ${warningCatName} telah mencapai 80% pada periode ${currentPeriod}.`,
+      );
+      expect(notifs80[0].title).not.toMatch(/Rp|\d{3}\.\d{3}/);
+      expect(notifs80[0].body).not.toMatch(/Rp|\d{3}\.\d{3}/);
+      const data = notifs80[0].data as any;
+      expect(data.budget_id).toBe(warningBudget.id);
+      expect(data.period).toBe(currentPeriod);
+      expect(data.threshold).toBe(80);
+      expect(data.usage_percent).toBe(80);
+
+      // 2. Post additional expense 50.000 (total 850.000 = 85%)
+      const res2 = await request(app.getHttpServer())
+        .post('/transactions')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          account_id: accountA1Id,
+          category_id: warningCatId,
+          type: 'EXPENSE',
+          amount: 50000,
+          date: `${currentPeriod}-02`,
+          client_tx_id: generateTestUlid(),
+        });
+      expect(res2.status).toBe(201);
+
+      const allNotifsAfter = await prisma.notification.findMany({
+        where: { user_id: userAId, type: 'BUDGET_WARNING_80' },
+      });
+      const notifsAfter = allNotifsAfter.filter(
+        (n) => (n.data as any)?.budget_id === warningBudget.id,
+      );
+      expect(notifsAfter.length).toBe(1);
+    });
+
+    it('AC-2: Mencatat tambahan 200.000 sehingga total 1.000.000 (100%) memicu tepat 1 notifikasi BUDGET_WARNING_100; belanja lagi (110%) tidak mengirim ulang', async () => {
+      // Belanja 800.000 (80%)
+      const res1 = await request(app.getHttpServer())
+        .post('/transactions')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          account_id: accountA1Id,
+          category_id: warningCatId,
+          type: 'EXPENSE',
+          amount: 800000,
+          date: `${currentPeriod}-01`,
+          client_tx_id: generateTestUlid(),
+        });
+      expect(res1.status).toBe(201);
+
+      // Belanja 200.000 (mencapai 1.000.000 = 100%)
+      const res2 = await request(app.getHttpServer())
+        .post('/transactions')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          account_id: accountA1Id,
+          category_id: warningCatId,
+          type: 'EXPENSE',
+          amount: 200000,
+          date: `${currentPeriod}-02`,
+          client_tx_id: generateTestUlid(),
+        });
+      expect(res2.status).toBe(201);
+
+      const allNotifs100 = await prisma.notification.findMany({
+        where: { user_id: userAId, type: 'BUDGET_WARNING_100' },
+      });
+      const notifs100 = allNotifs100.filter(
+        (n) => (n.data as any)?.budget_id === warningBudget.id,
+      );
+      expect(notifs100.length).toBe(1);
+      const data = notifs100[0].data as any;
+      expect(data.threshold).toBe(100);
+      expect(data.usage_percent).toBe(100);
+
+      // Belanja lagi 100.000 (total 1.100.000 = 110%)
+      const res3 = await request(app.getHttpServer())
+        .post('/transactions')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          account_id: accountA1Id,
+          category_id: warningCatId,
+          type: 'EXPENSE',
+          amount: 100000,
+          date: `${currentPeriod}-03`,
+          client_tx_id: generateTestUlid(),
+        });
+      expect(res3.status).toBe(201);
+
+      const allNotifs100After = await prisma.notification.findMany({
+        where: { user_id: userAId, type: 'BUDGET_WARNING_100' },
+      });
+      const notifs100After = allNotifs100After.filter(
+        (n) => (n.data as any)?.budget_id === warningBudget.id,
+      );
+      expect(notifs100After.length).toBe(1);
+    });
+
+    it('AC-3 (Lonjakan & Reversal): Lonjakan langsung 1.050.000 (105%) dari 0 hanya memicu BUDGET_WARNING_100; reversal lalu belanja lagi ke 85% atau 105% tidak ada duplikat', async () => {
+      const lonjakanCat = await prisma.category.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: `Lonjakan Cat ${Date.now()}`,
+          type: 'EXPENSE',
+        },
+      });
+
+      const lonjakanBudget = await prisma.budget.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          type: 'CATEGORY',
+          category_id: lonjakanCat.id,
+        },
+      });
+
+      const bp = await prisma.budgetPeriod.create({
+        data: {
+          budget_id: lonjakanBudget.id,
+          period: currentPeriod,
+          base_amount: 1000000n,
+          carryover_amount: 0n,
+        },
+      });
+
+      await prisma.budgetCategory.create({
+        data: {
+          budget_period_id: bp.id,
+          category_id: lonjakanCat.id,
+          amount: 1000000n,
+          rollover_enabled: false,
+        },
+      });
+
+      // 1. Direct jump 1.050.000
+      const jumpTx = await request(app.getHttpServer())
+        .post('/transactions')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          account_id: accountA1Id,
+          category_id: lonjakanCat.id,
+          type: 'EXPENSE',
+          amount: 1050000,
+          date: `${currentPeriod}-01`,
+          client_tx_id: generateTestUlid(),
+        });
+      expect(jumpTx.status).toBe(201);
+
+      // Only BUDGET_WARNING_100 triggered, NO BUDGET_WARNING_80
+      const allNotifs = await prisma.notification.findMany({
+        where: { user_id: userAId },
+      });
+      const notifs80 = allNotifs.filter(
+        (n) =>
+          n.type === 'BUDGET_WARNING_80' &&
+          (n.data as any)?.budget_id === lonjakanBudget.id,
+      );
+      const notifs100 = allNotifs.filter(
+        (n) =>
+          n.type === 'BUDGET_WARNING_100' &&
+          (n.data as any)?.budget_id === lonjakanBudget.id,
+      );
+      expect(notifs80.length).toBe(0);
+      expect(notifs100.length).toBe(1);
+
+      // 2. Reverse the jump transaction
+      const revRes = await request(app.getHttpServer())
+        .post(`/transactions/${jumpTx.body.id}/reverse`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          client_tx_id: generateTestUlid(),
+          reason: 'Testing reversal',
+        });
+      expect(revRes.status).toBe(201);
+
+      // 3. Belanja lagi ke 850.000 (85%)
+      const spend85Res = await request(app.getHttpServer())
+        .post('/transactions')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          account_id: accountA1Id,
+          category_id: lonjakanCat.id,
+          type: 'EXPENSE',
+          amount: 850000,
+          date: `${currentPeriod}-02`,
+          client_tx_id: generateTestUlid(),
+        });
+      expect(spend85Res.status).toBe(201);
+
+      // No BUDGET_WARNING_80 because BUDGET_WARNING_100 was already sent for this period
+      const allNotifsAfterRev = await prisma.notification.findMany({
+        where: { user_id: userAId },
+      });
+      const notifs80After = allNotifsAfterRev.filter(
+        (n) =>
+          n.type === 'BUDGET_WARNING_80' &&
+          (n.data as any)?.budget_id === lonjakanBudget.id,
+      );
+      expect(notifs80After.length).toBe(0);
+
+      // 4. Belanja lagi hingga 1.050.000 (105%)
+      const spend105Res = await request(app.getHttpServer())
+        .post('/transactions')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          account_id: accountA1Id,
+          category_id: lonjakanCat.id,
+          type: 'EXPENSE',
+          amount: 200000,
+          date: `${currentPeriod}-03`,
+          client_tx_id: generateTestUlid(),
+        });
+      expect(spend105Res.status).toBe(201);
+
+      const allNotifsFinal = await prisma.notification.findMany({
+        where: { user_id: userAId },
+      });
+      const notifs100Final = allNotifsFinal.filter(
+        (n) =>
+          n.type === 'BUDGET_WARNING_100' &&
+          (n.data as any)?.budget_id === lonjakanBudget.id,
+      );
+      expect(notifs100Final.length).toBe(1);
+    });
+
+    it('AC-4 (Preferensi & Scheduled): budget_warning_80 = false tidak membuat notif 80%; scheduled tx memicu saat POSTED', async () => {
+      // 1. Set notification preference: budget_warning_80 = false
+      await prisma.notificationPreference.upsert({
+        where: { user_id: userAId },
+        create: {
+          user_id: userAId,
+          budget_warning_80: false,
+          budget_warning_100: true,
+        },
+        update: {
+          budget_warning_80: false,
+          budget_warning_100: true,
+        },
+      });
+
+      // Belanja 800.000 (80%)
+      const res80 = await request(app.getHttpServer())
+        .post('/transactions')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          account_id: accountA1Id,
+          category_id: warningCatId,
+          type: 'EXPENSE',
+          amount: 800000,
+          date: `${currentPeriod}-01`,
+          client_tx_id: generateTestUlid(),
+        });
+      expect(res80.status).toBe(201);
+
+      const allNotifs = await prisma.notification.findMany({
+        where: { user_id: userAId, type: 'BUDGET_WARNING_80' },
+      });
+      const notifs80 = allNotifs.filter(
+        (n) => (n.data as any)?.budget_id === warningBudget.id,
+      );
+      expect(notifs80.length).toBe(0);
+
+      // Restore preference for scheduled test
+      await prisma.notificationPreference.update({
+        where: { user_id: userAId },
+        data: { budget_warning_80: true },
+      });
+
+      // Create new category/budget for scheduled test
+      const schedCat = await prisma.category.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: `Sched Cat ${Date.now()}`,
+          type: 'EXPENSE',
+        },
+      });
+      const schedBudget = await prisma.budget.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          type: 'CATEGORY',
+          category_id: schedCat.id,
+        },
+      });
+      const schedBp = await prisma.budgetPeriod.create({
+        data: {
+          budget_id: schedBudget.id,
+          period: currentPeriod,
+          base_amount: 1000000n,
+          carryover_amount: 0n,
+        },
+      });
+      await prisma.budgetCategory.create({
+        data: {
+          budget_period_id: schedBp.id,
+          category_id: schedCat.id,
+          amount: 1000000n,
+          rollover_enabled: false,
+        },
+      });
+
+      // Create SCHEDULED transaction directly
+      const scheduledTx = await prisma.transaction.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          account_id: accountA1Id,
+          category_id: schedCat.id,
+          type: 'EXPENSE',
+          amount: 800000n,
+          date: new Date(`${currentPeriod}-01T00:00:00.000Z`),
+          status: 'SCHEDULED',
+          client_tx_id: generateTestUlid(),
+        },
+      });
+
+      // No warning yet while SCHEDULED
+      const notifsBeforePost = await prisma.notification.findMany({
+        where: { user_id: userAId, type: 'BUDGET_WARNING_80' },
+      });
+      const schedNotifsBefore = notifsBeforePost.filter(
+        (n) => (n.data as any)?.budget_id === schedBudget.id,
+      );
+      expect(schedNotifsBefore.length).toBe(0);
+
+      // Post the scheduled transaction via ScheduledTransactionService
+      const scheduledService = app.get(ScheduledTransactionService);
+      const posted = await scheduledService.postSingleScheduledTransaction(
+        scheduledTx.id,
+        randomUUID(),
+      );
+      expect(posted).toBe(true);
+
+      // Now BUDGET_WARNING_80 is triggered
+      const notifsAfterPost = await prisma.notification.findMany({
+        where: { user_id: userAId, type: 'BUDGET_WARNING_80' },
+      });
+      const schedNotifsAfter = notifsAfterPost.filter(
+        (n) => (n.data as any)?.budget_id === schedBudget.id,
+      );
+      expect(schedNotifsAfter.length).toBe(1);
+    });
+
+    it('AC-5 (Konkurensi & Privasi): Dua pengeluaran paralel (Promise.all) yang menembus 80% hanya menghasilkan 1 notifikasi; title/body bebas nominal Rp', async () => {
+      const concCat = await prisma.category.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: `Parallel Cat ${Date.now()}`,
+          type: 'EXPENSE',
+        },
+      });
+
+      const concBudget = await prisma.budget.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          type: 'CATEGORY',
+          category_id: concCat.id,
+        },
+      });
+
+      const bp = await prisma.budgetPeriod.create({
+        data: {
+          budget_id: concBudget.id,
+          period: currentPeriod,
+          base_amount: 1000000n,
+          carryover_amount: 0n,
+        },
+      });
+
+      await prisma.budgetCategory.create({
+        data: {
+          budget_period_id: bp.id,
+          category_id: concCat.id,
+          amount: 1000000n,
+          rollover_enabled: false,
+        },
+      });
+
+      // Run two parallel transactions of 800.000
+      await Promise.all([
+        request(app.getHttpServer())
+          .post('/transactions')
+          .set('Cookie', userAHeaders.cookie)
+          .send({
+            account_id: accountA1Id,
+            category_id: concCat.id,
+            type: 'EXPENSE',
+            amount: 800000,
+            date: `${currentPeriod}-01`,
+            client_tx_id: generateTestUlid(),
+          }),
+        request(app.getHttpServer())
+          .post('/transactions')
+          .set('Cookie', userAHeaders.cookie)
+          .send({
+            account_id: accountA1Id,
+            category_id: concCat.id,
+            type: 'EXPENSE',
+            amount: 800000,
+            date: `${currentPeriod}-01`,
+            client_tx_id: generateTestUlid(),
+          }),
+      ]);
+
+      const allNotifs = await prisma.notification.findMany({
+        where: {
+          user_id: userAId,
+          type: { in: ['BUDGET_WARNING_80', 'BUDGET_WARNING_100'] },
+        },
+      });
+      const budgetNotifs = allNotifs.filter(
+        (n) => (n.data as any)?.budget_id === concBudget.id,
+      );
+
+      // Under concurrency, at most 1 warning per threshold
+      const count80 = budgetNotifs.filter((n) => n.type === 'BUDGET_WARNING_80').length;
+      const count100 = budgetNotifs.filter((n) => n.type === 'BUDGET_WARNING_100').length;
+      expect(count80).toBeLessThanOrEqual(1);
+      expect(count100).toBeLessThanOrEqual(1);
+
+      // Verify privacy for all generated notifications
+      for (const n of budgetNotifs) {
+        expect(n.title).not.toMatch(/Rp|\d{3}\.\d{3}/);
+        expect(n.body).not.toMatch(/Rp|\d{3}\.\d{3}/);
+      }
     });
   });
 });

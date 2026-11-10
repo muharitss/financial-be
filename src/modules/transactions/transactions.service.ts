@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import {
   Injectable,
+  Logger,
+  Optional,
   NotFoundException,
   ConflictException,
   BadRequestException,
@@ -9,6 +11,7 @@ import {
 } from '@nestjs/common';
 import { Prisma, TransactionStatus } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service.js';
+import { BudgetWarningService } from '../budgets/budget-warning.service.js';
 import { todayInTz } from '../../common/utils/date.js';
 import { evaluateNegativeBalancePolicy } from './balance-policy.js';
 import {
@@ -159,30 +162,58 @@ export async function getAccountReserved(
 
 @Injectable()
 export class TransactionsService {
-  constructor(private readonly prisma: PrismaService) {}
+  private readonly logger = new Logger(TransactionsService.name);
+
+  constructor(
+    private readonly prisma: PrismaService,
+    @Optional() private readonly budgetWarningService?: BudgetWarningService,
+  ) {}
 
   async create(
     user: { userId: string; role?: string },
     dto: CreateTransactionDto,
     headerIdempotencyKey?: string,
   ): Promise<TransactionResponse> {
+    let res: TransactionResponse;
     if (dto.type === 'INCOME') {
-      return this.createIncome(user, dto, headerIdempotencyKey);
-    }
-    if (dto.type === 'EXPENSE') {
-      return this.createExpense(user, dto, headerIdempotencyKey);
-    }
-    if (dto.type === 'TRANSFER') {
-      return this.createTransfer(user, dto, headerIdempotencyKey);
-    }
-    if (dto.type === 'ADJUSTMENT') {
-      return this.createAdjustment(user, dto, undefined, headerIdempotencyKey);
+      res = await this.createIncome(user, dto, headerIdempotencyKey);
+    } else if (dto.type === 'EXPENSE') {
+      res = await this.createExpense(user, dto, headerIdempotencyKey);
+    } else if (dto.type === 'TRANSFER') {
+      res = await this.createTransfer(user, dto, headerIdempotencyKey);
+    } else if (dto.type === 'ADJUSTMENT') {
+      res = await this.createAdjustment(user, dto, undefined, headerIdempotencyKey);
+    } else {
+      throw new BadRequestException({
+        code: 'UNSUPPORTED_TRANSACTION_TYPE',
+        message: `Tipe transaksi ${(dto as any).type} belum didukung`,
+      });
     }
 
-    throw new BadRequestException({
-      code: 'UNSUPPORTED_TRANSACTION_TYPE',
-      message: `Tipe transaksi ${(dto as any).type} belum didukung`,
-    });
+    if (res.status === 'POSTED') {
+      const isExpense = res.type === 'EXPENSE';
+      const isTransferWithFee =
+        res.type === 'TRANSFER' &&
+        res.fee_mode === 'SEPARATE' &&
+        res.transfer_fee !== null &&
+        res.transfer_fee > 0;
+
+      if (isExpense || isTransferWithFee) {
+        const affectedPeriod = res.date.slice(0, 7);
+        try {
+          await this.budgetWarningService?.evaluateForPeriod(
+            user.userId,
+            affectedPeriod,
+          );
+        } catch (err: any) {
+          this.logger.warn(
+            `Failed to evaluate budget warnings for user ${user.userId}: ${err.message}`,
+          );
+        }
+      }
+    }
+
+    return res;
   }
 
   private async createIncome(
@@ -1160,7 +1191,7 @@ export class TransactionsService {
     const clientTxId = resolveClientTxId(dto.client_tx_id, headerIdempotencyKey);
 
     try {
-      return await this.prisma.$transaction(async (tx) => {
+      const result = await this.prisma.$transaction(async (tx) => {
         // 1. Kunci baris transaksi dengan SELECT ... FOR UPDATE (isolasi user_id)
         const existingTxs = await tx.$queryRaw<
           Array<{
@@ -1611,6 +1642,25 @@ export class TransactionsService {
           ...(warning ? { warning } : {}),
         };
       });
+
+      if (
+        result.transaction.type === 'EXPENSE' &&
+        result.transaction.status === 'POSTED'
+      ) {
+        const affectedPeriod = result.transaction.date.slice(0, 7);
+        try {
+          await this.budgetWarningService?.evaluateForPeriod(
+            user.userId,
+            affectedPeriod,
+          );
+        } catch (err: any) {
+          this.logger.warn(
+            `Failed to evaluate budget warnings for user ${user.userId}: ${err.message}`,
+          );
+        }
+      }
+
+      return result;
     } catch (error: any) {
       if (
         error instanceof Prisma.PrismaClientKnownRequestError &&

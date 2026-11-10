@@ -1,5 +1,6 @@
 import {
   Injectable,
+  Optional,
   UnauthorizedException,
   ConflictException,
   ForbiddenException,
@@ -11,6 +12,7 @@ import { randomBytes, createHash } from 'node:crypto';
 import { LoginCooldownTracker } from '../../common/throttler/throttler.config.js';
 import { PrismaService } from '../../prisma/prisma.service.js';
 import { ScheduledTransactionService } from '../transactions/scheduled-transaction.service.js';
+import { BudgetRolloverService } from '../budgets/budget-rollover.service.js';
 import type { RegisterDto, LoginDto } from './dto/auth.dto.js';
 import { seedDefaultCategories } from '../categories/default-categories.js';
 
@@ -22,7 +24,8 @@ export class AuthService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly jwtService: JwtService,
-    private readonly scheduledTransactionService?: ScheduledTransactionService,
+    @Optional() private readonly scheduledTransactionService?: ScheduledTransactionService,
+    @Optional() private readonly budgetRolloverService?: BudgetRolloverService,
   ) {}
 
   async register(dto: RegisterDto) {
@@ -264,6 +267,14 @@ export class AuthService {
       .catch((err) => {
         this.logger.warn(
           `Failed to process scheduled transactions on login for user ${userId}: ${err.message}`,
+        );
+      });
+
+    this.budgetRolloverService
+      ?.processMonthTurnForUser(userId)
+      .catch((err) => {
+        this.logger.warn(
+          `Failed to process budget rollover on login for user ${userId}: ${err.message}`,
         );
       });
   }

@@ -12,6 +12,7 @@ import { AccountsModule } from './modules/accounts/accounts.module.js';
 import { TransactionsModule } from './modules/transactions/transactions.module.js';
 import { TagsModule } from './modules/tags/tags.module.js';
 import { BudgetsModule } from './modules/budgets/budgets.module.js';
+import { NotificationsModule } from './modules/notifications/notifications.module.js';
 import { LoggerModule } from './common/logger/logger.module.js';
 import { TraceMiddleware } from './common/logger/trace.middleware.js';
 import { throttlerConfig } from './common/throttler/throttler.config.js';
@@ -34,6 +35,7 @@ export const { ObserveModule, ObserveInstrument } = createObserveModule();
     TransactionsModule,
     TagsModule,
     BudgetsModule,
+    NotificationsModule,
     HealthModule,
     ObserveModule.forRoot({
       appKey: process.env.OBSERVE_APP_KEY ?? 'YOUR_APP_KEY',
