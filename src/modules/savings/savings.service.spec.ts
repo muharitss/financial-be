@@ -12,13 +12,19 @@ import {
   toSavingsGoalResponse,
   toAllocationResponse,
 } from './savings.service.js';
+import { SavingsAchievementService } from './savings-achievement.service.js';
 import { PrismaService } from '../../prisma/prisma.service.js';
 
 describe('SavingsService', () => {
   let service: SavingsService;
   let prisma: any;
+  let savingsAchievementService: any;
 
   beforeEach(async () => {
+    savingsAchievementService = {
+      notifyIfFirstTimeAchieved: jest.fn().mockResolvedValue(undefined),
+    };
+
     prisma = {
       financialProfile: {
         findFirst: jest.fn(),
@@ -29,6 +35,7 @@ describe('SavingsService', () => {
       savingsGoal: {
         create: jest.fn(),
         findFirst: jest.fn(),
+        findMany: jest.fn(),
         update: jest.fn(),
       },
       savingsAllocation: {
@@ -36,6 +43,7 @@ describe('SavingsService', () => {
         aggregate: jest.fn(),
         count: jest.fn(),
         update: jest.fn(),
+        groupBy: jest.fn(),
       },
       account: {
         findFirst: jest.fn(),
@@ -52,6 +60,7 @@ describe('SavingsService', () => {
       providers: [
         SavingsService,
         { provide: PrismaService, useValue: prisma },
+        { provide: SavingsAchievementService, useValue: savingsAchievementService },
       ],
     }).compile();
 
@@ -792,6 +801,11 @@ describe('SavingsService', () => {
       expect(res.goal.achieved_at).not.toBeNull();
       expect(res.goal.progress_percent).toBe(100);
       expect(res.goal.remaining_amount).toBe(0);
+      expect(savingsAchievementService.notifyIfFirstTimeAchieved).toHaveBeenCalledWith(
+        user.userId,
+        expect.anything(),
+        100,
+      );
     });
   });
 
@@ -970,6 +984,168 @@ describe('SavingsService', () => {
       await expect(
         service.releaseAllocation(user, goalId, 'missing-allocation'),
       ).rejects.toThrow(NotFoundException);
+    });
+  });
+
+  describe('listGoals', () => {
+    const userId = 'user-uuid-1';
+
+    it('AC-1: mengembalikan array kosong langsung tanpa groupBy jika tidak ada goal', async () => {
+      prisma.savingsGoal.findMany.mockResolvedValue([]);
+
+      const res = await service.listGoals(userId);
+
+      expect(res).toEqual([]);
+      expect(prisma.savingsGoal.findMany).toHaveBeenCalledWith({
+        where: { user_id: userId, status: { not: 'ARCHIVED' } },
+        orderBy: { created_at: 'desc' },
+      });
+      expect(prisma.savingsAllocation.groupBy).not.toHaveBeenCalled();
+    });
+
+    it('AC-1: mengembalikan goal dengan current_amount, remaining_amount, dan progress_percent dalam maksimal 2 query Prisma', async () => {
+      const mockGoals = [
+        {
+          id: 'goal-1',
+          name: 'Dana Darurat',
+          target_amount: 10000000n,
+          target_date: new Date('2027-01-01T00:00:00.000Z'),
+          note: null,
+          status: SavingsGoalStatus.ACTIVE,
+          achieved_at: null,
+          created_at: new Date('2026-11-01T10:00:00.000Z'),
+          updated_at: new Date('2026-11-01T10:00:00.000Z'),
+        },
+        {
+          id: 'goal-2',
+          name: 'Beli Laptop',
+          target_amount: 20000000n,
+          target_date: null,
+          note: null,
+          status: SavingsGoalStatus.ACTIVE,
+          achieved_at: null,
+          created_at: new Date('2026-11-02T10:00:00.000Z'),
+          updated_at: new Date('2026-11-02T10:00:00.000Z'),
+        },
+      ];
+
+      prisma.savingsGoal.findMany.mockResolvedValue(mockGoals);
+      prisma.savingsAllocation.groupBy.mockResolvedValue([
+        { savings_goal_id: 'goal-1', _sum: { amount: 2500000n } },
+      ]);
+
+      const res = await service.listGoals(userId, false);
+
+      expect(res).toHaveLength(2);
+      expect(res[0]).toMatchObject({
+        id: 'goal-1',
+        current_amount: 2500000,
+        remaining_amount: 7500000,
+        progress_percent: 25,
+      });
+      expect(res[1]).toMatchObject({
+        id: 'goal-2',
+        current_amount: 0,
+        remaining_amount: 20000000,
+        progress_percent: 0,
+      });
+
+      expect(prisma.savingsGoal.findMany).toHaveBeenCalledTimes(1);
+      expect(prisma.savingsAllocation.groupBy).toHaveBeenCalledTimes(1);
+    });
+
+    it('AC-1: menyertakan goal ARCHIVED jika includeArchived = true', async () => {
+      prisma.savingsGoal.findMany.mockResolvedValue([]);
+
+      await service.listGoals(userId, true);
+
+      expect(prisma.savingsGoal.findMany).toHaveBeenCalledWith({
+        where: { user_id: userId },
+        orderBy: { created_at: 'desc' },
+      });
+    });
+  });
+
+  describe('getGoalDetail', () => {
+    const userId = 'user-uuid-1';
+    const goalId = 'goal-uuid-1';
+
+    it('AC-2: mengembalikan detail goal beserta riwayat alokasi ACTIVE dan RELEASED', async () => {
+      const mockGoalWithAllocations = {
+        id: goalId,
+        name: 'Dana Darurat',
+        target_amount: 5000000n,
+        target_date: null,
+        note: 'Penting',
+        status: SavingsGoalStatus.ACTIVE,
+        achieved_at: null,
+        created_at: new Date('2026-11-01T10:00:00.000Z'),
+        updated_at: new Date('2026-11-01T10:00:00.000Z'),
+        allocations: [
+          {
+            id: 'alloc-1',
+            account_id: 'acc-1',
+            amount: 1000000n,
+            status: 'ACTIVE',
+            allocated_at: new Date('2026-11-02T10:00:00.000Z'),
+            released_at: null,
+            release_reason: null,
+            account: { id: 'acc-1', name: 'BCA Utama', type: 'BANK' },
+          },
+          {
+            id: 'alloc-2',
+            account_id: 'acc-2',
+            amount: 500000n,
+            status: 'RELEASED',
+            allocated_at: new Date('2026-11-01T11:00:00.000Z'),
+            released_at: new Date('2026-11-01T12:00:00.000Z'),
+            release_reason: 'Darurat',
+            account: { id: 'acc-2', name: 'Mandiri', type: 'BANK' },
+          },
+        ],
+      };
+
+      prisma.savingsGoal.findFirst.mockResolvedValue(mockGoalWithAllocations);
+
+      const res = await service.getGoalDetail(userId, goalId);
+
+      expect(res.goal).toMatchObject({
+        id: goalId,
+        current_amount: 1000000,
+        remaining_amount: 4000000,
+        progress_percent: 20,
+      });
+      expect(res.allocations).toHaveLength(2);
+      expect(res.allocations[0]).toEqual({
+        id: 'alloc-1',
+        account_id: 'acc-1',
+        account_name: 'BCA Utama',
+        account_type: 'BANK',
+        amount: 1000000,
+        status: 'ACTIVE',
+        allocated_at: mockGoalWithAllocations.allocations[0].allocated_at,
+        released_at: null,
+        release_reason: null,
+      });
+      expect(res.allocations[1]).toEqual({
+        id: 'alloc-2',
+        account_id: 'acc-2',
+        account_name: 'Mandiri',
+        account_type: 'BANK',
+        amount: 500000,
+        status: 'RELEASED',
+        allocated_at: mockGoalWithAllocations.allocations[1].allocated_at,
+        released_at: mockGoalWithAllocations.allocations[1].released_at,
+        release_reason: 'Darurat',
+      });
+    });
+
+    it('AC-2: melempar 404 GOAL_NOT_FOUND jika goal tidak ditemukan atau milik user lain', async () => {
+      prisma.savingsGoal.findFirst.mockResolvedValue(null);
+
+      await expect(service.getGoalDetail(userId, 'non-existent')).rejects.toThrow(
+        NotFoundException,
+      );
     });
   });
 });

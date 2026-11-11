@@ -32,11 +32,12 @@ describe('Savings E2E Test Suite (Supertest)', () => {
     throttlerStorage = app.get(ThrottlerStorage);
 
     // Clean up test data
+    await prisma.asSystem().notification.deleteMany();
     await prisma.asSystem().savingsAllocation.deleteMany();
     await prisma.asSystem().savingsGoal.deleteMany();
     await prisma.asSystem().auditLog.deleteMany({
       where: {
-        resource_type: 'savings_goal',
+        resource_type: { in: ['savings_goal', 'savings_allocation'] },
       },
     });
     await prisma.asSystem().user.deleteMany({
@@ -95,11 +96,12 @@ describe('Savings E2E Test Suite (Supertest)', () => {
   });
 
   afterAll(async () => {
+    await prisma.asSystem().notification.deleteMany();
     await prisma.asSystem().savingsAllocation.deleteMany();
     await prisma.asSystem().savingsGoal.deleteMany();
     await prisma.asSystem().auditLog.deleteMany({
       where: {
-        resource_type: 'savings_goal',
+        resource_type: { in: ['savings_goal', 'savings_allocation'] },
       },
     });
     await prisma.asSystem().user.deleteMany({
@@ -952,6 +954,362 @@ describe('Savings E2E Test Suite (Supertest)', () => {
         .send();
       expect(resDiffGoal.status).toBe(404);
       expect(resDiffGoal.body.code).toBe('ALLOCATION_NOT_FOUND');
+    });
+  });
+
+  describe('GET /savings/goals (AC-1)', () => {
+    let goalActive1Id: string;
+    let goalActive2Id: string;
+    let goalArchivedId: string;
+
+    beforeEach(async () => {
+      // 1. Goal 1: Target 1.000.000, alokasi 400.000
+      const res1 = await request(app.getHttpServer())
+        .post('/savings/goals')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          name: `List Goal 1 ${Date.now()}`,
+          target_amount: 1000000,
+        });
+      expect(res1.status).toBe(201);
+      goalActive1Id = res1.body.id;
+
+      await request(app.getHttpServer())
+        .post(`/savings/goals/${goalActive1Id}/allocations`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          account_id: accountAId,
+          amount: 400000,
+        });
+
+      // 2. Goal 2: Target 2.000.000, alokasi 0
+      const res2 = await request(app.getHttpServer())
+        .post('/savings/goals')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          name: `List Goal 2 ${Date.now()}`,
+          target_amount: 2000000,
+        });
+      expect(res2.status).toBe(201);
+      goalActive2Id = res2.body.id;
+
+      // 3. Goal 3: Target 500.000, diarsipkan
+      const res3 = await request(app.getHttpServer())
+        .post('/savings/goals')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          name: `List Goal Archived ${Date.now()}`,
+          target_amount: 500000,
+        });
+      expect(res3.status).toBe(201);
+      goalArchivedId = res3.body.id;
+
+      await request(app.getHttpServer())
+        .post(`/savings/goals/${goalArchivedId}/archive`)
+        .set('Cookie', userAHeaders.cookie);
+    });
+
+    it('AC-1: mengembalikan seluruh goal non-arsip milik user dengan progress integer akurat tanpa menyertakan goal ARCHIVED', async () => {
+      const res = await request(app.getHttpServer())
+        .get('/savings/goals')
+        .set('Cookie', userAHeaders.cookie);
+
+      expect(res.status).toBe(200);
+      expect(Array.isArray(res.body)).toBe(true);
+
+      const ids = res.body.map((g: any) => g.id);
+      expect(ids).toContain(goalActive1Id);
+      expect(ids).toContain(goalActive2Id);
+      expect(ids).not.toContain(goalArchivedId);
+
+      const g1 = res.body.find((g: any) => g.id === goalActive1Id);
+      expect(g1.current_amount).toBe(400000);
+      expect(g1.remaining_amount).toBe(600000);
+      expect(g1.progress_percent).toBe(40);
+      expect(Number.isInteger(g1.progress_percent)).toBe(true);
+
+      const g2 = res.body.find((g: any) => g.id === goalActive2Id);
+      expect(g2.current_amount).toBe(0);
+      expect(g2.remaining_amount).toBe(2000000);
+      expect(g2.progress_percent).toBe(0);
+    });
+
+    it('AC-1: menyertakan goal ARCHIVED saat include_archived=true', async () => {
+      const res = await request(app.getHttpServer())
+        .get('/savings/goals?include_archived=true')
+        .set('Cookie', userAHeaders.cookie);
+
+      expect(res.status).toBe(200);
+      const ids = res.body.map((g: any) => g.id);
+      expect(ids).toContain(goalActive1Id);
+      expect(ids).toContain(goalActive2Id);
+      expect(ids).toContain(goalArchivedId);
+
+      const archivedGoal = res.body.find((g: any) => g.id === goalArchivedId);
+      expect(archivedGoal.status).toBe('ARCHIVED');
+    });
+
+    it('AC-1: isolasi tenant: User B hanya melihat goal miliknya sendiri', async () => {
+      const resB = await request(app.getHttpServer())
+        .get('/savings/goals')
+        .set('Cookie', userBHeaders.cookie);
+
+      expect(resB.status).toBe(200);
+      const ids = resB.body.map((g: any) => g.id);
+      expect(ids).not.toContain(goalActive1Id);
+      expect(ids).not.toContain(goalActive2Id);
+    });
+  });
+
+  describe('GET /savings/goals/:id (AC-2)', () => {
+    let detailGoalId: string;
+    let alloc1Id: string;
+    let alloc2Id: string;
+
+    beforeEach(async () => {
+      const goalRes = await request(app.getHttpServer())
+        .post('/savings/goals')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          name: `Detail Goal ${Date.now()}`,
+          target_amount: 1000000,
+        });
+      expect(goalRes.status).toBe(201);
+      detailGoalId = goalRes.body.id;
+
+      // Alokasi 1: 400.000 lalu dilepaskan
+      const alloc1Res = await request(app.getHttpServer())
+        .post(`/savings/goals/${detailGoalId}/allocations`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          account_id: accountAId,
+          amount: 400000,
+        });
+      alloc1Id = alloc1Res.body.allocation.id;
+
+      await request(app.getHttpServer())
+        .post(`/savings/goals/${detailGoalId}/allocations/${alloc1Id}/release`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({ reason: 'Butuh darurat' });
+
+      // Alokasi 2: 300.000 (tetap ACTIVE)
+      const alloc2Res = await request(app.getHttpServer())
+        .post(`/savings/goals/${detailGoalId}/allocations`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          account_id: accountAId,
+          amount: 300000,
+        });
+      alloc2Id = alloc2Res.body.allocation.id;
+    });
+
+    it('AC-2: mengembalikan detail goal beserta seluruh riwayat alokasi ACTIVE dan RELEASED dengan account_name', async () => {
+      const res = await request(app.getHttpServer())
+        .get(`/savings/goals/${detailGoalId}`)
+        .set('Cookie', userAHeaders.cookie);
+
+      expect(res.status).toBe(200);
+      expect(res.body.goal).toMatchObject({
+        id: detailGoalId,
+        current_amount: 300000,
+        remaining_amount: 700000,
+        progress_percent: 30,
+        status: 'ACTIVE',
+      });
+
+      expect(res.body.allocations).toHaveLength(2);
+
+      // Urut allocated_at desc: alokasi 2 terbaru di posisi pertama
+      const itemActive = res.body.allocations.find((a: any) => a.id === alloc2Id);
+      expect(itemActive).toMatchObject({
+        id: alloc2Id,
+        account_id: accountAId,
+        account_name: 'BCA User A Savings',
+        account_type: 'BANK',
+        amount: 300000,
+        status: 'ACTIVE',
+        released_at: null,
+        release_reason: null,
+      });
+
+      const itemReleased = res.body.allocations.find((a: any) => a.id === alloc1Id);
+      expect(itemReleased).toMatchObject({
+        id: alloc1Id,
+        account_id: accountAId,
+        account_name: 'BCA User A Savings',
+        account_type: 'BANK',
+        amount: 400000,
+        status: 'RELEASED',
+        release_reason: 'Butuh darurat',
+      });
+      expect(itemReleased.released_at).not.toBeNull();
+    });
+
+    it('AC-2: User B yang mengakses ID milik User A mendapat 404 GOAL_NOT_FOUND', async () => {
+      const res = await request(app.getHttpServer())
+        .get(`/savings/goals/${detailGoalId}`)
+        .set('Cookie', userBHeaders.cookie);
+
+      expect(res.status).toBe(404);
+      expect(res.body.code).toBe('GOAL_NOT_FOUND');
+    });
+
+    it('AC-2: ID target yang tidak ada mendapat 404 GOAL_NOT_FOUND', async () => {
+      const res = await request(app.getHttpServer())
+        .get('/savings/goals/00000000-0000-0000-0000-000000000000')
+        .set('Cookie', userAHeaders.cookie);
+
+      expect(res.status).toBe(404);
+      expect(res.body.code).toBe('GOAL_NOT_FOUND');
+    });
+  });
+
+  describe('Notifikasi SAVINGS_ACHIEVED (AC-3, AC-4, AC-5)', () => {
+    it('AC-3: saat alokasi membuat target tabungan tercapai pertama kali, sistem mengirim tepat 1 notifikasi SAVINGS_ACHIEVED tanpa nominal Rupiah', async () => {
+      // 1. Buat target tabungan 500.000
+      const goalRes = await request(app.getHttpServer())
+        .post('/savings/goals')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          name: `Target Gadget Impian ${Date.now()}`,
+          target_amount: 500000,
+        });
+      expect(goalRes.status).toBe(201);
+      const goalId = goalRes.body.id;
+
+      // 2. Alokasikan 500.000 hingga 100%
+      const allocRes = await request(app.getHttpServer())
+        .post(`/savings/goals/${goalId}/allocations`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          account_id: accountAId,
+          amount: 500000,
+        });
+      expect(allocRes.status).toBe(201);
+      expect(allocRes.body.goal.status).toBe('ACHIEVED');
+
+      // 3. Periksa notifikasi di DB
+      const notifications = await prisma.asSystem().notification.findMany({
+        where: {
+          user_id: userAId,
+          type: 'SAVINGS_ACHIEVED',
+        },
+      });
+
+      const goalNotifs = notifications.filter(
+        (n) => (n.data as any)?.savings_goal_id === goalId,
+      );
+      expect(goalNotifs).toHaveLength(1);
+
+      const notif = goalNotifs[0];
+      expect(notif.title).toBe('Target Tabungan Tercapai!');
+      expect(notif.body).toContain('Target Gadget Impian');
+      expect(notif.body).toContain('100%');
+      // Privasi layar kunci: TIDAK boleh ada teks "Rp" atau angka nominal 500000 di title/body
+      expect(notif.title).not.toMatch(/Rp/i);
+      expect(notif.body).not.toMatch(/Rp/i);
+      expect(notif.body).not.toContain('500.000');
+      expect(notif.body).not.toContain('500000');
+    });
+
+    it('AC-4: deduplikasi siklus Release -> Re-allocate tidak mengirim notifikasi kedua', async () => {
+      // 1. Buat target 400.000
+      const goalRes = await request(app.getHttpServer())
+        .post('/savings/goals')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          name: `Target Dedup Notif ${Date.now()}`,
+          target_amount: 400000,
+        });
+      const goalId = goalRes.body.id;
+
+      // 2. Alokasikan 400.000 -> ACHIEVED (notifikasi pertama terkirim)
+      const allocRes = await request(app.getHttpServer())
+        .post(`/savings/goals/${goalId}/allocations`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          account_id: accountAId,
+          amount: 400000,
+        });
+      const allocId = allocRes.body.allocation.id;
+
+      // 3. Lepaskan alokasi -> Goal kembali ACTIVE
+      const releaseRes = await request(app.getHttpServer())
+        .post(`/savings/goals/${goalId}/allocations/${allocId}/release`)
+        .set('Cookie', userAHeaders.cookie)
+        .send();
+      expect(releaseRes.body.goal.status).toBe('ACTIVE');
+
+      // 4. Alokasikan ulang 400.000 -> Goal kembali ACHIEVED
+      await request(app.getHttpServer())
+        .post(`/savings/goals/${goalId}/allocations`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          account_id: accountAId,
+          amount: 400000,
+        });
+
+      // 5. Total notifikasi untuk goal ini HARUS tetap 1
+      const notifications = await prisma.asSystem().notification.findMany({
+        where: {
+          user_id: userAId,
+          type: 'SAVINGS_ACHIEVED',
+        },
+      });
+      const goalNotifs = notifications.filter(
+        (n) => (n.data as any)?.savings_goal_id === goalId,
+      );
+      expect(goalNotifs).toHaveLength(1);
+    });
+
+    it('AC-5: jika preferensi savings_achieved = false, tidak ada notifikasi yang dikirim saat goal tercapai', async () => {
+      // 1. Matikan preferensi savings_achieved
+      await prisma.asSystem().notificationPreference.upsert({
+        where: { user_id: userAId },
+        update: { savings_achieved: false },
+        create: {
+          user_id: userAId,
+          savings_achieved: false,
+        },
+      });
+
+      // 2. Buat target baru 300.000 dan capai 100%
+      const goalRes = await request(app.getHttpServer())
+        .post('/savings/goals')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          name: `Target Notif Disabled ${Date.now()}`,
+          target_amount: 300000,
+        });
+      const goalId = goalRes.body.id;
+
+      const allocRes = await request(app.getHttpServer())
+        .post(`/savings/goals/${goalId}/allocations`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          account_id: accountAId,
+          amount: 300000,
+        });
+      expect(allocRes.status).toBe(201);
+      expect(allocRes.body.goal.status).toBe('ACHIEVED');
+
+      // 3. Periksa notifikasi: tidak ada untuk goal ini
+      const notifications = await prisma.asSystem().notification.findMany({
+        where: {
+          user_id: userAId,
+          type: 'SAVINGS_ACHIEVED',
+        },
+      });
+      const goalNotifs = notifications.filter(
+        (n) => (n.data as any)?.savings_goal_id === goalId,
+      );
+      expect(goalNotifs).toHaveLength(0);
+
+      // Kembalikan preferensi ke true
+      await prisma.asSystem().notificationPreference.update({
+        where: { user_id: userAId },
+        data: { savings_achieved: true },
+      });
     });
   });
 });

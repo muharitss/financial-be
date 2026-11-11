@@ -8,6 +8,7 @@ import {
 import { Prisma, SavingsGoalStatus } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service.js';
 import { todayInTz } from '../../common/utils/date.js';
+import { SavingsAchievementService } from './savings-achievement.service.js';
 import type {
   CreateSavingsGoalDto,
   UpdateSavingsGoalDto,
@@ -48,6 +49,23 @@ export interface AllocateGoalResponse {
 }
 
 export type ReleaseAllocationResponse = AllocateGoalResponse;
+
+export interface AllocationHistoryItem {
+  id: string;
+  account_id: string;
+  account_name: string;
+  account_type: string;
+  amount: number;
+  status: 'ACTIVE' | 'RELEASED';
+  allocated_at: Date;
+  released_at: Date | null;
+  release_reason: string | null;
+}
+
+export interface GoalDetailResponse {
+  goal: SavingsGoalResponse;
+  allocations: AllocationHistoryItem[];
+}
 
 export function toAllocationResponse(allocation: {
   id: string;
@@ -117,7 +135,10 @@ export function toSavingsGoalResponse(
 
 @Injectable()
 export class SavingsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly savingsAchievementService: SavingsAchievementService,
+  ) {}
 
   toSavingsGoalResponse(
     goal: Parameters<typeof toSavingsGoalResponse>[0],
@@ -299,7 +320,7 @@ export class SavingsService {
       }
     }
 
-    return this.prisma.$transaction(async (tx) => {
+    const result = await this.prisma.$transaction(async (tx) => {
       const rows = await tx.$queryRaw<
         Array<{
           id: string;
@@ -371,8 +392,22 @@ export class SavingsService {
         },
       });
 
-      return afterResponse;
+      return {
+        response: afterResponse,
+        justAchieved: existing.status !== 'ACHIEVED' && reconciled.status === 'ACHIEVED',
+        goal: reconciled,
+      };
     });
+
+    if (result.justAchieved) {
+      await this.savingsAchievementService.notifyIfFirstTimeAchieved(
+        user.userId,
+        result.goal,
+        result.response.progress_percent,
+      );
+    }
+
+    return result.response;
   }
 
   async archiveGoal(
@@ -464,7 +499,7 @@ export class SavingsService {
     goalId: string,
     dto: CreateAllocationDto,
   ): Promise<AllocateGoalResponse> {
-    return this.prisma.$transaction(async (tx) => {
+    const result = await this.prisma.$transaction(async (tx) => {
       // 1. Lock SavingsGoal
       const goalRows = await tx.$queryRaw<
         Array<{
@@ -592,12 +627,27 @@ export class SavingsService {
       });
 
       // 7. Respons 201
+      const goalResponse = this.toSavingsGoalResponse(reconciledGoal, newGoalSum);
       return {
-        allocation: this.toAllocationResponse(allocation),
-        goal: this.toSavingsGoalResponse(reconciledGoal, newGoalSum),
-        account_available: Number(available - amountBig),
+        response: {
+          allocation: this.toAllocationResponse(allocation),
+          goal: goalResponse,
+          account_available: Number(available - amountBig),
+        },
+        justAchieved: goal.status !== 'ACHIEVED' && reconciledGoal.status === 'ACHIEVED',
+        goal: reconciledGoal,
       };
     });
+
+    if (result.justAchieved) {
+      await this.savingsAchievementService.notifyIfFirstTimeAchieved(
+        user.userId,
+        result.goal,
+        result.response.goal.progress_percent,
+      );
+    }
+
+    return result.response;
   }
 
   async releaseAllocation(
@@ -719,5 +769,90 @@ export class SavingsService {
         account_available: accountAvailable,
       };
     });
+  }
+
+  async listGoals(
+    userId: string,
+    includeArchived = false,
+  ): Promise<SavingsGoalResponse[]> {
+    const goals = await this.prisma.savingsGoal.findMany({
+      where: {
+        user_id: userId,
+        ...(includeArchived ? {} : { status: { not: 'ARCHIVED' } }),
+      },
+      orderBy: { created_at: 'desc' },
+    });
+
+    if (goals.length === 0) {
+      return [];
+    }
+
+    const goalIds = goals.map((g) => g.id);
+    const activeSums = await this.prisma.savingsAllocation.groupBy({
+      by: ['savings_goal_id'],
+      where: {
+        savings_goal_id: { in: goalIds },
+        status: 'ACTIVE',
+      },
+      _sum: {
+        amount: true,
+      },
+    });
+
+    const sumMap = new Map<string, bigint>();
+    for (const item of activeSums) {
+      sumMap.set(item.savings_goal_id, item._sum.amount ?? 0n);
+    }
+
+    return goals.map((g) => this.toSavingsGoalResponse(g, sumMap.get(g.id) ?? 0n));
+  }
+
+  async getGoalDetail(userId: string, goalId: string): Promise<GoalDetailResponse> {
+    const goal = await this.prisma.savingsGoal.findFirst({
+      where: {
+        id: goalId,
+        user_id: userId,
+      },
+      include: {
+        allocations: {
+          orderBy: { allocated_at: 'desc' },
+          include: {
+            account: {
+              select: { id: true, name: true, type: true },
+            },
+          },
+        },
+      },
+    });
+
+    if (!goal) {
+      throw new NotFoundException({
+        code: 'GOAL_NOT_FOUND',
+        message: 'Target tabungan tidak ditemukan',
+      });
+    }
+
+    const currentAmount = goal.allocations
+      .filter((a) => a.status === 'ACTIVE')
+      .reduce((sum, a) => sum + BigInt(a.amount), 0n);
+
+    const goalResponse = this.toSavingsGoalResponse(goal, currentAmount);
+
+    const allocations: AllocationHistoryItem[] = goal.allocations.map((a) => ({
+      id: a.id,
+      account_id: a.account_id,
+      account_name: a.account.name,
+      account_type: a.account.type,
+      amount: Number(a.amount),
+      status: a.status as 'ACTIVE' | 'RELEASED',
+      allocated_at: a.allocated_at,
+      released_at: a.released_at,
+      release_reason: a.release_reason,
+    }));
+
+    return {
+      goal: goalResponse,
+      allocations,
+    };
   }
 }

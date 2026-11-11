@@ -1,15 +1,24 @@
 import {
   Controller,
+  Get,
   Post,
   Patch,
   Param,
+  Query,
   ParseUUIDPipe,
   Body,
   UseGuards,
   HttpStatus,
   HttpCode,
 } from '@nestjs/common';
-import { ApiTags, ApiOperation, ApiResponse, ApiCookieAuth } from '@nestjs/swagger';
+import {
+  ApiTags,
+  ApiOperation,
+  ApiResponse,
+  ApiCookieAuth,
+  ApiQuery,
+  ApiParam,
+} from '@nestjs/swagger';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard.js';
 import { CurrentUser } from '../../common/decorators/current-user.decorator.js';
 import { ZodValidationPipe } from '../../common/pipes/zod-validation.pipe.js';
@@ -18,6 +27,7 @@ import {
   SavingsGoalResponse,
   AllocateGoalResponse,
   ReleaseAllocationResponse,
+  GoalDetailResponse,
 } from './savings.service.js';
 import {
   createSavingsGoalSchema,
@@ -36,6 +46,31 @@ import {
 @UseGuards(JwtAuthGuard)
 export class SavingsController {
   constructor(private readonly savingsService: SavingsService) {}
+
+  @Get()
+  @ApiOperation({ summary: 'Mendapatkan daftar target tabungan' })
+  @ApiQuery({ name: 'include_archived', required: false, type: Boolean })
+  @ApiResponse({ status: 200, description: 'Daftar target tabungan berhasil diambil' })
+  @ApiResponse({ status: 401, description: 'Sesi tidak valid' })
+  async list(
+    @CurrentUser() user: { userId: string; role?: string },
+    @Query('include_archived') includeArchived?: string,
+  ): Promise<SavingsGoalResponse[]> {
+    return this.savingsService.listGoals(user.userId, includeArchived === 'true');
+  }
+
+  @Get(':id')
+  @ApiOperation({ summary: 'Mendapatkan detail target tabungan dan riwayat alokasi' })
+  @ApiParam({ name: 'id', format: 'uuid', description: 'ID target tabungan' })
+  @ApiResponse({ status: 200, description: 'Detail target tabungan berhasil diambil' })
+  @ApiResponse({ status: 401, description: 'Sesi tidak valid' })
+  @ApiResponse({ status: 404, description: 'Target tabungan tidak ditemukan' })
+  async detail(
+    @CurrentUser() user: { userId: string; role?: string },
+    @Param('id', new ParseUUIDPipe()) id: string,
+  ): Promise<GoalDetailResponse> {
+    return this.savingsService.getGoalDetail(user.userId, id);
+  }
 
   @Post()
   @HttpCode(HttpStatus.CREATED)
