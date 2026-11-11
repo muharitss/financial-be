@@ -44,3 +44,14 @@ export const createAllocationSchema = z
 
 export type CreateAllocationDto = z.infer<typeof createAllocationSchema>;
 
+export const releaseAllocationSchema = z
+  .object({
+    reason: z.string().trim().max(500).optional(),
+    client_tx_id: z.string().max(64).optional(),
+  })
+  .strict()
+  .default({});
+
+export type ReleaseAllocationDto = z.infer<typeof releaseAllocationSchema>;
+
+

@@ -740,4 +740,218 @@ describe('Savings E2E Test Suite (Supertest)', () => {
       expect(resAusingBAcc.body.code).toBe('ACCOUNT_NOT_FOUND');
     });
   });
+
+  describe('POST /savings/goals/:id/allocations/:allocationId/release (AC-1, AC-2, AC-3, AC-4)', () => {
+    let bcaAccountId: string;
+    let goalId: string;
+    let allocId: string;
+
+    beforeEach(async () => {
+      // 1. Akun BCA balance = 1.000.000
+      const accRes = await request(app.getHttpServer())
+        .post('/accounts')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          name: `BCA Release Test ${Date.now()}`,
+          type: 'BANK',
+          opening_balance: 1000000,
+        });
+      expect(accRes.status).toBe(201);
+      bcaAccountId = accRes.body.id;
+
+      // 2. Goal target 2.000.000
+      const goalRes = await request(app.getHttpServer())
+        .post('/savings/goals')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          name: `Target Gadget ${Date.now()}`,
+          target_amount: 2000000,
+        });
+      expect(goalRes.status).toBe(201);
+      goalId = goalRes.body.id;
+
+      // 3. Buat alokasi 400.000 (available menjadi 600.000)
+      const allocRes = await request(app.getHttpServer())
+        .post(`/savings/goals/${goalId}/allocations`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          account_id: bcaAccountId,
+          amount: 400000,
+        });
+      expect(allocRes.status).toBe(201);
+      allocId = allocRes.body.allocation.id;
+    });
+
+    it('AC-1: rilis alokasi berhasil, status RELEASED, available balance BCA kembali 1.000.000, Account.balance tetap 1.000.000, 0 baris transaksi baru, dan AuditLog SAVINGS_RELEASE', async () => {
+      const initialTxCount = await prisma.asSystem().transaction.count();
+
+      const res = await request(app.getHttpServer())
+        .post(`/savings/goals/${goalId}/allocations/${allocId}/release`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          reason: 'Butuh bayar UKT',
+        });
+
+      expect(res.status).toBe(200);
+      expect(res.body.allocation).toMatchObject({
+        id: allocId,
+        savings_goal_id: goalId,
+        account_id: bcaAccountId,
+        amount: 400000,
+        status: 'RELEASED',
+        release_reason: 'Butuh bayar UKT',
+      });
+      expect(res.body.allocation.released_at).not.toBeNull();
+      expect(res.body.account_available).toBe(1000000);
+      expect(res.body.goal.current_amount).toBe(0);
+
+      // 1. Account.balance tetap 1.000.000
+      const rawAccount = await prisma.asSystem().account.findUnique({
+        where: { id: bcaAccountId },
+      });
+      expect(rawAccount?.balance).toBe(1000000n);
+
+      // 2. GET /accounts menampilkan available = 1.000.000 & reserved = 0
+      const listAccounts = await request(app.getHttpServer())
+        .get('/accounts')
+        .set('Cookie', userAHeaders.cookie);
+      expect(listAccounts.status).toBe(200);
+      const bcaInList = listAccounts.body.find((a: any) => a.id === bcaAccountId);
+      expect(bcaInList.balance).toBe(1000000);
+      expect(bcaInList.reserved).toBe(0);
+      expect(bcaInList.available).toBe(1000000);
+
+      // 3. 0 baris baru di tabel transactions
+      const finalTxCount = await prisma.asSystem().transaction.count();
+      expect(finalTxCount).toBe(initialTxCount);
+
+      // 4. AuditLog SAVINGS_RELEASE tercatat
+      const audit = await prisma.asSystem().auditLog.findFirst({
+        where: {
+          resource_type: 'savings_allocation',
+          resource_id: allocId,
+          action: 'SAVINGS_RELEASE',
+        },
+      });
+      expect(audit).not.toBeNull();
+      expect(audit?.actor_user_id).toBe(userAId);
+      expect((audit?.after as any)?.status).toBe('RELEASED');
+    });
+
+    it('AC-2: memanggil /release kedua kali pada allocationId yang sama -> 409 ALLOCATION_ALREADY_RELEASED', async () => {
+      // Rilis pertama
+      const res1 = await request(app.getHttpServer())
+        .post(`/savings/goals/${goalId}/allocations/${allocId}/release`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({ reason: 'Rilis pertama' });
+      expect(res1.status).toBe(200);
+
+      // Rilis kedua
+      const res2 = await request(app.getHttpServer())
+        .post(`/savings/goals/${goalId}/allocations/${allocId}/release`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({ reason: 'Rilis kedua' });
+      expect(res2.status).toBe(409);
+      expect(res2.body.code).toBe('ALLOCATION_ALREADY_RELEASED');
+    });
+
+    it('AC-3: goal berstatus ACHIEVED (target 500k, current 500k) yang alokasinya dilepas sehingga current 300k otomatis kembali ke ACTIVE dan achieved_at = null', async () => {
+      // 1. Buat goal dengan target 500.000
+      const smallGoalRes = await request(app.getHttpServer())
+        .post('/savings/goals')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          name: `Target UKT ${Date.now()}`,
+          target_amount: 500000,
+        });
+      expect(smallGoalRes.status).toBe(201);
+      const smallGoalId = smallGoalRes.body.id;
+
+      // 2. Buat alokasi 1: 300.000
+      await request(app.getHttpServer())
+        .post(`/savings/goals/${smallGoalId}/allocations`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          account_id: accountAId,
+          amount: 300000,
+        });
+
+      // 3. Buat alokasi 2: 200.000 -> Goal menjadi ACHIEVED (current = 500.000)
+      const alloc2Res = await request(app.getHttpServer())
+        .post(`/savings/goals/${smallGoalId}/allocations`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          account_id: accountAId,
+          amount: 200000,
+        });
+      expect(alloc2Res.status).toBe(201);
+      expect(alloc2Res.body.goal.status).toBe('ACHIEVED');
+      expect(alloc2Res.body.goal.achieved_at).not.toBeNull();
+      const alloc2Id = alloc2Res.body.allocation.id;
+
+      // 4. Lepaskan alokasi 2 (200.000) -> current menjadi 300.000 (< 500.000)
+      const releaseRes = await request(app.getHttpServer())
+        .post(`/savings/goals/${smallGoalId}/allocations/${alloc2Id}/release`)
+        .set('Cookie', userAHeaders.cookie)
+        .send();
+      expect(releaseRes.status).toBe(200);
+      expect(releaseRes.body.goal.status).toBe('ACTIVE');
+      expect(releaseRes.body.goal.achieved_at).toBeNull();
+      expect(releaseRes.body.goal.current_amount).toBe(300000);
+      expect(releaseRes.body.goal.remaining_amount).toBe(200000);
+
+      // Cek langsung di database
+      const dbGoal = await prisma.asSystem().savingsGoal.findUnique({
+        where: { id: smallGoalId },
+      });
+      expect(dbGoal?.status).toBe('ACTIVE');
+      expect(dbGoal?.achieved_at).toBeNull();
+    });
+
+    it('AC-4: allocationId tidak ditemukan, milik goalId berbeda, atau milik user lain -> 404', async () => {
+      // 1. Goal milik user lain (User B coba rilis alokasi User A) -> 404 GOAL_NOT_FOUND
+      const resB = await request(app.getHttpServer())
+        .post(`/savings/goals/${goalId}/allocations/${allocId}/release`)
+        .set('Cookie', userBHeaders.cookie)
+        .send();
+      expect(resB.status).toBe(404);
+      expect(resB.body.code).toBe('GOAL_NOT_FOUND');
+
+      // 2. GoalId non-existent -> 404 GOAL_NOT_FOUND
+      const nonExistentGoalId = '00000000-0000-0000-0000-000000000000';
+      const resMissingGoal = await request(app.getHttpServer())
+        .post(`/savings/goals/${nonExistentGoalId}/allocations/${allocId}/release`)
+        .set('Cookie', userAHeaders.cookie)
+        .send();
+      expect(resMissingGoal.status).toBe(404);
+      expect(resMissingGoal.body.code).toBe('GOAL_NOT_FOUND');
+
+      // 3. AllocationId non-existent -> 404 ALLOCATION_NOT_FOUND
+      const nonExistentAllocId = '00000000-0000-0000-0000-000000000000';
+      const resMissingAlloc = await request(app.getHttpServer())
+        .post(`/savings/goals/${goalId}/allocations/${nonExistentAllocId}/release`)
+        .set('Cookie', userAHeaders.cookie)
+        .send();
+      expect(resMissingAlloc.status).toBe(404);
+      expect(resMissingAlloc.body.code).toBe('ALLOCATION_NOT_FOUND');
+
+      // 4. AllocationId ada tetapi milik goalId berbeda milik user yang sama -> 404 ALLOCATION_NOT_FOUND
+      const otherGoalRes = await request(app.getHttpServer())
+        .post('/savings/goals')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          name: `Other Goal ${Date.now()}`,
+          target_amount: 1000000,
+        });
+      expect(otherGoalRes.status).toBe(201);
+      const otherGoalId = otherGoalRes.body.id;
+
+      const resDiffGoal = await request(app.getHttpServer())
+        .post(`/savings/goals/${otherGoalId}/allocations/${allocId}/release`)
+        .set('Cookie', userAHeaders.cookie)
+        .send();
+      expect(resDiffGoal.status).toBe(404);
+      expect(resDiffGoal.body.code).toBe('ALLOCATION_NOT_FOUND');
+    });
+  });
 });

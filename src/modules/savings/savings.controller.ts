@@ -17,14 +17,17 @@ import {
   SavingsService,
   SavingsGoalResponse,
   AllocateGoalResponse,
+  ReleaseAllocationResponse,
 } from './savings.service.js';
 import {
   createSavingsGoalSchema,
   updateSavingsGoalSchema,
   createAllocationSchema,
+  releaseAllocationSchema,
   type CreateSavingsGoalDto,
   type UpdateSavingsGoalDto,
   type CreateAllocationDto,
+  type ReleaseAllocationDto,
 } from './dto/savings.dto.js';
 
 @ApiTags('savings')
@@ -92,5 +95,22 @@ export class SavingsController {
     @Body(new ZodValidationPipe(createAllocationSchema)) dto: CreateAllocationDto,
   ): Promise<AllocateGoalResponse> {
     return this.savingsService.allocate(user, id, dto);
+  }
+
+  @Post(':id/allocations/:allocationId/release')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Melepaskan alokasi dana dari target tabungan' })
+  @ApiResponse({ status: 200, description: 'Alokasi berhasil dilepaskan' })
+  @ApiResponse({ status: 400, description: 'Data tidak valid' })
+  @ApiResponse({ status: 401, description: 'Sesi tidak valid' })
+  @ApiResponse({ status: 404, description: 'Target tabungan atau alokasi tidak ditemukan' })
+  @ApiResponse({ status: 409, description: 'Alokasi tabungan sudah dilepaskan sebelumnya' })
+  async releaseAllocation(
+    @CurrentUser() user: { userId: string; role?: string },
+    @Param('id', new ParseUUIDPipe()) id: string,
+    @Param('allocationId', new ParseUUIDPipe()) allocationId: string,
+    @Body(new ZodValidationPipe(releaseAllocationSchema)) dto: ReleaseAllocationDto,
+  ): Promise<ReleaseAllocationResponse> {
+    return this.savingsService.releaseAllocation(user, id, allocationId, dto);
   }
 }

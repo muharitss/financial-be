@@ -12,6 +12,7 @@ import type {
   CreateSavingsGoalDto,
   UpdateSavingsGoalDto,
   CreateAllocationDto,
+  ReleaseAllocationDto,
 } from './dto/savings.dto.js';
 
 export interface SavingsGoalResponse {
@@ -45,6 +46,8 @@ export interface AllocateGoalResponse {
   goal: SavingsGoalResponse;
   account_available: number;
 }
+
+export type ReleaseAllocationResponse = AllocateGoalResponse;
 
 export function toAllocationResponse(allocation: {
   id: string;
@@ -593,6 +596,127 @@ export class SavingsService {
         allocation: this.toAllocationResponse(allocation),
         goal: this.toSavingsGoalResponse(reconciledGoal, newGoalSum),
         account_available: Number(available - amountBig),
+      };
+    });
+  }
+
+  async releaseAllocation(
+    user: { userId: string; role?: string },
+    goalId: string,
+    allocationId: string,
+    dto?: ReleaseAllocationDto,
+  ): Promise<ReleaseAllocationResponse> {
+    return this.prisma.$transaction(async (tx) => {
+      // 1. Lock SavingsGoal
+      const goalRows = await tx.$queryRaw<
+        Array<{
+          id: string;
+          financial_profile_id: string;
+          user_id: string;
+          name: string;
+          target_amount: bigint;
+          target_date: Date | null;
+          note: string | null;
+          status: SavingsGoalStatus;
+          achieved_at: Date | null;
+          created_at: Date;
+          updated_at: Date;
+        }>
+      >`SELECT id, financial_profile_id, user_id, name, target_amount, target_date, note, status, achieved_at, created_at, updated_at FROM savings_goals WHERE id = ${goalId}::uuid AND user_id = ${user.userId}::uuid FOR UPDATE`;
+
+      const goal = goalRows[0];
+      if (!goal) {
+        throw new NotFoundException({
+          code: 'GOAL_NOT_FOUND',
+          message: 'Target tabungan tidak ditemukan',
+        });
+      }
+
+      // 2. Lock SavingsAllocation
+      const allocationRows = await tx.$queryRaw<
+        Array<{
+          id: string;
+          savings_goal_id: string;
+          account_id: string;
+          amount: bigint;
+          status: string;
+          allocated_at: Date;
+          released_at: Date | null;
+          release_reason: string | null;
+        }>
+      >`SELECT id, savings_goal_id, account_id, amount, status, allocated_at, released_at, release_reason FROM savings_allocations WHERE id = ${allocationId}::uuid AND savings_goal_id = ${goalId}::uuid FOR UPDATE`;
+
+      const allocation = allocationRows[0];
+      if (!allocation) {
+        throw new NotFoundException({
+          code: 'ALLOCATION_NOT_FOUND',
+          message: 'Alokasi tabungan tidak ditemukan',
+        });
+      }
+
+      // 3. Cek apakah alokasi sudah RELEASED
+      if (allocation.status === 'RELEASED') {
+        throw new ConflictException({
+          code: 'ALLOCATION_ALREADY_RELEASED',
+          message: 'Alokasi tabungan sudah dilepaskan sebelumnya',
+        });
+      }
+
+      // 4. Update status ke RELEASED
+      const now = new Date();
+      const updatedAllocation = await tx.savingsAllocation.update({
+        where: { id: allocation.id },
+        data: {
+          status: 'RELEASED',
+          released_at: now,
+          release_reason: dto?.reason?.trim() || null,
+        },
+      });
+
+      // 5. Hitung ulang total alokasi aktif goal & reconcile status
+      const newGoalSum = await this.getGoalActiveSumTx(tx, goal.id);
+      const reconciledGoal = await this.reconcileGoalStatusTx(tx, goal, newGoalSum, now);
+
+      // 6. Hitung account_available terbaru akun sumber
+      const account = await tx.account.findFirst({
+        where: {
+          id: allocation.account_id,
+          user_id: user.userId,
+        },
+        select: { balance: true },
+      });
+
+      const accountAllocations = await tx.savingsAllocation.aggregate({
+        where: {
+          account_id: allocation.account_id,
+          status: 'ACTIVE',
+        },
+        _sum: {
+          amount: true,
+        },
+      });
+
+      const accountActiveReserved = accountAllocations._sum.amount ?? 0n;
+      const accountAvailable = Number((account?.balance ?? 0n) - accountActiveReserved);
+
+      // 7. Tulis AuditLog SAVINGS_RELEASE
+      await tx.auditLog.create({
+        data: {
+          action: 'SAVINGS_RELEASE',
+          resource_type: 'savings_allocation',
+          resource_id: allocation.id,
+          actor_user_id: user.userId,
+          actor_role: user.role ?? 'USER',
+          before: this.toAllocationResponse(allocation) as unknown as Prisma.InputJsonValue,
+          after: this.toAllocationResponse(updatedAllocation) as unknown as Prisma.InputJsonValue,
+        },
+      });
+
+      // Respons 200
+      return {
+        allocation: this.toAllocationResponse(updatedAllocation),
+        goal: this.toSavingsGoalResponse(reconciledGoal, newGoalSum),
+        account_available: accountAvailable,
       };
     });
   }

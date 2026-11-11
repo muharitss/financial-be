@@ -35,6 +35,11 @@ describe('SavingsService', () => {
         create: jest.fn(),
         aggregate: jest.fn(),
         count: jest.fn(),
+        update: jest.fn(),
+      },
+      account: {
+        findFirst: jest.fn(),
+        findUnique: jest.fn(),
       },
       auditLog: {
         create: jest.fn(),
@@ -787,6 +792,184 @@ describe('SavingsService', () => {
       expect(res.goal.achieved_at).not.toBeNull();
       expect(res.goal.progress_percent).toBe(100);
       expect(res.goal.remaining_amount).toBe(0);
+    });
+  });
+
+  describe('releaseAllocation', () => {
+    const user = { userId: 'user-uuid-1', role: 'USER' };
+    const goalId = 'goal-uuid-1';
+    const accountId = 'account-uuid-1';
+    const allocationId = 'alloc-uuid-1';
+
+    const mockGoalRow = {
+      id: goalId,
+      financial_profile_id: 'fp-1',
+      user_id: user.userId,
+      name: 'Dana Darurat',
+      target_amount: 2000000n,
+      target_date: null,
+      note: null,
+      status: SavingsGoalStatus.ACTIVE,
+      achieved_at: null,
+      created_at: new Date('2026-11-11T10:00:00.000Z'),
+      updated_at: new Date('2026-11-11T10:00:00.000Z'),
+    };
+
+    const mockAllocationRow = {
+      id: allocationId,
+      savings_goal_id: goalId,
+      account_id: accountId,
+      amount: 400000n,
+      status: 'ACTIVE',
+      allocated_at: new Date('2026-11-11T10:00:00.000Z'),
+      released_at: null,
+      release_reason: null,
+    };
+
+    it('AC-1: berhasil melepaskan alokasi, status RELEASED, released_at & release_reason terisi, available balance bertambah tanpa mengubah balance akun & mencatat audit log SAVINGS_RELEASE', async () => {
+      prisma.$queryRaw
+        .mockResolvedValueOnce([mockGoalRow])
+        .mockResolvedValueOnce([mockAllocationRow]);
+
+      const now = new Date('2026-11-11T10:30:00.000Z');
+      const updatedAllocation = {
+        ...mockAllocationRow,
+        status: 'RELEASED',
+        released_at: now,
+        release_reason: 'Butuh bayar UKT',
+      };
+      prisma.savingsAllocation.update.mockResolvedValue(updatedAllocation);
+
+      // getGoalActiveSumTx (setelah release -> 0n)
+      prisma.savingsAllocation.aggregate
+        .mockResolvedValueOnce({ _sum: { amount: 0n } }) // goal sum
+        .mockResolvedValueOnce({ _sum: { amount: 0n } }); // account reserved
+
+      prisma.account.findFirst.mockResolvedValue({ balance: 1000000n });
+
+      const res = await service.releaseAllocation(user, goalId, allocationId, {
+        reason: 'Butuh bayar UKT',
+      });
+
+      expect(res.allocation).toEqual({
+        id: allocationId,
+        savings_goal_id: goalId,
+        account_id: accountId,
+        amount: 400000,
+        status: 'RELEASED',
+        allocated_at: mockAllocationRow.allocated_at,
+        released_at: now,
+        release_reason: 'Butuh bayar UKT',
+      });
+      expect(res.account_available).toBe(1000000);
+      expect(res.goal.current_amount).toBe(0);
+
+      expect(prisma.savingsAllocation.update).toHaveBeenCalledWith({
+        where: { id: allocationId },
+        data: {
+          status: 'RELEASED',
+          released_at: expect.any(Date),
+          release_reason: 'Butuh bayar UKT',
+        },
+      });
+
+      expect(prisma.auditLog.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          action: 'SAVINGS_RELEASE',
+          resource_type: 'savings_allocation',
+          resource_id: allocationId,
+          actor_user_id: user.userId,
+          before: expect.objectContaining({
+            status: 'ACTIVE',
+          }),
+          after: expect.objectContaining({
+            status: 'RELEASED',
+            release_reason: 'Butuh bayar UKT',
+          }),
+        }),
+      });
+    });
+
+    it('AC-2: melempar 409 ALLOCATION_ALREADY_RELEASED jika alokasi sudah berstatus RELEASED', async () => {
+      prisma.$queryRaw
+        .mockResolvedValueOnce([mockGoalRow])
+        .mockResolvedValueOnce([{ ...mockAllocationRow, status: 'RELEASED' }]);
+
+      await expect(
+        service.releaseAllocation(user, goalId, allocationId, {
+          reason: 'Coba release lagi',
+        }),
+      ).rejects.toThrow(ConflictException);
+    });
+
+    it('AC-3: otomatis mengembalikan status goal dari ACHIEVED ke ACTIVE dan achieved_at null jika total alokasi turun di bawah target_amount', async () => {
+      const achievedGoalRow = {
+        ...mockGoalRow,
+        target_amount: 500000n,
+        status: SavingsGoalStatus.ACHIEVED,
+        achieved_at: new Date('2026-11-11T10:00:00.000Z'),
+      };
+
+      prisma.$queryRaw
+        .mockResolvedValueOnce([achievedGoalRow])
+        .mockResolvedValueOnce([mockAllocationRow]);
+
+      const updatedAllocation = {
+        ...mockAllocationRow,
+        status: 'RELEASED',
+        released_at: new Date('2026-11-11T10:30:00.000Z'),
+        release_reason: null,
+      };
+      prisma.savingsAllocation.update.mockResolvedValue(updatedAllocation);
+
+      // Remaining active allocations for goal: 300.000 (< target 500.000)
+      prisma.savingsAllocation.aggregate
+        .mockResolvedValueOnce({ _sum: { amount: 300000n } }) // goal sum
+        .mockResolvedValueOnce({ _sum: { amount: 300000n } }); // account reserved
+
+      prisma.account.findFirst.mockResolvedValue({ balance: 1000000n });
+
+      prisma.savingsGoal.update.mockResolvedValue({
+        ...achievedGoalRow,
+        status: SavingsGoalStatus.ACTIVE,
+        achieved_at: null,
+      });
+
+      const res = await service.releaseAllocation(user, goalId, allocationId, {});
+
+      expect(prisma.savingsGoal.update).toHaveBeenCalledWith({
+        where: {
+          id: goalId,
+          user_id: user.userId,
+        },
+        data: {
+          status: 'ACTIVE',
+          achieved_at: null,
+        },
+      });
+
+      expect(res.goal.status).toBe('ACTIVE');
+      expect(res.goal.achieved_at).toBeNull();
+      expect(res.goal.current_amount).toBe(300000);
+      expect(res.goal.remaining_amount).toBe(200000);
+    });
+
+    it('AC-4: melempar 404 GOAL_NOT_FOUND jika goal tidak ditemukan', async () => {
+      prisma.$queryRaw.mockResolvedValueOnce([]);
+
+      await expect(
+        service.releaseAllocation(user, 'missing-goal', allocationId),
+      ).rejects.toThrow(NotFoundException);
+    });
+
+    it('AC-4: melempar 404 ALLOCATION_NOT_FOUND jika alokasi tidak ditemukan pada goal tersebut', async () => {
+      prisma.$queryRaw
+        .mockResolvedValueOnce([mockGoalRow])
+        .mockResolvedValueOnce([]);
+
+      await expect(
+        service.releaseAllocation(user, goalId, 'missing-allocation'),
+      ).rejects.toThrow(NotFoundException);
     });
   });
 });
