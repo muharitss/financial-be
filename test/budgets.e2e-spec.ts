@@ -8,6 +8,7 @@ import { AppModule } from '../src/app.module.js';
 import { PrismaService } from '../src/prisma/prisma.service.js';
 import { AllExceptionsFilter } from '../src/common/filters/all-exceptions.filter.js';
 import { todayInTz, previousPeriod } from '../src/common/utils/date.js';
+import { BudgetPeriodLockService } from '../src/modules/budgets/budget-period-lock.service.js';
 import { BudgetRolloverService } from '../src/modules/budgets/budget-rollover.service.js';
 import { ScheduledTransactionService } from '../src/modules/transactions/scheduled-transaction.service.js';
 
@@ -24,6 +25,7 @@ describe('Budgets E2E Test Suite (Supertest)', () => {
   let app: INestApplication;
   let prisma: PrismaService;
   let throttlerStorage: any;
+  let lockService: BudgetPeriodLockService;
 
   let userAHeaders: { cookie: string };
   let userBHeaders: { cookie: string };
@@ -54,6 +56,7 @@ describe('Budgets E2E Test Suite (Supertest)', () => {
 
     prisma = app.get(PrismaService);
     throttlerStorage = app.get(ThrottlerStorage);
+    lockService = app.get(BudgetPeriodLockService);
 
     // Clean up
     await prisma.asSystem().transactionSplit.deleteMany();
@@ -1864,6 +1867,223 @@ describe('Budgets E2E Test Suite (Supertest)', () => {
         expect(n.title).not.toMatch(/Rp|\d{3}\.\d{3}/);
         expect(n.body).not.toMatch(/Rp|\d{3}\.\d{3}/);
       }
+    });
+  });
+
+  describe('TASK-065: Lock Budget Period on Month Turn (BudgetPeriodLockService & Immutability Guard)', () => {
+    it('AC-2: lockExpiredPeriodsForUser mengunci BudgetPeriod bulan lalu, tidak menyentuh bulan berjalan, dan menulis AuditLog', async () => {
+      const lockCat = await prisma.category.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Lock Test Category AC-2',
+          type: 'EXPENSE',
+        },
+      });
+
+      const lockBudget = await prisma.budget.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          type: 'CATEGORY',
+          category_id: lockCat.id,
+        },
+      });
+
+      const prevPeriod = previousPeriod(currentPeriod);
+
+      const bpPast = await prisma.budgetPeriod.create({
+        data: {
+          budget_id: lockBudget.id,
+          period: prevPeriod,
+          base_amount: 500000n,
+          carryover_amount: 50000n,
+          locked_at: null,
+        },
+      });
+
+      const bpCurrent = await prisma.budgetPeriod.create({
+        data: {
+          budget_id: lockBudget.id,
+          period: currentPeriod,
+          base_amount: 500000n,
+          carryover_amount: 0n,
+          locked_at: null,
+        },
+      });
+
+      const res = await lockService.lockExpiredPeriodsForUser(userAId);
+      expect(res.lockedCount).toBeGreaterThanOrEqual(1);
+
+      // Verify bpPast is locked
+      const updatedPast = await prisma.budgetPeriod.findUnique({
+        where: { id: bpPast.id },
+      });
+      expect(updatedPast?.locked_at).not.toBeNull();
+
+      // Verify bpCurrent is NOT locked
+      const updatedCurrent = await prisma.budgetPeriod.findUnique({
+        where: { id: bpCurrent.id },
+      });
+      expect(updatedCurrent?.locked_at).toBeNull();
+
+      // Verify AuditLog written
+      const audit = await prisma.asSystem().auditLog.findFirst({
+        where: {
+          action: 'BUDGET_PERIOD_LOCK',
+          resource_type: 'budget_period',
+          resource_id: bpPast.id,
+        },
+      });
+      expect(audit).not.toBeNull();
+      expect(audit?.actor_user_id).toBe(userAId);
+      expect(audit?.actor_role).toBe('SYSTEM');
+      expect((audit?.before as any)?.locked_at).toBeNull();
+      expect((audit?.after as any)?.period).toBe(prevPeriod);
+      expect((audit?.after as any)?.carryover_amount).toBe(50000);
+      expect((audit?.after as any)?.locked_at).toBeDefined();
+    });
+
+    it('AC-3: Eksekusi paralel lockExpiredPeriodsForUser idempoten dan mengunci tepat 1×', async () => {
+      const concCat = await prisma.category.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Lock Concurrency Category AC-3',
+          type: 'EXPENSE',
+        },
+      });
+
+      const concBudget = await prisma.budget.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          type: 'CATEGORY',
+          category_id: concCat.id,
+        },
+      });
+
+      const targetPeriod = '2024-01';
+
+      const bpTarget = await prisma.budgetPeriod.create({
+        data: {
+          budget_id: concBudget.id,
+          period: targetPeriod,
+          base_amount: 700000n,
+          carryover_amount: 0n,
+          locked_at: null,
+        },
+      });
+
+      // Run parallel calls
+      await Promise.all([
+        lockService.lockExpiredPeriodsForUser(userAId),
+        lockService.lockExpiredPeriodsForUser(userAId),
+      ]);
+
+      // Exactly 1 lock audit log should be created for bpTarget
+      const auditLogs = await prisma.asSystem().auditLog.findMany({
+        where: {
+          action: 'BUDGET_PERIOD_LOCK',
+          resource_type: 'budget_period',
+          resource_id: bpTarget.id,
+        },
+      });
+      expect(auditLogs.length).toBe(1);
+
+      const checkBp = await prisma.budgetPeriod.findUnique({
+        where: { id: bpTarget.id },
+      });
+      expect(checkBp?.locked_at).not.toBeNull();
+    });
+
+    it('AC-4: Imutabilitas periode terkunci — PATCH budget ditolak 409 & edit transaksi bulan lalu menghasilkan warning LOCKED_BUDGET_PERIOD_AFFECTED tanpa ubah carryover', async () => {
+      const immCat = await prisma.category.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          name: 'Immutability Category AC-4',
+          type: 'EXPENSE',
+        },
+      });
+
+      const immBudget = await prisma.budget.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          type: 'CATEGORY',
+          category_id: immCat.id,
+        },
+      });
+
+      const prevPeriod = previousPeriod(currentPeriod);
+
+      // Create a locked budget period for last month with carryover_amount = 150.000
+      const lockedBp = await prisma.budgetPeriod.create({
+        data: {
+          budget_id: immBudget.id,
+          period: prevPeriod,
+          base_amount: 600000n,
+          carryover_amount: 150000n,
+          locked_at: new Date(),
+        },
+      });
+
+      await prisma.budgetCategory.create({
+        data: {
+          budget_period_id: lockedBp.id,
+          category_id: immCat.id,
+          amount: 600000n,
+          rollover_enabled: true,
+          carryover_amount: 150000n,
+        },
+      });
+
+      // 1. PATCH /budgets/:id for this period is rejected with 409 BUDGET_PERIOD_LOCKED
+      const patchRes = await request(app.getHttpServer())
+        .patch(`/budgets/${immBudget.id}`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          period: prevPeriod,
+          amount: 800000,
+        });
+      expect(patchRes.status).toBe(409);
+      expect(patchRes.body.code).toBe('BUDGET_PERIOD_LOCKED');
+
+      // 2. Create an expense transaction in that past period
+      const pastTx = await prisma.transaction.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          account_id: accountA1Id,
+          category_id: immCat.id,
+          type: 'EXPENSE',
+          amount: 50000n,
+          date: new Date(`${prevPeriod}-15T10:00:00.000Z`),
+          status: 'POSTED',
+          client_tx_id: generateTestUlid(),
+        },
+      });
+
+      // 3. Edit the transaction
+      const editTxRes = await request(app.getHttpServer())
+        .patch(`/transactions/${pastTx.id}`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          amount: 75000,
+          client_tx_id: generateTestUlid(),
+        });
+
+      expect(editTxRes.status).toBe(200);
+      expect(editTxRes.body.warning).toBe('LOCKED_BUDGET_PERIOD_AFFECTED');
+
+      // 4. Verify locked BudgetPeriod carryover_amount and base_amount are completely unchanged
+      const bpAfterEdit = await prisma.budgetPeriod.findUnique({
+        where: { id: lockedBp.id },
+      });
+      expect(bpAfterEdit?.base_amount).toBe(600000n);
+      expect(bpAfterEdit?.carryover_amount).toBe(150000n);
+      expect(bpAfterEdit?.locked_at).not.toBeNull();
     });
   });
 });
