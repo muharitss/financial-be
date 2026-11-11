@@ -12,6 +12,7 @@ import { AccountsModule } from './modules/accounts/accounts.module.js';
 import { TransactionsModule } from './modules/transactions/transactions.module.js';
 import { TagsModule } from './modules/tags/tags.module.js';
 import { BudgetsModule } from './modules/budgets/budgets.module.js';
+import { SavingsModule } from './modules/savings/savings.module.js';
 import { NotificationsModule } from './modules/notifications/notifications.module.js';
 import { LoggerModule } from './common/logger/logger.module.js';
 import { TraceMiddleware } from './common/logger/trace.middleware.js';
@@ -35,6 +36,7 @@ export const { ObserveModule, ObserveInstrument } = createObserveModule();
     TransactionsModule,
     TagsModule,
     BudgetsModule,
+    SavingsModule,
     NotificationsModule,
     HealthModule,
     ObserveModule.forRoot({

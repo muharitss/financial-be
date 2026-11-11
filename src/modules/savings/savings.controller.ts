@@ -1,0 +1,73 @@
+import {
+  Controller,
+  Post,
+  Patch,
+  Param,
+  ParseUUIDPipe,
+  Body,
+  UseGuards,
+  HttpStatus,
+  HttpCode,
+} from '@nestjs/common';
+import { ApiTags, ApiOperation, ApiResponse, ApiCookieAuth } from '@nestjs/swagger';
+import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard.js';
+import { CurrentUser } from '../../common/decorators/current-user.decorator.js';
+import { ZodValidationPipe } from '../../common/pipes/zod-validation.pipe.js';
+import { SavingsService, SavingsGoalResponse } from './savings.service.js';
+import {
+  createSavingsGoalSchema,
+  updateSavingsGoalSchema,
+  type CreateSavingsGoalDto,
+  type UpdateSavingsGoalDto,
+} from './dto/savings.dto.js';
+
+@ApiTags('savings')
+@ApiCookieAuth('__Host-duitku_session')
+@Controller('savings/goals')
+@UseGuards(JwtAuthGuard)
+export class SavingsController {
+  constructor(private readonly savingsService: SavingsService) {}
+
+  @Post()
+  @HttpCode(HttpStatus.CREATED)
+  @ApiOperation({ summary: 'Membuat target tabungan baru' })
+  @ApiResponse({ status: 201, description: 'Target tabungan berhasil dibuat' })
+  @ApiResponse({ status: 400, description: 'Data tidak valid' })
+  @ApiResponse({ status: 401, description: 'Sesi tidak valid' })
+  async create(
+    @CurrentUser() user: { userId: string; role?: string },
+    @Body(new ZodValidationPipe(createSavingsGoalSchema)) dto: CreateSavingsGoalDto,
+  ): Promise<SavingsGoalResponse> {
+    return this.savingsService.createGoal(user, dto);
+  }
+
+  @Patch(':id')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Memperbarui target tabungan' })
+  @ApiResponse({ status: 200, description: 'Target tabungan berhasil diperbarui' })
+  @ApiResponse({ status: 400, description: 'Data tidak valid' })
+  @ApiResponse({ status: 401, description: 'Sesi tidak valid' })
+  @ApiResponse({ status: 404, description: 'Target tabungan tidak ditemukan' })
+  @ApiResponse({ status: 409, description: 'Target tabungan sudah diarsipkan' })
+  async update(
+    @CurrentUser() user: { userId: string; role?: string },
+    @Param('id', new ParseUUIDPipe()) id: string,
+    @Body(new ZodValidationPipe(updateSavingsGoalSchema)) dto: UpdateSavingsGoalDto,
+  ): Promise<SavingsGoalResponse> {
+    return this.savingsService.updateGoal(user, id, dto);
+  }
+
+  @Post(':id/archive')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Mengarsipkan target tabungan' })
+  @ApiResponse({ status: 200, description: 'Target tabungan berhasil diarsipkan' })
+  @ApiResponse({ status: 401, description: 'Sesi tidak valid' })
+  @ApiResponse({ status: 404, description: 'Target tabungan tidak ditemukan' })
+  @ApiResponse({ status: 409, description: 'Target tabungan memiliki alokasi aktif' })
+  async archive(
+    @CurrentUser() user: { userId: string; role?: string },
+    @Param('id', new ParseUUIDPipe()) id: string,
+  ): Promise<SavingsGoalResponse> {
+    return this.savingsService.archiveGoal(user, id);
+  }
+}
