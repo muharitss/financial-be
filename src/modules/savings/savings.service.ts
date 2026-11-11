@@ -3,11 +3,16 @@ import {
   NotFoundException,
   ConflictException,
   BadRequestException,
+  UnprocessableEntityException,
 } from '@nestjs/common';
 import { Prisma, SavingsGoalStatus } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service.js';
 import { todayInTz } from '../../common/utils/date.js';
-import type { CreateSavingsGoalDto, UpdateSavingsGoalDto } from './dto/savings.dto.js';
+import type {
+  CreateSavingsGoalDto,
+  UpdateSavingsGoalDto,
+  CreateAllocationDto,
+} from './dto/savings.dto.js';
 
 export interface SavingsGoalResponse {
   id: string;
@@ -22,6 +27,45 @@ export interface SavingsGoalResponse {
   achieved_at: Date | null;
   created_at: Date;
   updated_at: Date;
+}
+
+export interface AllocationResponse {
+  id: string;
+  savings_goal_id: string;
+  account_id: string;
+  amount: number;
+  status: 'ACTIVE' | 'RELEASED';
+  allocated_at: Date;
+  released_at: Date | null;
+  release_reason: string | null;
+}
+
+export interface AllocateGoalResponse {
+  allocation: AllocationResponse;
+  goal: SavingsGoalResponse;
+  account_available: number;
+}
+
+export function toAllocationResponse(allocation: {
+  id: string;
+  savings_goal_id: string;
+  account_id: string;
+  amount: bigint | number;
+  status: string;
+  allocated_at: Date;
+  released_at?: Date | null;
+  release_reason?: string | null;
+}): AllocationResponse {
+  return {
+    id: allocation.id,
+    savings_goal_id: allocation.savings_goal_id,
+    account_id: allocation.account_id,
+    amount: Number(allocation.amount),
+    status: allocation.status as 'ACTIVE' | 'RELEASED',
+    allocated_at: allocation.allocated_at,
+    released_at: allocation.released_at ?? null,
+    release_reason: allocation.release_reason ?? null,
+  };
 }
 
 export function toSavingsGoalResponse(
@@ -403,6 +447,153 @@ export class SavingsService {
       });
 
       return afterResponse;
+    });
+  }
+
+  toAllocationResponse(
+    allocation: Parameters<typeof toAllocationResponse>[0],
+  ): AllocationResponse {
+    return toAllocationResponse(allocation);
+  }
+
+  async allocate(
+    user: { userId: string; role?: string },
+    goalId: string,
+    dto: CreateAllocationDto,
+  ): Promise<AllocateGoalResponse> {
+    return this.prisma.$transaction(async (tx) => {
+      // 1. Lock SavingsGoal
+      const goalRows = await tx.$queryRaw<
+        Array<{
+          id: string;
+          financial_profile_id: string;
+          user_id: string;
+          name: string;
+          target_amount: bigint;
+          target_date: Date | null;
+          note: string | null;
+          status: SavingsGoalStatus;
+          achieved_at: Date | null;
+          created_at: Date;
+          updated_at: Date;
+        }>
+      >`SELECT id, financial_profile_id, user_id, name, target_amount, target_date, note, status, achieved_at, created_at, updated_at FROM savings_goals WHERE id = ${goalId}::uuid AND user_id = ${user.userId}::uuid FOR UPDATE`;
+
+      const goal = goalRows[0];
+      if (!goal) {
+        throw new NotFoundException({
+          code: 'GOAL_NOT_FOUND',
+          message: 'Target tabungan tidak ditemukan',
+        });
+      }
+
+      if (goal.status === 'ARCHIVED') {
+        throw new ConflictException({
+          code: 'GOAL_ARCHIVED',
+          message: 'Target tabungan sudah diarsipkan',
+        });
+      }
+
+      // 2. Lock Account
+      const accountRows = await tx.$queryRaw<
+        Array<{
+          id: string;
+          name: string;
+          type: string;
+          balance: bigint;
+          archived: boolean;
+        }>
+      >`SELECT id, name, type, balance, archived FROM accounts WHERE id = ${dto.account_id}::uuid AND user_id = ${user.userId}::uuid FOR UPDATE`;
+
+      const account = accountRows[0];
+      if (!account) {
+        throw new NotFoundException({
+          code: 'ACCOUNT_NOT_FOUND',
+          message: 'Akun tidak ditemukan',
+        });
+      }
+
+      if (account.archived) {
+        throw new ConflictException({
+          code: 'ACCOUNT_ARCHIVED',
+          message: 'Akun sudah diarsipkan',
+        });
+      }
+
+      if (account.type === 'INVESTMENT' || account.type === 'RECEIVABLE') {
+        throw new UnprocessableEntityException({
+          code: 'ACCOUNT_TYPE_NOT_ALLOCATABLE',
+          message:
+            'Akun Investasi dan Piutang tidak likuid sehingga tidak dapat dialokasikan ke target tabungan',
+        });
+      }
+
+      // 3. Hitung reserved & available
+      const accountAllocations = await tx.savingsAllocation.aggregate({
+        where: {
+          account_id: account.id,
+          status: 'ACTIVE',
+        },
+        _sum: {
+          amount: true,
+        },
+      });
+
+      const reserved = accountAllocations._sum.amount ?? 0n;
+      const available = account.balance - reserved;
+      const amountBig = BigInt(dto.amount);
+
+      if (account.balance <= 0n || available <= 0n || amountBig > available) {
+        throw new ConflictException({
+          code: 'INSUFFICIENT_AVAILABLE_BALANCE',
+          message: 'Saldo tersedia akun tidak mencukupi untuk dialokasikan',
+          details: {
+            balance: Number(account.balance),
+            reserved: Number(reserved),
+            available: Number(available > 0n ? available : 0n),
+            needed: dto.amount,
+            account_id: account.id,
+          },
+        });
+      }
+
+      // 4. Buat SavingsAllocation
+      const allocation = await tx.savingsAllocation.create({
+        data: {
+          savings_goal_id: goal.id,
+          account_id: account.id,
+          amount: amountBig,
+          status: 'ACTIVE',
+        },
+      });
+
+      // 5. Hitung total alokasi aktif goal & reconcile status
+      const newGoalSum = await this.getGoalActiveSumTx(tx, goal.id);
+      const now = new Date();
+      const reconciledGoal = await this.reconcileGoalStatusTx(tx, goal, newGoalSum, now);
+
+      // 6. Buat AuditLog
+      await tx.auditLog.create({
+        data: {
+          action: 'SAVINGS_ALLOCATE',
+          resource_type: 'savings_allocation',
+          resource_id: allocation.id,
+          actor_user_id: user.userId,
+          actor_role: user.role ?? 'USER',
+          before: Prisma.DbNull,
+          after: {
+            allocation: this.toAllocationResponse(allocation),
+            account_balance_unchanged: Number(account.balance),
+          } as unknown as Prisma.InputJsonValue,
+        },
+      });
+
+      // 7. Respons 201
+      return {
+        allocation: this.toAllocationResponse(allocation),
+        goal: this.toSavingsGoalResponse(reconciledGoal, newGoalSum),
+        account_available: Number(available - amountBig),
+      };
     });
   }
 }

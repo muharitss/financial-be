@@ -33,3 +33,14 @@ export const updateSavingsGoalSchema = z
   );
 
 export type UpdateSavingsGoalDto = z.infer<typeof updateSavingsGoalSchema>;
+
+export const createAllocationSchema = z
+  .object({
+    account_id: z.uuid(),
+    amount: z.number().int().positive(),
+    client_tx_id: z.string().max(64).optional(),
+  })
+  .strict();
+
+export type CreateAllocationDto = z.infer<typeof createAllocationSchema>;
+

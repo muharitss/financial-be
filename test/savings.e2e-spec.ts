@@ -408,4 +408,336 @@ describe('Savings E2E Test Suite (Supertest)', () => {
       expect(res.body.code).toBe('GOAL_NOT_FOUND');
     });
   });
+
+  describe('POST /savings/goals/:id/allocations (AC-1, AC-2, AC-3, AC-4, AC-5, AC-6)', () => {
+    let bcaAccountId: string;
+    let goalId: string;
+
+    beforeEach(async () => {
+      // Buat akun BCA dengan balance 1.000.000
+      const accRes = await request(app.getHttpServer())
+        .post('/accounts')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          name: `BCA Alloc Test ${Date.now()}`,
+          type: 'BANK',
+          opening_balance: 1000000,
+        });
+      expect(accRes.status).toBe(201);
+      bcaAccountId = accRes.body.id;
+
+      // Buat target tabungan 2.000.000
+      const goalRes = await request(app.getHttpServer())
+        .post('/savings/goals')
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          name: `Target Motor ${Date.now()}`,
+          target_amount: 2000000,
+        });
+      expect(goalRes.status).toBe(201);
+      goalId = goalRes.body.id;
+    });
+
+    it('AC-1: alokasi berhasil tanpa mengubah ledger balance akun, reserved terpotong, tanpa transaksi ledger, dan audit log tercatat', async () => {
+      const initialTxCount = await prisma.asSystem().transaction.count();
+
+      const res = await request(app.getHttpServer())
+        .post(`/savings/goals/${goalId}/allocations`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          account_id: bcaAccountId,
+          amount: 400000,
+        });
+
+      expect(res.status).toBe(201);
+      expect(res.body.allocation).toMatchObject({
+        savings_goal_id: goalId,
+        account_id: bcaAccountId,
+        amount: 400000,
+        status: 'ACTIVE',
+      });
+      expect(res.body.account_available).toBe(600000);
+      expect(res.body.goal).toMatchObject({
+        id: goalId,
+        current_amount: 400000,
+        remaining_amount: 1600000,
+        progress_percent: 20,
+        status: 'ACTIVE',
+      });
+
+      // 1. Ledger balance akun tetap 1.000.000
+      const rawAccount = await prisma.asSystem().account.findUnique({
+        where: { id: bcaAccountId },
+      });
+      expect(rawAccount?.balance).toBe(1000000n);
+
+      // 2. GET /accounts menampilkan reserved = 400.000 & available = 600.000
+      const listAccounts = await request(app.getHttpServer())
+        .get('/accounts')
+        .set('Cookie', userAHeaders.cookie);
+      expect(listAccounts.status).toBe(200);
+      const bcaInList = listAccounts.body.find((a: any) => a.id === bcaAccountId);
+      expect(bcaInList.balance).toBe(1000000);
+      expect(bcaInList.reserved).toBe(400000);
+      expect(bcaInList.available).toBe(600000);
+
+      // 3. Jumlah baris di tabel transactions tidak bertambah
+      const finalTxCount = await prisma.asSystem().transaction.count();
+      expect(finalTxCount).toBe(initialTxCount);
+
+      // 4. Tercatat AuditLog SAVINGS_ALLOCATE
+      const audit = await prisma.asSystem().auditLog.findFirst({
+        where: {
+          resource_type: 'savings_allocation',
+          resource_id: res.body.allocation.id,
+          action: 'SAVINGS_ALLOCATE',
+        },
+      });
+      expect(audit).not.toBeNull();
+      expect(audit?.actor_user_id).toBe(userAId);
+    });
+
+    it('AC-2: menolak alokasi melebihi available (available = 600.000, butuh 700.000) meskipun allow_negative = true', async () => {
+      // Alokasikan 400.000 dulu -> available = 600.000
+      await request(app.getHttpServer())
+        .post(`/savings/goals/${goalId}/allocations`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          account_id: bcaAccountId,
+          amount: 400000,
+        });
+
+      // Aktifkan allow_negative pada akun
+      await request(app.getHttpServer())
+        .patch(`/accounts/${bcaAccountId}/allow-negative`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({ allow_negative: true });
+
+      // Coba alokasi 700.000 -> 409 INSUFFICIENT_AVAILABLE_BALANCE
+      const res = await request(app.getHttpServer())
+        .post(`/savings/goals/${goalId}/allocations`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          account_id: bcaAccountId,
+          amount: 700000,
+        });
+
+      expect(res.status).toBe(409);
+      expect(res.body.code).toBe('INSUFFICIENT_AVAILABLE_BALANCE');
+      expect(res.body.details?.available).toBe(600000);
+      expect(res.body.details?.needed).toBe(700000);
+    });
+
+    it('AC-3: validasi akun negatif, akun arsip, akun illiquid (INVESTMENT/RECEIVABLE), dan goal ARCHIVED', async () => {
+      // 1. Akun dengan saldo negatif
+      const negAcc = await prisma.asSystem().account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: (await prisma.asSystem().financialProfile.findFirstOrThrow({ where: { user_id: userAId, is_default: true } })).id,
+          name: 'Akun Negatif Test',
+          type: 'BANK',
+          opening_balance: -50000n,
+          balance: -50000n,
+          opening_date: new Date(),
+          allow_negative: true,
+        },
+      });
+      const resNeg = await request(app.getHttpServer())
+        .post(`/savings/goals/${goalId}/allocations`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          account_id: negAcc.id,
+          amount: 10000,
+        });
+      expect(resNeg.status).toBe(409);
+      expect(resNeg.body.code).toBe('INSUFFICIENT_AVAILABLE_BALANCE');
+
+      // 2. Akun arsip
+      const archivedAcc = await prisma.asSystem().account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: (await prisma.asSystem().financialProfile.findFirstOrThrow({ where: { user_id: userAId, is_default: true } })).id,
+          name: 'Akun Arsip Test',
+          type: 'BANK',
+          opening_balance: 500000n,
+          balance: 500000n,
+          opening_date: new Date(),
+          archived: true,
+          archived_at: new Date(),
+        },
+      });
+      const resArchived = await request(app.getHttpServer())
+        .post(`/savings/goals/${goalId}/allocations`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          account_id: archivedAcc.id,
+          amount: 10000,
+        });
+      expect(resArchived.status).toBe(409);
+      expect(resArchived.body.code).toBe('ACCOUNT_ARCHIVED');
+
+      // 3. Akun INVESTMENT & RECEIVABLE -> 422 ACCOUNT_TYPE_NOT_ALLOCATABLE
+      const investAcc = await prisma.asSystem().account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: (await prisma.asSystem().financialProfile.findFirstOrThrow({ where: { user_id: userAId, is_default: true } })).id,
+          name: 'Akun Reksadana',
+          type: 'INVESTMENT',
+          opening_balance: 1000000n,
+          balance: 1000000n,
+          opening_date: new Date(),
+        },
+      });
+      const resInvest = await request(app.getHttpServer())
+        .post(`/savings/goals/${goalId}/allocations`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          account_id: investAcc.id,
+          amount: 100000,
+        });
+      expect(resInvest.status).toBe(422);
+      expect(resInvest.body.code).toBe('ACCOUNT_TYPE_NOT_ALLOCATABLE');
+
+      const receivableAcc = await prisma.asSystem().account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: (await prisma.asSystem().financialProfile.findFirstOrThrow({ where: { user_id: userAId, is_default: true } })).id,
+          name: 'Piutang Teman',
+          type: 'RECEIVABLE',
+          opening_balance: 500000n,
+          balance: 500000n,
+          opening_date: new Date(),
+        },
+      });
+      const resReceivable = await request(app.getHttpServer())
+        .post(`/savings/goals/${goalId}/allocations`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          account_id: receivableAcc.id,
+          amount: 50000,
+        });
+      expect(resReceivable.status).toBe(422);
+      expect(resReceivable.body.code).toBe('ACCOUNT_TYPE_NOT_ALLOCATABLE');
+
+      // 4. Goal ARCHIVED -> 409 GOAL_ARCHIVED
+      await request(app.getHttpServer())
+        .post(`/savings/goals/${goalId}/archive`)
+        .set('Cookie', userAHeaders.cookie);
+
+      const resGoalArchived = await request(app.getHttpServer())
+        .post(`/savings/goals/${goalId}/allocations`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          account_id: bcaAccountId,
+          amount: 100000,
+        });
+      expect(resGoalArchived.status).toBe(409);
+      expect(resGoalArchived.body.code).toBe('GOAL_ARCHIVED');
+    });
+
+    it('AC-4: saat total alokasi mencapai target_amount, goal otomatis menjadi ACHIEVED', async () => {
+      // Goal 2.000.000, alokasikan 2.000.000 dari akun bersaldo 3.000.000
+      const richAcc = await prisma.asSystem().account.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: (await prisma.asSystem().financialProfile.findFirstOrThrow({ where: { user_id: userAId, is_default: true } })).id,
+          name: 'Akun Kaya',
+          type: 'BANK',
+          opening_balance: 3000000n,
+          balance: 3000000n,
+          opening_date: new Date(),
+        },
+      });
+
+      const res = await request(app.getHttpServer())
+        .post(`/savings/goals/${goalId}/allocations`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          account_id: richAcc.id,
+          amount: 2000000,
+        });
+
+      expect(res.status).toBe(201);
+      expect(res.body.goal.status).toBe('ACHIEVED');
+      expect(res.body.goal.achieved_at).not.toBeNull();
+      expect(res.body.goal.current_amount).toBe(2000000);
+      expect(res.body.goal.progress_percent).toBe(100);
+
+      // Cek di DB
+      const dbGoal = await prisma.asSystem().savingsGoal.findUnique({
+        where: { id: goalId },
+      });
+      expect(dbGoal?.status).toBe('ACHIEVED');
+      expect(dbGoal?.achieved_at).not.toBeNull();
+    });
+
+    it('AC-5: konkurensi alokasi paralel (saldo 1.000.000, dua request 600.000) -> tepat satu 201 dan satu 409', async () => {
+      const p1 = request(app.getHttpServer())
+        .post(`/savings/goals/${goalId}/allocations`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          account_id: bcaAccountId,
+          amount: 600000,
+        });
+
+      const p2 = request(app.getHttpServer())
+        .post(`/savings/goals/${goalId}/allocations`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          account_id: bcaAccountId,
+          amount: 600000,
+        });
+
+      const [r1, r2] = await Promise.all([p1, p2]);
+      const statuses = [r1.status, r2.status].sort((a, b) => a - b);
+      expect(statuses).toEqual([201, 409]);
+
+      // Total reserved di DB harus 600.000, bukan 1.200.000
+      const activeAllocations = await prisma.asSystem().savingsAllocation.aggregate({
+        where: {
+          account_id: bcaAccountId,
+          status: 'ACTIVE',
+        },
+        _sum: { amount: true },
+      });
+      expect(activeAllocations._sum.amount).toBe(600000n);
+    });
+
+    it('AC-6: User B mengakses alokasi ke goal User A atau memakai account_id User B -> 404', async () => {
+      // Buat akun milik User B
+      const userBAcc = await prisma.asSystem().account.create({
+        data: {
+          user_id: userBId,
+          financial_profile_id: (await prisma.asSystem().financialProfile.findFirstOrThrow({ where: { user_id: userBId, is_default: true } })).id,
+          name: 'User B Bank',
+          type: 'BANK',
+          opening_balance: 1000000n,
+          balance: 1000000n,
+          opening_date: new Date(),
+        },
+      });
+
+      // 1. User B coba alokasi ke goal User A -> 404 GOAL_NOT_FOUND
+      const resBtoA = await request(app.getHttpServer())
+        .post(`/savings/goals/${goalId}/allocations`)
+        .set('Cookie', userBHeaders.cookie)
+        .send({
+          account_id: userBAcc.id,
+          amount: 100000,
+        });
+      expect(resBtoA.status).toBe(404);
+      expect(resBtoA.body.code).toBe('GOAL_NOT_FOUND');
+
+      // 2. User A coba alokasi memakai account_id milik User B -> 404 ACCOUNT_NOT_FOUND
+      const resAusingBAcc = await request(app.getHttpServer())
+        .post(`/savings/goals/${goalId}/allocations`)
+        .set('Cookie', userAHeaders.cookie)
+        .send({
+          account_id: userBAcc.id,
+          amount: 100000,
+        });
+      expect(resAusingBAcc.status).toBe(404);
+      expect(resAusingBAcc.body.code).toBe('ACCOUNT_NOT_FOUND');
+    });
+  });
 });

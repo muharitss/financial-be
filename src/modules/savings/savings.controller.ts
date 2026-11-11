@@ -13,12 +13,18 @@ import { ApiTags, ApiOperation, ApiResponse, ApiCookieAuth } from '@nestjs/swagg
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard.js';
 import { CurrentUser } from '../../common/decorators/current-user.decorator.js';
 import { ZodValidationPipe } from '../../common/pipes/zod-validation.pipe.js';
-import { SavingsService, SavingsGoalResponse } from './savings.service.js';
+import {
+  SavingsService,
+  SavingsGoalResponse,
+  AllocateGoalResponse,
+} from './savings.service.js';
 import {
   createSavingsGoalSchema,
   updateSavingsGoalSchema,
+  createAllocationSchema,
   type CreateSavingsGoalDto,
   type UpdateSavingsGoalDto,
+  type CreateAllocationDto,
 } from './dto/savings.dto.js';
 
 @ApiTags('savings')
@@ -69,5 +75,22 @@ export class SavingsController {
     @Param('id', new ParseUUIDPipe()) id: string,
   ): Promise<SavingsGoalResponse> {
     return this.savingsService.archiveGoal(user, id);
+  }
+
+  @Post(':id/allocations')
+  @HttpCode(HttpStatus.CREATED)
+  @ApiOperation({ summary: 'Mengalokasikan dana dari akun ke target tabungan' })
+  @ApiResponse({ status: 201, description: 'Alokasi berhasil dibuat' })
+  @ApiResponse({ status: 400, description: 'Data tidak valid' })
+  @ApiResponse({ status: 401, description: 'Sesi tidak valid' })
+  @ApiResponse({ status: 404, description: 'Target tabungan atau akun tidak ditemukan' })
+  @ApiResponse({ status: 409, description: 'Saldo tidak mencukupi atau target/akun diarsipkan' })
+  @ApiResponse({ status: 422, description: 'Tipe akun tidak dapat dialokasikan' })
+  async allocate(
+    @CurrentUser() user: { userId: string; role?: string },
+    @Param('id', new ParseUUIDPipe()) id: string,
+    @Body(new ZodValidationPipe(createAllocationSchema)) dto: CreateAllocationDto,
+  ): Promise<AllocateGoalResponse> {
+    return this.savingsService.allocate(user, id, dto);
   }
 }
