@@ -187,7 +187,7 @@ describe('Reports E2E Test Suite (Supertest)', () => {
 
   afterAll(async () => {
     await app.close();
-  });
+  }, 30000);
 
   describe('AC-1 & AC-8: GET /reports/summary', () => {
     it('returns 401 when unauthenticated', async () => {
@@ -896,6 +896,45 @@ describe('Reports E2E Test Suite (Supertest)', () => {
     });
   });
 
+  describe('TASK-086: GET /reports/export.pdf', () => {
+    it('AC-1: returns 200, application/pdf, and body starting with %PDF- header', async () => {
+      const res = await request(app.getHttpServer())
+        .get('/reports/export.pdf?from=2026-11-01&to=2026-11-30')
+        .set('Cookie', userAHeaders.cookie)
+        .responseType('blob');
+
+      expect(res.status).toBe(200);
+      expect(res.headers['content-type']).toBe('application/pdf');
+      expect(res.headers['cache-control']).toBe('no-store');
+      expect(res.headers['content-disposition']).toBe('attachment; filename="duitku-laporan.pdf"');
+      expect(Buffer.isBuffer(res.body)).toBe(true);
+      expect(res.body.subarray(0, 5).toString('ascii')).toBe('%PDF-');
+    }, 20000);
+
+    it('AC-6: invalid query returns 400 without launching Chromium', async () => {
+      const res = await request(app.getHttpServer())
+        .get('/reports/export.pdf?from=2026-11-30&to=2026-11-01')
+        .set('Cookie', userAHeaders.cookie);
+
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe('VALIDATION_ERROR');
+    });
+
+    it('AC-6: exceeding 5 requests per minute returns 429', async () => {
+      let lastStatus = 200;
+      for (let i = 0; i < 10; i++) {
+        const res = await request(app.getHttpServer())
+          .get('/reports/export.pdf?from=2026-11-01&to=2026-11-30')
+          .set('Cookie', userBHeaders.cookie);
+        lastStatus = res.status;
+        if (res.status === 429) {
+          break;
+        }
+      }
+      expect(lastStatus).toBe(429);
+    }, 30000);
+  });
+
   describe('AC-7: Swagger OpenAPI Documentation', () => {
     it('displays tag reports with routes and reference descriptions to /transactions and /budgets', async () => {
       const res = await request(app.getHttpServer()).get('/docs-json');
@@ -907,6 +946,7 @@ describe('Reports E2E Test Suite (Supertest)', () => {
       expect(paths['/reports/balance-changes']).toBeDefined();
       expect(paths['/reports/monthly-comparison']).toBeDefined();
       expect(paths['/reports/export.csv']).toBeDefined();
+      expect(paths['/reports/export.pdf']).toBeDefined();
 
       // Check tags
       expect(paths['/reports/summary'].get.tags).toContain('reports');
@@ -914,6 +954,7 @@ describe('Reports E2E Test Suite (Supertest)', () => {
       expect(paths['/reports/balance-changes'].get.tags).toContain('reports');
       expect(paths['/reports/monthly-comparison'].get.tags).toContain('reports');
       expect(paths['/reports/export.csv'].get.tags).toContain('reports');
+      expect(paths['/reports/export.pdf'].get.tags).toContain('reports');
 
       // Check reference descriptions
       const summaryDesc = paths['/reports/summary'].get.description ?? '';

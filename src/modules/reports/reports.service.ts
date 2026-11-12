@@ -1,10 +1,12 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, HttpException, HttpStatus, Logger } from '@nestjs/common';
+import puppeteer, { type Browser } from 'puppeteer';
 import { PrismaService } from '../../prisma/prisma.service.js';
 import { DashboardService } from '../dashboard/dashboard.service.js';
 import { TransactionsService } from '../transactions/transactions.service.js';
 import { balanceEffects } from '../dashboard/balance-effects.js';
 import { previousPeriod, currentPeriodInTz } from '../../common/utils/date.js';
 import { CSV_HEADER, CSV_BOM, transactionToCsvRow } from './csv.js';
+import { renderReportHtml, type PdfReportData } from './pdf-template.js';
 import type { ReportFilter } from '../dashboard/dto/dashboard.dto.js';
 import type {
   BalanceChangesResponse,
@@ -16,6 +18,8 @@ import type {
 
 @Injectable()
 export class ReportsService {
+  private readonly logger = new Logger(ReportsService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly dashboardService: DashboardService,
@@ -325,5 +329,233 @@ export class ReportsService {
 
       cursor = page.next_cursor;
     } while (cursor);
+  }
+
+  async buildPdf(userId: string, filter?: ReportFilter): Promise<Buffer> {
+    const { from, to } = await this.dashboardService.resolveRange(
+      userId,
+      filter?.from,
+      filter?.to,
+    );
+
+    const pref = await this.prisma.userPreference.findFirst({
+      where: { user_id: userId },
+    });
+    const tz = pref?.timezone ?? 'Asia/Jakarta';
+    const now = new Date();
+    const printedAt = new Intl.DateTimeFormat('id-ID', {
+      timeZone: tz,
+      dateStyle: 'medium',
+      timeStyle: 'short',
+    }).format(now);
+
+    let accountNames = 'Semua akun';
+    if (filter?.account_id && filter.account_id.length > 0) {
+      const accounts = await this.prisma.account.findMany({
+        where: { user_id: userId, id: { in: filter.account_id } },
+        select: { name: true },
+      });
+      if (accounts.length > 0) {
+        accountNames = accounts.map((a) => a.name).join(', ');
+      }
+    }
+
+    let categoryNames = 'Semua kategori';
+    if (filter?.category_id && filter.category_id.length > 0) {
+      const categories = await this.prisma.category.findMany({
+        where: {
+          id: { in: filter.category_id },
+          user_id: userId,
+        },
+        select: { name: true },
+      });
+      if (categories.length > 0) {
+        categoryNames = categories.map((c) => c.name).join(', ');
+      }
+    }
+
+    const summary = await this.dashboardService.getSummary(userId, filter);
+    const categoryBreakdown = await this.dashboardService.getCategoryBreakdown(
+      userId,
+      filter,
+    );
+
+    const startDate = new Date(`${from}T00:00:00.000Z`);
+    const [toYearStr, toMonthStr, toDayStr] = to.split('-');
+    const toYear = parseInt(toYearStr, 10);
+    const toMonth = parseInt(toMonthStr, 10);
+    const toDay = parseInt(toDayStr, 10);
+    const nextDayDate = new Date(Date.UTC(toYear, toMonth - 1, toDay + 1));
+
+    const where: any = {
+      user_id: userId,
+      status: 'POSTED',
+      date: {
+        gte: startDate,
+        lt: nextDayDate,
+      },
+    };
+
+    if (filter?.account_id && filter.account_id.length > 0) {
+      where.OR = [
+        { account_id: { in: filter.account_id } },
+        { to_account_id: { in: filter.account_id } },
+      ];
+    }
+
+    if (filter?.category_id && filter.category_id.length > 0) {
+      const catConditions = [
+        { category_id: { in: filter.category_id } },
+        { splits: { some: { category_id: { in: filter.category_id } } } },
+      ];
+      if (where.OR) {
+        where.AND = [{ OR: where.OR }, { OR: catConditions }];
+        delete where.OR;
+      } else {
+        where.OR = catConditions;
+      }
+    }
+
+    const totalTransactionsCount = await this.prisma.transaction.count({
+      where,
+    });
+
+    // shortcut: batas 2000 baris di PDF, pindah ke job async bila user butuh PDF penuh
+    const maxRows = 2000;
+    const txRecords = await this.prisma.transaction.findMany({
+      where,
+      select: {
+        id: true,
+        date: true,
+        type: true,
+        amount: true,
+        note: true,
+        reason: true,
+        account: {
+          select: { name: true },
+        },
+        to_account: {
+          select: { name: true },
+        },
+        category: {
+          select: { name: true },
+        },
+        splits: {
+          select: {
+            amount: true,
+            category: {
+              select: { name: true },
+            },
+          },
+        },
+      },
+      orderBy: [{ date: 'desc' }, { id: 'desc' }],
+      take: maxRows,
+    });
+
+    const transactions = txRecords.map((tx) => {
+      let accountName = tx.account?.name ?? '-';
+      if (tx.type === 'TRANSFER' && tx.to_account?.name) {
+        accountName = `${tx.account?.name ?? '-'} → ${tx.to_account.name}`;
+      }
+
+      let categoryName = tx.category?.name ?? '-';
+      if (!tx.category && tx.splits && tx.splits.length > 0) {
+        const splitNames = tx.splits
+          .map((s) => s.category?.name)
+          .filter(Boolean);
+        categoryName = splitNames.length > 0 ? splitNames.join(', ') : 'Split';
+      }
+
+      return {
+        date: tx.date,
+        type: tx.type,
+        account_name: accountName,
+        category_name: categoryName,
+        notes: tx.note || tx.reason || '-',
+        amount: Number(tx.amount),
+      };
+    });
+
+    const reportData: PdfReportData = {
+      from,
+      to,
+      accountNames,
+      categoryNames,
+      printedAt,
+      summary: {
+        income: summary.income,
+        expense: summary.expense,
+        net: summary.net,
+        adjustment_net: summary.adjustment_net,
+        transfer_total: summary.transfer_total,
+      },
+      categories: categoryBreakdown.items.map((item) => ({
+        name: item.name,
+        amount: item.amount,
+        percent_bp: item.percent_bp,
+      })),
+      transactions,
+      totalTransactionsCount,
+    };
+
+    const html = renderReportHtml(reportData);
+
+    // shortcut: launch Chromium per request, ganti ke browser pool bila export > 1 req/detik
+    const args: string[] = [];
+    if (process.env.PUPPETEER_NO_SANDBOX === 'true') {
+      args.push('--no-sandbox');
+    }
+
+    let browser: Browser | null = null;
+    try {
+      browser = await puppeteer.launch({
+        headless: true,
+        args,
+        timeout: 30000,
+      });
+
+      const page = await browser.newPage();
+      await page.setJavaScriptEnabled(false);
+      await page.setRequestInterception(true);
+      page.on('request', (req) => {
+        void req.abort();
+      });
+
+      await page.setContent(html, {
+        waitUntil: 'load',
+        timeout: 30000,
+      });
+
+      const pdf = await page.pdf({
+        format: 'A4',
+        printBackground: true,
+        timeout: 30000,
+      });
+
+      return Buffer.from(pdf);
+    } catch (err: unknown) {
+      if (err instanceof HttpException) {
+        throw err;
+      }
+      this.logger.error('Error generating PDF report', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      throw new HttpException(
+        {
+          code: 'PDF_GENERATION_FAILED',
+          message: 'Gagal membuat PDF, coba lagi atau gunakan ekspor CSV',
+        },
+        HttpStatus.SERVICE_UNAVAILABLE,
+      );
+    } finally {
+      if (browser) {
+        await browser.close().catch((closeErr) => {
+          this.logger.error('Failed to close browser', {
+            error: String(closeErr),
+          });
+        });
+      }
+    }
   }
 }

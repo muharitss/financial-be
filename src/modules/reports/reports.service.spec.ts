@@ -18,7 +18,8 @@ describe('ReportsService', () => {
   let prismaMock: {
     userPreference: { findFirst: jest.Mock };
     account: { findMany: jest.Mock };
-    transaction: { findMany: jest.Mock };
+    category: { findMany: jest.Mock };
+    transaction: { findMany: jest.Mock; count: jest.Mock };
   };
 
   beforeEach(async () => {
@@ -33,7 +34,8 @@ describe('ReportsService', () => {
     prismaMock = {
       userPreference: { findFirst: jest.fn() as any },
       account: { findMany: jest.fn() as any },
-      transaction: { findMany: jest.fn() as any },
+      category: { findMany: jest.fn() as any },
+      transaction: { findMany: jest.fn() as any, count: jest.fn() as any },
     };
 
     const module: TestingModule = await Test.createTestingModule({
@@ -505,6 +507,107 @@ describe('ReportsService', () => {
         'user-1',
         expect.objectContaining({ limit: 200, cursor: 'cursor-123' }),
       );
+    });
+  });
+
+  describe('buildPdf', () => {
+    it('generates a valid PDF buffer starting with %PDF- header', async () => {
+      dashboardServiceMock.resolveRange.mockResolvedValue({
+        from: '2026-11-01',
+        to: '2026-11-30',
+      });
+      prismaMock.userPreference.findFirst.mockResolvedValue({
+        timezone: 'Asia/Jakarta',
+      });
+      prismaMock.account.findMany.mockResolvedValue([{ name: 'BCA' }]);
+      prismaMock.category.findMany.mockResolvedValue([{ name: 'Makanan' }]);
+      dashboardServiceMock.getSummary.mockResolvedValue({
+        from: '2026-11-01',
+        to: '2026-11-30',
+        income: 1000000,
+        expense: 500000,
+        net: 500000,
+        adjustment_net: 0,
+        transfer_total: 0,
+      });
+      dashboardServiceMock.getCategoryBreakdown.mockResolvedValue({
+        from: '2026-11-01',
+        to: '2026-11-30',
+        total: 500000,
+        items: [
+          {
+            category_id: 'cat-1',
+            name: 'Makanan',
+            amount: 500000,
+            percent_bp: 10000,
+          },
+        ],
+      });
+      prismaMock.transaction.count.mockResolvedValue(1);
+      prismaMock.transaction.findMany.mockResolvedValue([
+        {
+          id: 'tx-1',
+          date: new Date('2026-11-05T10:00:00.000Z'),
+          type: 'EXPENSE',
+          amount: 500000n,
+          note: 'Makan siang',
+          reason: null,
+          account: { name: 'BCA' },
+          to_account: null,
+          category: { name: 'Makanan' },
+          splits: [],
+        },
+      ]);
+
+      const buffer = await service.buildPdf('user-1', {
+        from: '2026-11-01',
+        to: '2026-11-30',
+      });
+
+      expect(Buffer.isBuffer(buffer)).toBe(true);
+      expect(buffer.length).toBeGreaterThan(100);
+      expect(buffer.subarray(0, 5).toString('ascii')).toBe('%PDF-');
+    }, 15000);
+
+    it('throws 503 PDF_GENERATION_FAILED if puppeteer fails', async () => {
+      dashboardServiceMock.resolveRange.mockResolvedValue({
+        from: '2026-11-01',
+        to: '2026-11-30',
+      });
+      prismaMock.userPreference.findFirst.mockResolvedValue(null);
+      dashboardServiceMock.getSummary.mockResolvedValue({
+        from: '2026-11-01',
+        to: '2026-11-30',
+        income: 0,
+        expense: 0,
+        net: 0,
+        adjustment_net: 0,
+        transfer_total: 0,
+      });
+      dashboardServiceMock.getCategoryBreakdown.mockResolvedValue({
+        from: '2026-11-01',
+        to: '2026-11-30',
+        total: 0,
+        items: [],
+      });
+      prismaMock.transaction.count.mockResolvedValue(0);
+      prismaMock.transaction.findMany.mockResolvedValue([]);
+
+      // Mock puppeteer.launch to simulate a failure
+      const puppeteerModule = await import('puppeteer');
+      const spy = jest
+        .spyOn(puppeteerModule.default, 'launch')
+        .mockRejectedValueOnce(new Error('Chromium crash simulation'));
+
+      await expect(service.buildPdf('user-1')).rejects.toMatchObject({
+        response: {
+          code: 'PDF_GENERATION_FAILED',
+          message: 'Gagal membuat PDF, coba lagi atau gunakan ekspor CSV',
+        },
+        status: 503,
+      });
+
+      spy.mockRestore();
     });
   });
 });

@@ -156,4 +156,36 @@ export class ReportsController {
       res.destroy();
     }
   }
+
+  @Get('export.pdf')
+  @Throttle({ default: { limit: 5, ttl: 60000 } })
+  @ApiOperation({
+    summary: 'Ekspor laporan keuangan ke format PDF',
+    description:
+      'FR-REPORTS-009. Ekspor laporan keuangan berformat PDF A4 via Puppeteer headless browser.',
+  })
+  @ApiQuery({ name: 'from', required: false, type: String, description: 'YYYY-MM-DD' })
+  @ApiQuery({ name: 'to', required: false, type: String, description: 'YYYY-MM-DD' })
+  @ApiQuery({ name: 'account_id', required: false, type: [String], description: 'Filter UUID akun' })
+  @ApiQuery({ name: 'category_id', required: false, type: [String], description: 'Filter UUID kategori' })
+  @ApiResponse({ status: 200, description: 'File PDF berhasil diunduh' })
+  @ApiResponse({ status: 400, description: 'Parameter filter tidak valid' })
+  @ApiResponse({ status: 401, description: 'Sesi tidak valid' })
+  @ApiResponse({ status: 429, description: 'Rate limit ekspor PDF terlampaui' })
+  @ApiResponse({ status: 503, description: 'Chromium gagal membuat PDF' })
+  async exportPdf(
+    @CurrentUser() user: { userId: string },
+    @Query(new ZodValidationPipe(reportFilterSchema)) query: ReportFilter,
+    @Res() res: Response,
+  ): Promise<void> {
+    const pdfBuffer = await this.reportsService.buildPdf(user.userId, query);
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader(
+      'Content-Disposition',
+      'attachment; filename="duitku-laporan.pdf"',
+    );
+    res.send(pdfBuffer);
+  }
 }
