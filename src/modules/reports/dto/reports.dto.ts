@@ -1,4 +1,14 @@
 import { z } from 'zod';
+import { listTransactionsQuerySchema } from '../../transactions/dto/transaction.dto.js';
+
+export const exportTransactionsCsvQuerySchema = listTransactionsQuerySchema.omit({
+  cursor: true,
+  limit: true,
+});
+
+export type ExportTransactionsCsvQueryDto = z.infer<
+  typeof exportTransactionsCsvQuerySchema
+>;
 
 const emptyToUndefined = (val: unknown) => (val === '' ? undefined : val);
 

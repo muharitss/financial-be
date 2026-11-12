@@ -2,6 +2,7 @@ import { jest, describe, it, expect, beforeEach } from '@jest/globals';
 import { Test, TestingModule } from '@nestjs/testing';
 import { ReportsService } from './reports.service.js';
 import { DashboardService } from '../dashboard/dashboard.service.js';
+import { TransactionsService } from '../transactions/transactions.service.js';
 import { PrismaService } from '../../prisma/prisma.service.js';
 
 describe('ReportsService', () => {
@@ -10,6 +11,9 @@ describe('ReportsService', () => {
     resolveRange: jest.Mock;
     getSummary: jest.Mock;
     getCategoryBreakdown: jest.Mock;
+  };
+  let transactionsServiceMock: {
+    list: jest.Mock;
   };
   let prismaMock: {
     userPreference: { findFirst: jest.Mock };
@@ -23,6 +27,9 @@ describe('ReportsService', () => {
       getSummary: jest.fn() as any,
       getCategoryBreakdown: jest.fn() as any,
     };
+    transactionsServiceMock = {
+      list: jest.fn() as any,
+    };
     prismaMock = {
       userPreference: { findFirst: jest.fn() as any },
       account: { findMany: jest.fn() as any },
@@ -35,6 +42,10 @@ describe('ReportsService', () => {
         {
           provide: DashboardService,
           useValue: dashboardServiceMock,
+        },
+        {
+          provide: TransactionsService,
+          useValue: transactionsServiceMock,
         },
         {
           provide: PrismaService,
@@ -55,27 +66,31 @@ describe('ReportsService', () => {
 
       prismaMock.account.findMany.mockResolvedValue([
         {
-          id: 'acc-1',
+          id: 'acc-bca',
           name: 'BCA',
           type: 'BANK',
-          opening_balance: 10_000_000n,
-          opening_date: new Date('2026-01-01T00:00:00.000Z'),
+          opening_balance: 1_000_000n,
+          opening_date: new Date('2026-10-01T00:00:00.000Z'),
         },
         {
-          id: 'acc-2',
+          id: 'acc-cash',
           name: 'Dompet',
           type: 'CASH',
-          opening_balance: 500_000n,
-          opening_date: new Date('2026-11-15T00:00:00.000Z'),
+          opening_balance: 200_000n,
+          opening_date: new Date('2026-10-01T00:00:00.000Z'),
         },
       ]);
 
+      // BCA had 100k expense in October (before from -> opening)
+      // BCA received 500k income in Nov (inflow)
+      // Dompet spent 50k in Nov (outflow)
+      // Transfer 100k from BCA to Dompet in Nov (BCA outflow 100k, Dompet inflow 100k)
       prismaMock.transaction.findMany.mockResolvedValue([
         {
-          id: 'tx-old',
+          id: 'tx-oct',
           type: 'EXPENSE',
-          amount: 200_000n,
-          account_id: 'acc-1',
+          amount: 100_000n,
+          account_id: 'acc-bca',
           to_account_id: null,
           transfer_fee: 0n,
           fee_mode: null,
@@ -83,10 +98,10 @@ describe('ReportsService', () => {
           parent: null,
         },
         {
-          id: 'tx-in-period-1',
+          id: 'tx-nov-inc',
           type: 'INCOME',
-          amount: 5_000_000n,
-          account_id: 'acc-1',
+          amount: 500_000n,
+          account_id: 'acc-bca',
           to_account_id: null,
           transfer_fee: 0n,
           fee_mode: null,
@@ -94,14 +109,25 @@ describe('ReportsService', () => {
           parent: null,
         },
         {
-          id: 'tx-in-period-transfer',
-          type: 'TRANSFER',
-          amount: 1_000_000n,
-          account_id: 'acc-1',
-          to_account_id: 'acc-2',
-          transfer_fee: 6_500n,
-          fee_mode: 'SEPARATE',
+          id: 'tx-nov-exp',
+          type: 'EXPENSE',
+          amount: 50_000n,
+          account_id: 'acc-cash',
+          to_account_id: null,
+          transfer_fee: 0n,
+          fee_mode: null,
           date: new Date('2026-11-10T00:00:00.000Z'),
+          parent: null,
+        },
+        {
+          id: 'tx-nov-trf',
+          type: 'TRANSFER',
+          amount: 100_000n,
+          account_id: 'acc-bca',
+          to_account_id: 'acc-cash',
+          transfer_fee: 0n,
+          fee_mode: null,
+          date: new Date('2026-11-15T00:00:00.000Z'),
           parent: null,
         },
       ]);
@@ -113,26 +139,37 @@ describe('ReportsService', () => {
 
       expect(result.from).toBe('2026-11-01');
       expect(result.to).toBe('2026-11-30');
-      expect(result.items.length).toBe(2);
+      expect(result.items).toHaveLength(2);
 
-      const bca = result.items.find((i) => i.account_id === 'acc-1')!;
-      expect(bca.opening).toBe(9_800_000);
-      expect(bca.inflow).toBe(5_000_000);
-      expect(bca.outflow).toBe(1_006_500);
-      expect(bca.closing).toBe(9_800_000 + 5_000_000 - 1_006_500);
+      // BCA:
+      // opening = 1_000_000 - 100_000 = 900_000
+      // inflow = 500_000
+      // outflow = 100_000 (transfer)
+      // closing = 900_000 + 500_000 - 100_000 = 1_300_000
+      const bca = result.items.find((i) => i.account_id === 'acc-bca')!;
+      expect(bca.opening).toBe(900_000);
+      expect(bca.inflow).toBe(500_000);
+      expect(bca.outflow).toBe(100_000);
+      expect(bca.closing).toBe(1_300_000);
       expect(bca.closing - bca.opening).toBe(bca.inflow - bca.outflow);
 
-      const dompet = result.items.find((i) => i.account_id === 'acc-2')!;
-      expect(dompet.opening).toBe(0);
-      expect(dompet.inflow).toBe(500_000 + 1_000_000);
-      expect(dompet.outflow).toBe(0);
-      expect(dompet.closing).toBe(1_500_000);
-      expect(dompet.closing - dompet.opening).toBe(dompet.inflow - dompet.outflow);
+      // Dompet:
+      // opening = 200_000
+      // inflow = 100_000 (transfer from BCA)
+      // outflow = 50_000
+      // closing = 200_000 + 100_000 - 50_000 = 250_000
+      const cash = result.items.find((i) => i.account_id === 'acc-cash')!;
+      expect(cash.opening).toBe(200_000);
+      expect(cash.inflow).toBe(100_000);
+      expect(cash.outflow).toBe(50_000);
+      expect(cash.closing).toBe(250_000);
+      expect(cash.closing - cash.opening).toBe(cash.inflow - cash.outflow);
 
-      expect(result.totals.opening).toBe(bca.opening + dompet.opening);
-      expect(result.totals.inflow).toBe(bca.inflow + dompet.inflow);
-      expect(result.totals.outflow).toBe(bca.outflow + dompet.outflow);
-      expect(result.totals.closing).toBe(bca.closing + dompet.closing);
+      // Totals
+      expect(result.totals.opening).toBe(1_100_000);
+      expect(result.totals.inflow).toBe(600_000);
+      expect(result.totals.outflow).toBe(150_000);
+      expect(result.totals.closing).toBe(1_550_000);
       expect(result.totals.closing - result.totals.opening).toBe(
         result.totals.inflow - result.totals.outflow,
       );
@@ -150,31 +187,32 @@ describe('ReportsService', () => {
           name: 'BCA',
           type: 'BANK',
           opening_balance: 1_000_000n,
-          opening_date: new Date('2026-01-01T00:00:00.000Z'),
+          opening_date: new Date('2026-11-01T00:00:00.000Z'),
         },
       ]);
 
+      // Expense 100k on Nov 5, reversed on Nov 10
       prismaMock.transaction.findMany.mockResolvedValue([
         {
-          id: 'tx-rev-orig',
+          id: 'tx-exp',
           type: 'EXPENSE',
-          amount: 50_000n,
+          amount: 100_000n,
           account_id: 'acc-1',
           to_account_id: null,
           transfer_fee: 0n,
           fee_mode: null,
-          date: new Date('2026-11-02T00:00:00.000Z'),
+          date: new Date('2026-11-05T00:00:00.000Z'),
           parent: null,
         },
         {
-          id: 'tx-reversal',
+          id: 'tx-rev',
           type: 'REVERSAL',
-          amount: 50_000n,
+          amount: 100_000n,
           account_id: 'acc-1',
           to_account_id: null,
           transfer_fee: 0n,
           fee_mode: null,
-          date: new Date('2026-11-03T00:00:00.000Z'),
+          date: new Date('2026-11-10T00:00:00.000Z'),
           parent: { type: 'EXPENSE' },
         },
       ]);
@@ -184,10 +222,12 @@ describe('ReportsService', () => {
         to: '2026-11-30',
       });
 
-      const bca = result.items[0];
-      expect(bca.inflow).toBe(50_000);
-      expect(bca.outflow).toBe(50_000);
-      expect(bca.closing).toBe(bca.opening);
+      const acc = result.items[0];
+      // Inflow = 100_000 (from reversal), Outflow = 100_000 (from expense)
+      expect(acc.inflow).toBe(100_000);
+      expect(acc.outflow).toBe(100_000);
+      expect(acc.closing).toBe(1_000_000);
+      expect(acc.closing - acc.opening).toBe(acc.inflow - acc.outflow);
     });
 
     it('returns empty result when filtered account_id does not belong to user (AC-8)', async () => {
@@ -195,25 +235,34 @@ describe('ReportsService', () => {
         from: '2026-11-01',
         to: '2026-11-30',
       });
-
+      // User has no account with foreign UUID
       prismaMock.account.findMany.mockResolvedValue([]);
 
       const result = await service.getBalanceChanges('user-1', {
-        from: '2026-11-01',
-        to: '2026-11-30',
-        account_id: ['non-existent-or-other-user'],
+        account_id: ['00000000-0000-0000-0000-000000000099'],
       });
 
       expect(result.items).toEqual([]);
-      expect(result.totals).toEqual({ opening: 0, inflow: 0, outflow: 0, closing: 0 });
+      expect(result.totals).toEqual({
+        opening: 0,
+        inflow: 0,
+        outflow: 0,
+        closing: 0,
+      });
+      expect(prismaMock.transaction.findMany).not.toHaveBeenCalled();
     });
   });
 
   describe('getMonthlyComparison', () => {
     it('AC-4: computes delta and delta_bp accurately; returns null delta_bp when previous is 0', async () => {
+      prismaMock.userPreference.findFirst.mockResolvedValue({
+        timezone: 'Asia/Jakarta',
+      });
+
       dashboardServiceMock.getSummary.mockImplementation(
-        async (_userId: string, filter?: { from?: string }) => {
-          if (filter?.from?.startsWith('2026-11')) {
+        async (_userId: string, range: { from: string; to: string }) => {
+          if (range.from.startsWith('2026-11')) {
+            // November (current)
             return {
               from: '2026-11-01',
               to: '2026-11-30',
@@ -224,12 +273,13 @@ describe('ReportsService', () => {
               transfer_total: 0,
             };
           } else {
+            // October (previous)
             return {
               from: '2026-10-01',
               to: '2026-10-31',
-              income: 1_500_000,
+              income: 1_000_000,
               expense: 1_000_000,
-              net: 500_000,
+              net: 0,
               adjustment_net: 0,
               transfer_total: 0,
             };
@@ -238,32 +288,30 @@ describe('ReportsService', () => {
       );
 
       dashboardServiceMock.getCategoryBreakdown.mockImplementation(
-        async (_userId: string, filter?: { from?: string }) => {
-          if (filter?.from?.startsWith('2026-11')) {
+        async (_userId: string, range: { from: string; to: string }) => {
+          if (range.from.startsWith('2026-11')) {
             return {
               from: '2026-11-01',
               to: '2026-11-30',
               total: 1_250_000,
               items: [
                 {
-                  category_id: 'cat-1',
-                  name: 'Makanan',
+                  category_id: 'cat-makanan',
+                  name: 'Makanan & Minuman',
                   icon: 'food',
-                  color: '#fff',
-                  total: 800_000,
-                  percentage: 64,
-                  percentage_bp: 6400,
-                  subcategories: [],
+                  color: '#ff0000',
+                  archived: false,
+                  amount: 800_000,
+                  percent_bp: 6400,
                 },
                 {
-                  category_id: 'cat-2',
+                  category_id: 'cat-transport',
                   name: 'Transportasi',
                   icon: 'car',
-                  color: '#fff',
-                  total: 450_000,
-                  percentage: 36,
-                  percentage_bp: 3600,
-                  subcategories: [],
+                  color: '#00ff00',
+                  archived: false,
+                  amount: 450_000,
+                  percent_bp: 3600,
                 },
               ],
             };
@@ -274,24 +322,22 @@ describe('ReportsService', () => {
               total: 1_000_000,
               items: [
                 {
-                  category_id: 'cat-1',
-                  name: 'Makanan',
+                  category_id: 'cat-makanan',
+                  name: 'Makanan & Minuman',
                   icon: 'food',
-                  color: '#fff',
-                  total: 600_000,
-                  percentage: 60,
-                  percentage_bp: 6000,
-                  subcategories: [],
+                  color: '#ff0000',
+                  archived: false,
+                  amount: 600_000,
+                  percent_bp: 6000,
                 },
                 {
-                  category_id: 'cat-3',
-                  name: 'Tagihan',
-                  icon: 'bill',
-                  color: '#fff',
-                  total: 400_000,
-                  percentage: 40,
-                  percentage_bp: 4000,
-                  subcategories: [],
+                  category_id: 'cat-hiburan',
+                  name: 'Hiburan',
+                  icon: 'game',
+                  color: '#0000ff',
+                  archived: false,
+                  amount: 400_000,
+                  percent_bp: 4000,
                 },
               ],
             };
@@ -304,46 +350,68 @@ describe('ReportsService', () => {
       expect(result.month).toBe('2026-11');
       expect(result.previous_month).toBe('2026-10');
 
-      expect(result.current.income).toBe(2_000_000);
-      expect(result.current.expense).toBe(1_250_000);
-      expect(result.previous.income).toBe(1_500_000);
-      expect(result.previous.expense).toBe(1_000_000);
+      // Delta: current - previous
+      // income: 2_000_000 - 1_000_000 = 1_000_000
+      // expense: 1_250_000 - 1_000_000 = 250_000
+      // net: 750_000 - 0 = 750_000
+      expect(result.delta).toEqual({
+        income: 1_000_000,
+        expense: 250_000,
+        net: 750_000,
+      });
 
-      expect(result.delta.income).toBe(500_000);
-      expect(result.delta.expense).toBe(250_000);
-      expect(result.delta.net).toBe(250_000);
+      // delta_bp:
+      // income: 1_000_000 * 10000 / 1_000_000 = 10000
+      // expense: 250_000 * 10000 / 1_000_000 = 2500
+      // net: previous was 0 -> null
+      expect(result.delta_bp).toEqual({
+        income: 10000,
+        expense: 2500,
+        net: null,
+      });
 
-      expect(result.delta_bp.income).toBe(3333);
-      expect(result.delta_bp.expense).toBe(2500);
-      expect(result.delta_bp.net).toBe(5000);
-
-      expect(result.categories.length).toBe(3);
-      expect(result.categories[0].name).toBe('Makanan');
-      expect(result.categories[0].current).toBe(800_000);
-      expect(result.categories[0].previous).toBe(600_000);
-      expect(result.categories[0].delta).toBe(200_000);
-
-      expect(result.categories[1].name).toBe('Transportasi');
-      expect(result.categories[1].current).toBe(450_000);
-      expect(result.categories[1].previous).toBe(0);
-      expect(result.categories[1].delta).toBe(450_000);
-
-      expect(result.categories[2].name).toBe('Tagihan');
-      expect(result.categories[2].current).toBe(0);
-      expect(result.categories[2].previous).toBe(400_000);
-      expect(result.categories[2].delta).toBe(-400_000);
+      // Categories merged & sorted by current descending
+      // 1. Makanan (current: 800k, prev: 600k, delta: 200k)
+      // 2. Transport (current: 450k, prev: 0, delta: 450k)
+      // 3. Hiburan (current: 0, prev: 400k, delta: -400k)
+      expect(result.categories).toHaveLength(3);
+      expect(result.categories[0]).toEqual({
+        category_id: 'cat-makanan',
+        name: 'Makanan & Minuman',
+        current: 800_000,
+        previous: 600_000,
+        delta: 200_000,
+      });
+      expect(result.categories[1]).toEqual({
+        category_id: 'cat-transport',
+        name: 'Transportasi',
+        current: 450_000,
+        previous: 0,
+        delta: 450_000,
+      });
+      expect(result.categories[2]).toEqual({
+        category_id: 'cat-hiburan',
+        name: 'Hiburan',
+        current: 0,
+        previous: 400_000,
+        delta: -400_000,
+      });
     });
 
     it('AC-4: when previous month has zero expense, delta_bp.expense is null (no division by zero)', async () => {
+      prismaMock.userPreference.findFirst.mockResolvedValue({
+        timezone: 'Asia/Jakarta',
+      });
+
       dashboardServiceMock.getSummary.mockImplementation(
-        async (_userId: string, filter?: { from?: string }) => {
-          if (filter?.from?.startsWith('2026-11')) {
+        async (_userId: string, range: { from: string; to: string }) => {
+          if (range.from.startsWith('2026-11')) {
             return {
               from: '2026-11-01',
               to: '2026-11-30',
-              income: 1_000_000,
+              income: 0,
               expense: 500_000,
-              net: 500_000,
+              net: -500_000,
               adjustment_net: 0,
               transfer_total: 0,
             };
@@ -372,6 +440,71 @@ describe('ReportsService', () => {
 
       expect(result.delta.expense).toBe(500_000);
       expect(result.delta_bp.expense).toBeNull();
+    });
+  });
+
+  describe('streamTransactionsCsv', () => {
+    it('writes BOM and header, then iterates cursor until next_cursor is null', async () => {
+      prismaMock.account.findMany.mockResolvedValue([
+        { id: 'acc-1', name: 'Dompet Tunai' },
+      ]);
+
+      transactionsServiceMock.list
+        .mockResolvedValueOnce({
+          items: [
+            {
+              id: 'tx-1',
+              date: '2026-11-01',
+              type: 'INCOME',
+              status: 'POSTED',
+              account_id: 'acc-1',
+              amount: 500000,
+              transfer_fee: 0,
+              created_at: '2026-11-01T08:00:00.000Z',
+            },
+          ],
+          next_cursor: 'cursor-123',
+        })
+        .mockResolvedValueOnce({
+          items: [
+            {
+              id: 'tx-2',
+              date: '2026-11-02',
+              type: 'EXPENSE',
+              status: 'POSTED',
+              account_id: 'acc-1',
+              amount: 25000,
+              transfer_fee: 0,
+              created_at: '2026-11-02T09:00:00.000Z',
+            },
+          ],
+          next_cursor: null,
+        });
+
+      const chunks: string[] = [];
+      await service.streamTransactionsCsv(
+        'user-1',
+        { date_from: '2026-11-01', date_to: '2026-11-30' } as any,
+        (chunk) => chunks.push(chunk),
+      );
+
+      expect(chunks.length).toBe(3);
+      expect(chunks[0].startsWith('\uFEFFID,Tanggal,Jenis')).toBe(true);
+      expect(chunks[1]).toContain('Dompet Tunai');
+      expect(chunks[1]).toContain('500000');
+      expect(chunks[2]).toContain('Dompet Tunai');
+      expect(chunks[2]).toContain('25000');
+      expect(transactionsServiceMock.list).toHaveBeenCalledTimes(2);
+      expect(transactionsServiceMock.list).toHaveBeenNthCalledWith(
+        1,
+        'user-1',
+        expect.objectContaining({ limit: 200, cursor: undefined }),
+      );
+      expect(transactionsServiceMock.list).toHaveBeenNthCalledWith(
+        2,
+        'user-1',
+        expect.objectContaining({ limit: 200, cursor: 'cursor-123' }),
+      );
     });
   });
 });

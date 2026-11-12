@@ -1,4 +1,6 @@
-import { Controller, Get, Query, UseGuards } from '@nestjs/common';
+import { Controller, Get, Query, UseGuards, Res, Logger } from '@nestjs/common';
+import type { Response } from 'express';
+import { Throttle } from '@nestjs/throttler';
 import { ApiTags, ApiOperation, ApiResponse, ApiCookieAuth, ApiQuery } from '@nestjs/swagger';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard.js';
 import { CurrentUser } from '../../common/decorators/current-user.decorator.js';
@@ -13,7 +15,9 @@ import {
 import { ReportsService } from './reports.service.js';
 import {
   monthlyComparisonQuerySchema,
+  exportTransactionsCsvQuerySchema,
   type MonthlyComparisonQueryDto,
+  type ExportTransactionsCsvQueryDto,
   type BalanceChangesResponse,
   type MonthlyComparisonResponse,
 } from './dto/reports.dto.js';
@@ -23,6 +27,8 @@ import {
 @Controller('reports')
 @UseGuards(JwtAuthGuard)
 export class ReportsController {
+  private readonly logger = new Logger(ReportsController.name);
+
   constructor(
     private readonly dashboardService: DashboardService,
     private readonly reportsService: ReportsService,
@@ -93,7 +99,7 @@ export class ReportsController {
     description:
       'FR-REPORTS-006. Perbandingan performa keuangan bulan ini vs bulan sebelumnya, termasuk delta basis points (bp) dan breakdown per kategori.',
   })
-  @ApiQuery({ name: 'month', required: false, type: String, description: 'YYYY-MM-DD' })
+  @ApiQuery({ name: 'month', required: false, type: String, description: 'YYYY-MM (default bulan berjalan di timezone user)' })
   @ApiResponse({ status: 200, description: 'Laporan perbandingan bulanan berhasil diambil' })
   @ApiResponse({ status: 400, description: 'Format bulan tidak valid' })
   @ApiResponse({ status: 401, description: 'Sesi tidak valid' })
@@ -102,5 +108,52 @@ export class ReportsController {
     @Query(new ZodValidationPipe(monthlyComparisonQuerySchema)) query: MonthlyComparisonQueryDto,
   ): Promise<MonthlyComparisonResponse> {
     return this.reportsService.getMonthlyComparison(user.userId, query.month);
+  }
+
+  @Get('export.csv')
+  @Throttle({ default: { limit: 10, ttl: 60000 } })
+  @ApiOperation({
+    summary: 'Ekspor riwayat transaksi ke format CSV',
+    description:
+      'FR-REPORTS-008. Streaming ekspor riwayat transaksi ber-BOM UTF-8 dengan pembatasan rate limit 10 request/menit.',
+  })
+  @ApiQuery({ name: 'date_from', required: false, type: String, description: 'YYYY-MM-DD' })
+  @ApiQuery({ name: 'date_to', required: false, type: String, description: 'YYYY-MM-DD' })
+  @ApiQuery({ name: 'type', required: false, type: [String], description: 'Filter tipe transaksi' })
+  @ApiQuery({ name: 'status', required: false, type: [String], description: 'Filter status transaksi' })
+  @ApiQuery({ name: 'account_id', required: false, type: [String], description: 'Filter UUID akun' })
+  @ApiQuery({ name: 'category_id', required: false, type: [String], description: 'Filter UUID kategori' })
+  @ApiResponse({ status: 200, description: 'File CSV berhasil diunduh' })
+  @ApiResponse({ status: 400, description: 'Parameter query tidak valid' })
+  @ApiResponse({ status: 401, description: 'Sesi tidak valid' })
+  @ApiResponse({ status: 429, description: 'Rate limit ekspor CSV terlampaui' })
+  async exportCsv(
+    @CurrentUser() user: { userId: string },
+    @Query(new ZodValidationPipe(exportTransactionsCsvQuerySchema))
+    query: ExportTransactionsCsvQueryDto,
+    @Res() res: Response,
+  ): Promise<void> {
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader(
+      'Content-Disposition',
+      'attachment; filename="duitku-transaksi.csv"',
+    );
+
+    try {
+      await this.reportsService.streamTransactionsCsv(
+        user.userId,
+        query,
+        (chunk: string) => {
+          res.write(chunk);
+        },
+      );
+      res.end();
+    } catch (err: unknown) {
+      this.logger.error('Error streaming CSV export', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      res.destroy();
+    }
   }
 }

@@ -1,14 +1,17 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service.js';
 import { DashboardService } from '../dashboard/dashboard.service.js';
+import { TransactionsService } from '../transactions/transactions.service.js';
 import { balanceEffects } from '../dashboard/balance-effects.js';
 import { previousPeriod, currentPeriodInTz } from '../../common/utils/date.js';
+import { CSV_HEADER, CSV_BOM, transactionToCsvRow } from './csv.js';
 import type { ReportFilter } from '../dashboard/dto/dashboard.dto.js';
 import type {
   BalanceChangesResponse,
   BalanceChangeItem,
   MonthlyComparisonResponse,
   MonthlyComparisonCategoryItem,
+  ExportTransactionsCsvQueryDto,
 } from './dto/reports.dto.js';
 
 @Injectable()
@@ -16,6 +19,7 @@ export class ReportsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly dashboardService: DashboardService,
+    private readonly transactionsService: TransactionsService,
   ) {}
 
   async getBalanceChanges(
@@ -98,69 +102,67 @@ export class ReportsService {
 
     for (const acc of accounts) {
       accountStats.set(acc.id, { opening: 0n, inflow: 0n, outflow: 0n });
+      const d =
+        acc.opening_date instanceof Date
+          ? acc.opening_date.toISOString().slice(0, 10)
+          : String(acc.opening_date).slice(0, 10);
+      if (d <= from) {
+        accountStats.get(acc.id)!.opening += acc.opening_balance;
+      } else if (d <= to) {
+        if (acc.opening_balance >= 0n) {
+          accountStats.get(acc.id)!.inflow += acc.opening_balance;
+        } else {
+          accountStats.get(acc.id)!.outflow += -acc.opening_balance;
+        }
+      }
     }
 
-    const [fromYearStr, fromMonthStr, fromDayStr] = from.split('-');
-    const fromYear = parseInt(fromYearStr, 10);
-    const fromMonth = parseInt(fromMonthStr, 10);
-    const fromDay = parseInt(fromDayStr, 10);
-    const startDate = new Date(Date.UTC(fromYear, fromMonth - 1, fromDay));
-
     for (const tx of transactions) {
-      const txEffects = balanceEffects(tx);
-      const isBeforePeriod = tx.date < startDate;
+      const txDateStr =
+        tx.date instanceof Date
+          ? tx.date.toISOString().slice(0, 10)
+          : String(tx.date).slice(0, 10);
 
-      for (const eff of txEffects) {
-        if (!targetAccountIds.has(eff.account_id)) {
-          continue;
-        }
-        const stat = accountStats.get(eff.account_id)!;
+      const effects = balanceEffects(tx);
+      for (const eff of effects) {
+        const stats = accountStats.get(eff.account_id);
+        if (!stats) continue;
 
-        if (isBeforePeriod) {
-          stat.opening += eff.delta;
-        } else {
-          if (eff.delta > 0n) {
-            stat.inflow += eff.delta;
-          } else if (eff.delta < 0n) {
-            stat.outflow += -eff.delta;
+        if (txDateStr < from) {
+          stats.opening += eff.delta;
+        } else if (txDateStr <= to) {
+          if (eff.delta >= 0n) {
+            stats.inflow += eff.delta;
+          } else {
+            stats.outflow += -eff.delta;
           }
         }
       }
     }
 
-    const items: BalanceChangeItem[] = [];
     let totalOpening = 0n;
     let totalInflow = 0n;
     let totalOutflow = 0n;
     let totalClosing = 0n;
 
+    const items: BalanceChangeItem[] = [];
+
     for (const acc of accounts) {
-      const stat = accountStats.get(acc.id)!;
-      let opening = stat.opening;
-      if (acc.opening_date < startDate) {
-        opening += acc.opening_balance;
-      } else if (acc.opening_date <= endDate) {
-        if (acc.opening_balance > 0n) {
-          stat.inflow += acc.opening_balance;
-        } else if (acc.opening_balance < 0n) {
-          stat.outflow += -acc.opening_balance;
-        }
-      }
+      const stats = accountStats.get(acc.id)!;
+      const closing = stats.opening + stats.inflow - stats.outflow;
 
-      const closing = opening + stat.inflow - stat.outflow;
-
-      totalOpening += opening;
-      totalInflow += stat.inflow;
-      totalOutflow += stat.outflow;
+      totalOpening += stats.opening;
+      totalInflow += stats.inflow;
+      totalOutflow += stats.outflow;
       totalClosing += closing;
 
       items.push({
         account_id: acc.id,
         name: acc.name,
         type: acc.type,
-        opening: Number(opening),
-        inflow: Number(stat.inflow),
-        outflow: Number(stat.outflow),
+        opening: Number(stats.opening),
+        inflow: Number(stats.inflow),
+        outflow: Number(stats.outflow),
         closing: Number(closing),
       });
     }
@@ -180,41 +182,39 @@ export class ReportsService {
 
   async getMonthlyComparison(
     userId: string,
-    targetMonth?: string,
+    month?: string,
   ): Promise<MonthlyComparisonResponse> {
-    let month = targetMonth;
-    if (!month) {
+    let targetMonth = month;
+    if (!targetMonth) {
       const pref = await this.prisma.userPreference.findFirst({
         where: { user_id: userId },
       });
       const tz = pref?.timezone ?? 'Asia/Jakarta';
-      month = currentPeriodInTz(tz);
+      targetMonth = currentPeriodInTz(tz);
     }
 
-    const prevMonth = previousPeriod(month);
+    const prevMonth = previousPeriod(targetMonth);
 
-    const [currentYear, currentMonthNum] = month.split('-').map(Number);
-    const lastDayCurrent = new Date(Date.UTC(currentYear, currentMonthNum, 0)).getUTCDate();
-    const currentFrom = `${month}-01`;
-    const currentTo = `${month}-${String(lastDayCurrent).padStart(2, '0')}`;
+    const getMonthRange = (period: string) => {
+      const [yStr, mStr] = period.split('-');
+      const y = parseInt(yStr, 10);
+      const m = parseInt(mStr, 10);
+      const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
+      return {
+        from: `${period}-01`,
+        to: `${period}-${String(lastDay).padStart(2, '0')}`,
+      };
+    };
 
-    const [prevYear, prevMonthNum] = prevMonth.split('-').map(Number);
-    const lastDayPrev = new Date(Date.UTC(prevYear, prevMonthNum, 0)).getUTCDate();
-    const prevFrom = `${prevMonth}-01`;
-    const prevTo = `${prevMonth}-${String(lastDayPrev).padStart(2, '0')}`;
+    const currentRange = getMonthRange(targetMonth);
+    const prevRange = getMonthRange(prevMonth);
 
-    const [currentSummary, prevSummary, currentCatBreakdown, prevCatBreakdown] =
+    const [currentSummary, prevSummary, currentCatRes, prevCatRes] =
       await Promise.all([
-        this.dashboardService.getSummary(userId, { from: currentFrom, to: currentTo }),
-        this.dashboardService.getSummary(userId, { from: prevFrom, to: prevTo }),
-        this.dashboardService.getCategoryBreakdown(userId, {
-          from: currentFrom,
-          to: currentTo,
-        }),
-        this.dashboardService.getCategoryBreakdown(userId, {
-          from: prevFrom,
-          to: prevTo,
-        }),
+        this.dashboardService.getSummary(userId, currentRange),
+        this.dashboardService.getSummary(userId, prevRange),
+        this.dashboardService.getCategoryBreakdown(userId, currentRange),
+        this.dashboardService.getCategoryBreakdown(userId, prevRange),
       ]);
 
     const deltaIncome = currentSummary.income - prevSummary.income;
@@ -223,53 +223,51 @@ export class ReportsService {
 
     const calcDeltaBp = (delta: number, previous: number): number | null => {
       if (previous === 0) return null;
-      return Number((BigInt(delta) * 10000n) / BigInt(Math.abs(previous)));
+      const deltaBig = BigInt(delta);
+      const prevBig = BigInt(Math.abs(previous));
+      return Number((deltaBig * 10000n) / prevBig);
     };
 
-    const categoriesMap = new Map<
-      string,
-      { category_id: string | null; name: string; current: number; previous: number }
-    >();
+    const catMap = new Map<string, MonthlyComparisonCategoryItem>();
 
-    for (const item of currentCatBreakdown.items) {
-      const key = item.category_id ?? item.name;
-      categoriesMap.set(key, {
+    for (const item of currentCatRes.items) {
+      const key = item.category_id ?? '__uncategorized__';
+      catMap.set(key, {
         category_id: item.category_id,
         name: item.name,
-        current: item.total,
+        current: item.amount,
         previous: 0,
+        delta: item.amount,
       });
     }
 
-    for (const item of prevCatBreakdown.items) {
-      const key = item.category_id ?? item.name;
-      const existing = categoriesMap.get(key);
+    for (const item of prevCatRes.items) {
+      const key = item.category_id ?? '__uncategorized__';
+      const existing = catMap.get(key);
       if (existing) {
-        existing.previous = item.total;
+        existing.previous = item.amount;
+        existing.delta = existing.current - item.amount;
       } else {
-        categoriesMap.set(key, {
+        catMap.set(key, {
           category_id: item.category_id,
           name: item.name,
           current: 0,
-          previous: item.total,
+          previous: item.amount,
+          delta: 0 - item.amount,
         });
       }
     }
 
-    const categories: MonthlyComparisonCategoryItem[] = Array.from(
-      categoriesMap.values(),
-    )
-      .map((c) => ({
-        category_id: c.category_id,
-        name: c.name,
-        current: c.current,
-        previous: c.previous,
-        delta: c.current - c.previous,
-      }))
-      .sort((a, b) => b.current - a.current);
+    const categories = Array.from(catMap.values());
+    categories.sort((a, b) => {
+      if (b.current !== a.current) {
+        return b.current - a.current;
+      }
+      return a.name.localeCompare(b.name);
+    });
 
     return {
-      month,
+      month: targetMonth,
       previous_month: prevMonth,
       current: {
         income: currentSummary.income,
@@ -295,5 +293,37 @@ export class ReportsService {
       },
       categories,
     };
+  }
+
+  async streamTransactionsCsv(
+    userId: string,
+    query: ExportTransactionsCsvQueryDto,
+    write: (chunk: string) => void,
+  ): Promise<void> {
+    const accounts = await this.prisma.account.findMany({
+      where: { user_id: userId },
+      select: { id: true, name: true },
+    });
+    const accountMap = new Map(accounts.map((a) => [a.id, a.name]));
+
+    write(`${CSV_BOM}${CSV_HEADER}\r\n`);
+
+    let cursor: string | null = null;
+    do {
+      const page = await this.transactionsService.list(userId, {
+        ...query,
+        cursor: cursor ?? undefined,
+        limit: 200,
+      });
+
+      if (page.items && page.items.length > 0) {
+        const rows = page.items
+          .map((item) => transactionToCsvRow(item, accountMap))
+          .join('\r\n');
+        write(`${rows}\r\n`);
+      }
+
+      cursor = page.next_cursor;
+    } while (cursor);
   }
 }
