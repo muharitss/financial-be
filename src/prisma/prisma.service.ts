@@ -57,6 +57,44 @@ function hasUserId(obj: any): boolean {
   return false;
 }
 
+export const IMMUTABLE_AUDIT_MODELS = new Set([
+  'AuditLog',
+  'TransactionAudit',
+]);
+
+const IMMUTABLE_AUDIT_MODELS_LOWER = new Set(
+  Array.from(IMMUTABLE_AUDIT_MODELS).map((m) => m.toLowerCase()),
+);
+
+const IMMUTABLE_AUDIT_OPERATIONS = new Set([
+  'update',
+  'updateMany',
+  'delete',
+  'deleteMany',
+  'upsert',
+]);
+
+const IMMUTABLE_AUDIT_OPERATIONS_LOWER = new Set(
+  Array.from(IMMUTABLE_AUDIT_OPERATIONS).map((o) => o.toLowerCase()),
+);
+
+export function validateAuditAppendOnly(
+  model?: string,
+  operation?: string,
+): void {
+  if (
+    model &&
+    IMMUTABLE_AUDIT_MODELS_LOWER.has(model.toLowerCase()) &&
+    operation &&
+    IMMUTABLE_AUDIT_OPERATIONS_LOWER.has(operation.toLowerCase())
+  ) {
+    throw new ForbiddenException({
+      code: 'AUDIT_LOG_IMMUTABLE',
+      message: 'Audit log bersifat append-only',
+    });
+  }
+}
+
 export function validateTenantIsolation(
   model?: string,
   operation?: string,
@@ -136,6 +174,7 @@ export class PrismaService
       query: {
         $allModels: {
           async $allOperations({ model, operation, args, query }) {
+            validateAuditAppendOnly(model, operation);
             validateTenantIsolation(model, operation, args);
             return query(args);
           },

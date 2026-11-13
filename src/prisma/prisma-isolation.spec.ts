@@ -140,6 +140,29 @@ describe('Prisma Tenant Isolation Guard', () => {
       ).rejects.toThrow(ForbiddenException);
     });
 
+    it('AC-4: menolak operasi update, delete, deleteMany pada AuditLog dan TransactionAudit melalui client aplikasi', async () => {
+      await expect(
+        prisma.auditLog.update({ where: { id: '00000000-0000-0000-0000-000000000000' }, data: {} } as any),
+      ).rejects.toThrow(ForbiddenException);
+
+      try {
+        await prisma.auditLog.update({ where: { id: '00000000-0000-0000-0000-000000000000' }, data: {} } as any);
+      } catch (err: any) {
+        expect(err.getResponse()).toEqual({
+          code: 'AUDIT_LOG_IMMUTABLE',
+          message: 'Audit log bersifat append-only',
+        });
+      }
+
+      await expect(
+        prisma.auditLog.delete({ where: { id: '00000000-0000-0000-0000-000000000000' } } as any),
+      ).rejects.toThrow(ForbiddenException);
+
+      await expect(
+        prisma.transactionAudit.deleteMany({} as any),
+      ).rejects.toThrow(ForbiddenException);
+    });
+
     it('asSystem() mengembalikan base client yang membypass isolasi tenant', () => {
       const systemClient = prisma.asSystem();
       expect(systemClient).toBeDefined();
