@@ -32,6 +32,7 @@ model User {
   savings_goals           SavingsGoal[]
   notifications           Notification[]
   notification_preference NotificationPreference?
+  push_subscriptions      PushSubscription[]
 
   @@index([status])
   @@index([email])

@@ -17,6 +17,7 @@ export const USER_OWNED_MODELS = new Set([
   'Budget',
   'SavingsGoal',
   'Notification',
+  'PushSubscription',
   'IdempotencyKey',
   'RefreshToken',
 ]);
