@@ -1,21 +1,27 @@
-import { createHmac, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
+import 'multer';
 import {
   Injectable,
+  Logger,
   NotFoundException,
   ConflictException,
   UnprocessableEntityException,
 } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service.js';
+import { CloudinaryService } from '../files/cloudinary.service.js';
 import {
-  ALLOWED_ATTACHMENT_MIMES,
   MAX_ATTACHMENT_SIZE_BYTES,
   MAX_ATTACHMENTS_PER_TRANSACTION,
-  type PresignAttachmentDto,
-  type ConfirmAttachmentDto,
 } from './dto/transaction.dto.js';
 
 export const SIGNED_URL_TTL_SECONDS = 3600;
+
+const FORMAT_MAP: Record<string, string> = {
+  'image/jpeg': 'jpg',
+  'image/png': 'png',
+  'image/webp': 'webp',
+};
 
 export function detectMimeFromMagicBytes(
   buf: Buffer,
@@ -64,91 +70,57 @@ export function detectMimeFromMagicBytes(
 
 @Injectable()
 export class TransactionAttachmentsService {
-  constructor(private readonly prisma: PrismaService) {}
+  private readonly logger = new Logger(TransactionAttachmentsService.name);
 
-  // shortcut: lightweight crypto presign/signed-url adapter until full Cloudinary lifecycle in TASK-090
-  private getCloudinaryConfig() {
-    return {
-      cloudName: process.env.CLOUDINARY_CLOUD_NAME || 'duitku-dev',
-      apiKey: process.env.CLOUDINARY_API_KEY || 'duitku-dev-key',
-      apiSecret: process.env.CLOUDINARY_API_SECRET || 'duitku-dev-secret',
-    };
-  }
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly cloudinaryService: CloudinaryService,
+  ) {}
 
-  private createHmacSignature(payload: string): string {
-    const { apiSecret } = this.getCloudinaryConfig();
-    return createHmac('sha256', apiSecret).update(payload).digest('hex');
-  }
-
-  private buildUploadUrl(
-    storageKey: string,
-    mime: string,
-    size: number,
-    expiresAt: Date,
-  ): string {
-    const { cloudName, apiKey } = this.getCloudinaryConfig();
-    const exp = Math.floor(expiresAt.getTime() / 1000);
-    const sigPayload = `mime=${mime}&public_id=${storageKey}&size=${size}&timestamp=${exp}&type=authenticated`;
-    const signature = this.createHmacSignature(sigPayload);
-    return `https://api.cloudinary.com/v1_1/${encodeURIComponent(cloudName)}/image/upload?public_id=${encodeURIComponent(storageKey)}&type=authenticated&timestamp=${exp}&api_key=${encodeURIComponent(apiKey)}&signature=${signature}`;
-  }
-
-  private buildAuthenticatedAccessUrl(
-    storageKey: string,
-    expiresAt: Date,
-  ): string {
-    const { cloudName } = this.getCloudinaryConfig();
-    const exp = Math.floor(expiresAt.getTime() / 1000);
-    const sigPayload = `exp=${exp}&public_id=${storageKey}&type=authenticated`;
-    const signature = this.createHmacSignature(sigPayload);
-    return `https://res.cloudinary.com/${encodeURIComponent(cloudName)}/image/authenticated/s--${signature.slice(0, 8)}--/v1/${storageKey}?exp=${exp}&sig=${signature}`;
-  }
-
-  private validateMimeAndSize(mime: string, size: number) {
-    if (
-      !ALLOWED_ATTACHMENT_MIMES.includes(
-        mime as (typeof ALLOWED_ATTACHMENT_MIMES)[number],
-      )
-    ) {
+  async upload(
+    user: { userId: string; role?: string },
+    transactionId: string,
+    file?: Express.Multer.File,
+  ): Promise<{
+    attachment_id: string;
+    mime: string;
+    size_bytes: number;
+    access_url: string;
+    expires_at: Date;
+  }> {
+    if (!file || !file.buffer || file.buffer.length === 0) {
       throw new UnprocessableEntityException({
-        code: 'INVALID_FILE_TYPE',
-        message: 'Tipe file harus JPEG, PNG, atau WebP',
+        code: 'FILE_REQUIRED',
+        message: 'File lampiran wajib diunggah',
       });
     }
 
     if (
-      typeof size !== 'number' ||
-      !Number.isInteger(size) ||
-      size <= 0 ||
-      size > MAX_ATTACHMENT_SIZE_BYTES
+      file.size > MAX_ATTACHMENT_SIZE_BYTES ||
+      file.buffer.length > MAX_ATTACHMENT_SIZE_BYTES
     ) {
       throw new UnprocessableEntityException({
         code: 'FILE_TOO_LARGE',
         message: 'Ukuran lampiran maksimal 5 MB',
       });
     }
-  }
 
-  async presign(
-    user: { userId: string; role?: string },
-    transactionId: string,
-    dto: PresignAttachmentDto,
-  ): Promise<{
-    upload_url: string;
-    storage_key: string;
-    expires_at: Date;
-  }> {
-    this.validateMimeAndSize(dto?.mime, dto?.size);
-
-    const tx = await this.prisma.transaction.findFirst({
+    const txRow = await this.prisma.transaction.findFirst({
       where: { id: transactionId, user_id: user.userId },
-      select: { id: true },
+      select: { id: true, type: true },
     });
 
-    if (!tx) {
+    if (!txRow) {
       throw new NotFoundException({
         code: 'TRANSACTION_NOT_FOUND',
         message: 'Transaksi tidak ditemukan',
+      });
+    }
+
+    if (txRow.type === 'REVERSAL') {
+      throw new ConflictException({
+        code: 'ATTACHMENT_NOT_ALLOWED_ON_REVERSAL',
+        message: 'Transaksi reversal tidak dapat menerima lampiran',
       });
     }
 
@@ -163,107 +135,81 @@ export class TransactionAttachmentsService {
       });
     }
 
-    const storageKey = `users/${user.userId}/tx/${transactionId}/${randomUUID()}`;
-    const expiresAt = new Date(Date.now() + SIGNED_URL_TTL_SECONDS * 1000);
-    const uploadUrl = this.buildUploadUrl(
-      storageKey,
-      dto.mime,
-      dto.size,
-      expiresAt,
-    );
-
-    return {
-      upload_url: uploadUrl,
-      storage_key: storageKey,
-      expires_at: expiresAt,
-    };
-  }
-
-  async confirm(
-    user: { userId: string; role?: string },
-    transactionId: string,
-    dto: ConfirmAttachmentDto,
-  ): Promise<{
-    attachment_id: string;
-    access_url: string;
-    expires_at: Date;
-  }> {
-    this.validateMimeAndSize(dto?.mime, dto?.size_bytes);
-
-    const txRow = await this.prisma.transaction.findFirst({
-      where: { id: transactionId, user_id: user.userId },
-      select: { id: true },
-    });
-
-    if (!txRow) {
-      throw new NotFoundException({
-        code: 'TRANSACTION_NOT_FOUND',
-        message: 'Transaksi tidak ditemukan',
-      });
-    }
-
-    const expectedPrefix = `users/${user.userId}/tx/${transactionId}/`;
-    if (!dto.storage_key || !dto.storage_key.startsWith(expectedPrefix)) {
-      throw new UnprocessableEntityException({
-        code: 'INVALID_STORAGE_KEY',
-        message: 'storage_key tidak sesuai dengan pengguna atau transaksi ini',
-      });
-    }
-
-    const headerBuf = Buffer.from(dto.magic_bytes_base64 || '', 'base64');
-    const detectedMime = detectMimeFromMagicBytes(headerBuf);
-    if (!detectedMime || detectedMime !== dto.mime) {
+    const detectedMime = detectMimeFromMagicBytes(file.buffer);
+    if (!detectedMime) {
       throw new UnprocessableEntityException({
         code: 'INVALID_FILE_TYPE',
-        message: 'Isi file (magic bytes) tidak sesuai dengan format gambar',
+        message:
+          'Isi file (magic bytes) tidak sesuai dengan format gambar JPEG, PNG, atau WebP',
       });
     }
 
-    const expiresAt = new Date(Date.now() + SIGNED_URL_TTL_SECONDS * 1000);
+    const format = FORMAT_MAP[detectedMime] || 'jpg';
+    const storageKey = `users/${user.userId}/tx/${transactionId}/${randomUUID()}`;
 
-    return await this.prisma.$transaction(async (tx) => {
-      const currentCount = await tx.fileAttachment.count({
-        where: { transaction_id: transactionId },
-      });
+    await this.cloudinaryService.upload(file.buffer, storageKey, detectedMime);
 
-      if (currentCount >= MAX_ATTACHMENTS_PER_TRANSACTION) {
-        throw new ConflictException({
-          code: 'ATTACHMENT_LIMIT_EXCEEDED',
-          message: 'Maksimal 3 lampiran per transaksi',
+    try {
+      return await this.prisma.$transaction(async (tx) => {
+        const count = await tx.fileAttachment.count({
+          where: { transaction_id: transactionId },
         });
+
+        if (count >= MAX_ATTACHMENTS_PER_TRANSACTION) {
+          throw new ConflictException({
+            code: 'ATTACHMENT_LIMIT_EXCEEDED',
+            message: 'Maksimal 3 lampiran per transaksi',
+          });
+        }
+
+        const attachment = await tx.fileAttachment.create({
+          data: {
+            transaction_id: transactionId,
+            storage_key: storageKey,
+            mime: detectedMime,
+            size_bytes: BigInt(file.buffer.length),
+            uploaded_by: user.userId,
+          },
+        });
+
+        await tx.transactionAudit.create({
+          data: {
+            transaction_id: transactionId,
+            action: 'UPDATE',
+            before: Prisma.DbNull,
+            after: { attachment_added: attachment.id },
+            actor_user_id: user.userId,
+          },
+        });
+
+        const accessUrl = this.cloudinaryService.signedDownloadUrl(
+          storageKey,
+          format,
+          SIGNED_URL_TTL_SECONDS,
+        );
+        const expiresAt = new Date(Date.now() + SIGNED_URL_TTL_SECONDS * 1000);
+
+        this.logger.log(`Attachment ${attachment.id} uploaded by ${user.userId}`);
+
+        return {
+          attachment_id: attachment.id,
+          mime: detectedMime,
+          size_bytes: Number(attachment.size_bytes),
+          access_url: accessUrl,
+          expires_at: expiresAt,
+        };
+      });
+    } catch (err) {
+      try {
+        await this.cloudinaryService.destroy(storageKey);
+      } catch (destroyErr) {
+        this.logger.warn(
+          `Failed to cleanup orphaned Cloudinary file ${storageKey}:`,
+          destroyErr,
+        );
       }
-
-      const attachment = await tx.fileAttachment.create({
-        data: {
-          transaction_id: transactionId,
-          storage_key: dto.storage_key,
-          mime: dto.mime,
-          size_bytes: BigInt(dto.size_bytes),
-          uploaded_by: user.userId,
-        },
-      });
-
-      await tx.transactionAudit.create({
-        data: {
-          transaction_id: transactionId,
-          action: 'UPDATE',
-          before: Prisma.DbNull,
-          after: { attachment_added: attachment.id },
-          actor_user_id: user.userId,
-        },
-      });
-
-      const accessUrl = this.buildAuthenticatedAccessUrl(
-        attachment.storage_key,
-        expiresAt,
-      );
-
-      return {
-        attachment_id: attachment.id,
-        access_url: accessUrl,
-        expires_at: expiresAt,
-      };
-    });
+      throw err;
+    }
   }
 
   async getSignedUrl(
@@ -297,11 +243,13 @@ export class TransactionAttachmentsService {
       });
     }
 
-    const expiresAt = new Date(Date.now() + SIGNED_URL_TTL_SECONDS * 1000);
-    const accessUrl = this.buildAuthenticatedAccessUrl(
+    const format = FORMAT_MAP[attachment.mime] || 'jpg';
+    const accessUrl = this.cloudinaryService.signedDownloadUrl(
       attachment.storage_key,
-      expiresAt,
+      format,
+      SIGNED_URL_TTL_SECONDS,
     );
+    const expiresAt = new Date(Date.now() + SIGNED_URL_TTL_SECONDS * 1000);
 
     return {
       access_url: accessUrl,
@@ -355,5 +303,14 @@ export class TransactionAttachmentsService {
         },
       });
     });
+
+    try {
+      await this.cloudinaryService.destroy(attachment.storage_key);
+    } catch (destroyErr) {
+      this.logger.warn(
+        `Failed to destroy Cloudinary file ${attachment.storage_key}:`,
+        destroyErr,
+      );
+    }
   }
 }

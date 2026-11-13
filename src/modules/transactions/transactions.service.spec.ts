@@ -17,6 +17,7 @@ import {
   resolveClientTxId,
 } from './dto/transaction.dto.js';
 import { PrismaService } from '../../prisma/prisma.service.js';
+import { CloudinaryService } from '../files/cloudinary.service.js';
 
 describe('TransactionsService', () => {
   let service: TransactionsService;
@@ -2206,6 +2207,44 @@ describe('TransactionsService', () => {
           reason: 'Batal beli',
         },
       });
+    });
+
+    it('AC-5: cancel transaksi SCHEDULED dengan lampiran memanggil Cloudinary destroy', async () => {
+      const mockCloudinary = {
+        destroy: jest.fn<any>().mockResolvedValue({ result: 'ok' }),
+      };
+
+      const moduleWithCloudinary: TestingModule =
+        await Test.createTestingModule({
+          providers: [
+            TransactionsService,
+            { provide: PrismaService, useValue: prisma },
+            { provide: CloudinaryService, useValue: mockCloudinary },
+          ],
+        }).compile();
+
+      const txService =
+        moduleWithCloudinary.get<TransactionsService>(TransactionsService);
+
+      prisma.$queryRaw.mockResolvedValueOnce([scheduledExpense]);
+      prisma.transaction.update.mockResolvedValueOnce({
+        ...scheduledExpense,
+        status: 'CANCELLED',
+      });
+      prisma.transactionAudit.create.mockResolvedValue({ id: 'audit-1' });
+      prisma.fileAttachment.findMany.mockResolvedValueOnce([
+        { id: 'att-1', storage_key: 'users/u1/tx/t1/pic-1' },
+      ]);
+      prisma.fileAttachment.deleteMany.mockResolvedValueOnce({ count: 1 });
+
+      const res = await txService.cancel(user, scheduledExpense.id, {
+        client_tx_id: validUlid,
+      });
+
+      expect(res.status).toBe('CANCELLED');
+      expect(mockCloudinary.destroy).toHaveBeenCalledWith(
+        'users/u1/tx/t1/pic-1',
+      );
     });
 
     it('AC-2: Memanggil cancel pada transaksi POSTED -> 409 NOT_SCHEDULED', async () => {

@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { PrismaModule } from '../../prisma/prisma.module.js';
 import { BudgetsModule } from '../budgets/budgets.module.js';
+import { FilesModule } from '../files/files.module.js';
 import { TransactionsController } from './transactions.controller.js';
 import { AccountAdjustController } from './account-adjust.controller.js';
 import { TransactionsService } from './transactions.service.js';
@@ -10,7 +11,7 @@ import { TransactionAttachmentsService } from './transaction-attachments.service
 import { IdempotencyInterceptor } from '../../common/interceptors/idempotency.interceptor.js';
 
 @Module({
-  imports: [PrismaModule, BudgetsModule],
+  imports: [PrismaModule, BudgetsModule, FilesModule],
   controllers: [
     TransactionsController,
     AccountAdjustController,

@@ -6,6 +6,7 @@ import {
   redactNominalValues,
 } from './hard-delete.service.js';
 import { PrismaService } from '../../prisma/prisma.service.js';
+import { CloudinaryService } from '../files/cloudinary.service.js';
 
 describe('HardDeleteService', () => {
   let service: HardDeleteService;
@@ -206,6 +207,47 @@ describe('HardDeleteService', () => {
       const result = await service.runHardDelete();
 
       expect(result).toEqual({ deletedCount: 1, errors: 1 });
+    });
+
+    it('AC-5: membersihkan file Cloudinary milik user saat hard delete', async () => {
+      const mockCloudinary = {
+        destroy: jest.fn<any>().mockResolvedValue({ result: 'ok' }),
+      };
+
+      const moduleWithCloudinary: TestingModule =
+        await Test.createTestingModule({
+          providers: [
+            HardDeleteService,
+            { provide: PrismaService, useValue: prisma },
+            { provide: CloudinaryService, useValue: mockCloudinary },
+          ],
+        }).compile();
+
+      const hardDeleteService =
+        moduleWithCloudinary.get<HardDeleteService>(HardDeleteService);
+
+      prisma.user.findMany.mockResolvedValueOnce([
+        { id: 'user-with-files', status: 'PENDING_DELETION' },
+      ]);
+      prisma.auditLog.findMany.mockResolvedValueOnce([]);
+      prisma.fileAttachment = {
+        findMany: jest.fn<any>().mockResolvedValueOnce([
+          { storage_key: 'users/user-with-files/tx/1/pic-1' },
+          { storage_key: 'users/user-with-files/tx/2/pic-2' },
+        ]),
+      };
+      prisma.user.delete.mockResolvedValueOnce({ id: 'user-with-files' });
+
+      const result = await hardDeleteService.runHardDelete();
+
+      expect(result).toEqual({ deletedCount: 1, errors: 0 });
+      expect(mockCloudinary.destroy).toHaveBeenCalledTimes(2);
+      expect(mockCloudinary.destroy).toHaveBeenCalledWith(
+        'users/user-with-files/tx/1/pic-1',
+      );
+      expect(mockCloudinary.destroy).toHaveBeenCalledWith(
+        'users/user-with-files/tx/2/pic-2',
+      );
     });
   });
 });

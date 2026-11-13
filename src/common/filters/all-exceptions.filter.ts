@@ -28,7 +28,14 @@ export class AllExceptionsFilter implements ExceptionFilter {
     let details: any = null;
     const isProd = process.env.NODE_ENV === 'production';
 
-    if (exception instanceof HttpException) {
+    if (
+      (exception as any)?.code === 'LIMIT_FILE_SIZE' ||
+      (exception as any)?.message === 'File too large'
+    ) {
+      status = HttpStatus.UNPROCESSABLE_ENTITY;
+      code = 'FILE_TOO_LARGE';
+      message = 'Ukuran lampiran maksimal 5 MB';
+    } else if (exception instanceof HttpException) {
       status = exception.getStatus();
       const res = exception.getResponse();
 

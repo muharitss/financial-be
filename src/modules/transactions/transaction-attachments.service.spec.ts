@@ -1,14 +1,17 @@
 import { jest, describe, it, expect, beforeEach } from '@jest/globals';
 import { Test, TestingModule } from '@nestjs/testing';
+import { BadGatewayException } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service.js';
+import { CloudinaryService } from '../files/cloudinary.service.js';
 import {
   TransactionAttachmentsService,
   detectMimeFromMagicBytes,
 } from './transaction-attachments.service.js';
 
-describe('TransactionAttachmentsService (TASK-049)', () => {
+describe('TransactionAttachmentsService (TASK-090)', () => {
   let service: TransactionAttachmentsService;
   let prisma: any;
+  let cloudinary: any;
 
   const user = {
     userId: '11111111-1111-1111-1111-111111111111',
@@ -17,21 +20,36 @@ describe('TransactionAttachmentsService (TASK-049)', () => {
   const txId = '22222222-2222-2222-2222-222222222222';
   const aid = '33333333-3333-3333-3333-333333333333';
 
-  const jpegMagicBase64 = Buffer.from([
+  const jpegBuffer = Buffer.from([
     0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01,
-  ]).toString('base64');
+  ]);
 
-  const pngMagicBase64 = Buffer.from([
+  const pngBuffer = Buffer.from([
     0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
-  ]).toString('base64');
+  ]);
 
-  const webpMagicBase64 = Buffer.from([
+  const webpBuffer = Buffer.from([
     0x52, 0x49, 0x46, 0x46, 0x24, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50,
-  ]).toString('base64');
+  ]);
 
-  const textMagicBase64 = Buffer.from('Hello world not an image').toString(
-    'base64',
-  );
+  const textBuffer = Buffer.from('Hello world not an image');
+
+  const makeMulterFile = (
+    buf: Buffer,
+    originalname = 'receipt.jpg',
+    mimetype = 'image/jpeg',
+  ): Express.Multer.File => ({
+    fieldname: 'file',
+    originalname,
+    encoding: '7bit',
+    mimetype,
+    size: buf.length,
+    buffer: buf,
+    destination: '',
+    filename: originalname,
+    path: '',
+    stream: null as any,
+  });
 
   beforeEach(async () => {
     prisma = {
@@ -50,10 +68,24 @@ describe('TransactionAttachmentsService (TASK-049)', () => {
       $transaction: jest.fn(async (cb: any) => cb(prisma)),
     };
 
+    cloudinary = {
+      sign: jest.fn(),
+      upload: jest.fn<any>().mockResolvedValue({
+        public_id: `users/${user.userId}/tx/${txId}/mock`,
+        bytes: 100,
+      }),
+      signedDownloadUrl: jest.fn(
+        (key: string, format: string) =>
+          `https://api.cloudinary.com/v1_1/test-cloud/image/download?format=${format}&public_id=${key}&expires_at=123`,
+      ),
+      destroy: jest.fn<any>().mockResolvedValue({ result: 'ok' }),
+    };
+
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         TransactionAttachmentsService,
         { provide: PrismaService, useValue: prisma },
+        { provide: CloudinaryService, useValue: cloudinary },
       ],
     }).compile();
 
@@ -64,149 +96,53 @@ describe('TransactionAttachmentsService (TASK-049)', () => {
 
   describe('detectMimeFromMagicBytes', () => {
     it('mendeteksi JPEG (FF D8 FF)', () => {
-      const buf = Buffer.from(jpegMagicBase64, 'base64');
-      expect(detectMimeFromMagicBytes(buf)).toBe('image/jpeg');
+      expect(detectMimeFromMagicBytes(jpegBuffer)).toBe('image/jpeg');
     });
 
     it('mendeteksi PNG (89 50 4E 47 0D 0A 1A 0A)', () => {
-      const buf = Buffer.from(pngMagicBase64, 'base64');
-      expect(detectMimeFromMagicBytes(buf)).toBe('image/png');
+      expect(detectMimeFromMagicBytes(pngBuffer)).toBe('image/png');
     });
 
     it('mendeteksi WebP (RIFF....WEBP)', () => {
-      const buf = Buffer.from(webpMagicBase64, 'base64');
-      expect(detectMimeFromMagicBytes(buf)).toBe('image/webp');
+      expect(detectMimeFromMagicBytes(webpBuffer)).toBe('image/webp');
     });
 
     it('mengembalikan null untuk teks atau buffer tidak dikenal', () => {
-      const buf = Buffer.from(textMagicBase64, 'base64');
-      expect(detectMimeFromMagicBytes(buf)).toBeNull();
+      expect(detectMimeFromMagicBytes(textBuffer)).toBeNull();
       expect(detectMimeFromMagicBytes(Buffer.from([0x00, 0x01]))).toBeNull();
     });
   });
 
-  describe('presign', () => {
-    it('AC-1: presign { mime: image/jpeg, size: 3000000 } -> 200 { upload_url, storage_key, expires_at }', async () => {
-      prisma.transaction.findFirst.mockResolvedValueOnce({ id: txId });
+  describe('upload', () => {
+    it('AC-2: upload JPEG valid -> 201, FileAttachment + TransactionAudit dibuat, access_url ke image/download', async () => {
+      prisma.transaction.findFirst.mockResolvedValueOnce({
+        id: txId,
+        type: 'EXPENSE',
+      });
       prisma.fileAttachment.count.mockResolvedValueOnce(0);
-
-      const res = await service.presign(user, txId, {
-        mime: 'image/jpeg',
-        size: 3_000_000,
-      });
-
-      expect(res.upload_url).toContain('https://api.cloudinary.com/v1_1/');
-      expect(res.storage_key).toMatch(
-        new RegExp(`^users/${user.userId}/tx/${txId}/`),
-      );
-      expect(res.expires_at).toBeInstanceOf(Date);
-    });
-
-    it('AC-2: presign dengan size: 6000000 (> 5 MB) -> 422 FILE_TOO_LARGE', async () => {
-      await expect(
-        service.presign(user, txId, {
-          mime: 'image/jpeg',
-          size: 6_000_000,
-        }),
-      ).rejects.toMatchObject({
-        response: { code: 'FILE_TOO_LARGE' },
-      });
-    });
-
-    it('presign dengan tipe MIME tidak diizinkan -> 422 INVALID_FILE_TYPE', async () => {
-      await expect(
-        service.presign(user, txId, {
-          mime: 'application/pdf' as any,
-          size: 100_000,
-        }),
-      ).rejects.toMatchObject({
-        response: { code: 'INVALID_FILE_TYPE' },
-      });
-    });
-
-    it('AC-4: presign ke-4 saat sudah ada 3 lampiran -> 409 ATTACHMENT_LIMIT_EXCEEDED', async () => {
-      prisma.transaction.findFirst.mockResolvedValueOnce({ id: txId });
-      prisma.fileAttachment.count.mockResolvedValueOnce(3);
-
-      await expect(
-        service.presign(user, txId, {
-          mime: 'image/png',
-          size: 500_000,
-        }),
-      ).rejects.toMatchObject({
-        response: { code: 'ATTACHMENT_LIMIT_EXCEEDED' },
-      });
-    });
-
-    it('AC-6 (isolasi): presign pada transaksi user lain -> 404 TRANSACTION_NOT_FOUND', async () => {
-      prisma.transaction.findFirst.mockResolvedValueOnce(null);
-
-      await expect(
-        service.presign({ userId: 'other-user' }, txId, {
-          mime: 'image/jpeg',
-          size: 500_000,
-        }),
-      ).rejects.toMatchObject({
-        response: { code: 'TRANSACTION_NOT_FOUND' },
-      });
-    });
-  });
-
-  describe('confirm', () => {
-    const validStorageKey = `users/${user.userId}/tx/${txId}/file-uuid-1`;
-
-    it('AC-3: confirm dengan mime image/jpeg tetapi magic_bytes_base64 berisi PNG/teks -> 422 INVALID_FILE_TYPE', async () => {
-      prisma.transaction.findFirst.mockResolvedValue({ id: txId });
-
-      await expect(
-        service.confirm(user, txId, {
-          storage_key: validStorageKey,
-          mime: 'image/jpeg',
-          size_bytes: 1_000_000,
-          magic_bytes_base64: pngMagicBase64,
-        }),
-      ).rejects.toMatchObject({
-        response: { code: 'INVALID_FILE_TYPE' },
-      });
-
-      await expect(
-        service.confirm(user, txId, {
-          storage_key: validStorageKey,
-          mime: 'image/jpeg',
-          size_bytes: 1_000_000,
-          magic_bytes_base64: textMagicBase64,
-        }),
-      ).rejects.toMatchObject({
-        response: { code: 'INVALID_FILE_TYPE' },
-      });
-
-      expect(prisma.fileAttachment.create).not.toHaveBeenCalled();
-    });
-
-    it('AC-4: confirm dengan magic bytes JPEG/PNG/WebP valid -> 201 { attachment_id, access_url, expires_at } + audit', async () => {
-      prisma.transaction.findFirst.mockResolvedValueOnce({ id: txId });
-      prisma.fileAttachment.count.mockResolvedValueOnce(2);
+      prisma.fileAttachment.count.mockResolvedValueOnce(0);
       prisma.fileAttachment.create.mockResolvedValueOnce({
         id: aid,
         transaction_id: txId,
-        storage_key: validStorageKey,
-        mime: 'image/webp',
-        size_bytes: 250000n,
+        storage_key: `users/${user.userId}/tx/${txId}/file-1`,
+        mime: 'image/jpeg',
+        size_bytes: BigInt(jpegBuffer.length),
         uploaded_by: user.userId,
-        uploaded_at: new Date(),
       });
       prisma.transactionAudit.create.mockResolvedValueOnce({ id: 'audit-1' });
 
-      const res = await service.confirm(user, txId, {
-        storage_key: validStorageKey,
-        mime: 'image/webp',
-        size_bytes: 250_000,
-        magic_bytes_base64: webpMagicBase64,
-      });
+      const file = makeMulterFile(jpegBuffer);
+      const res = await service.upload(user, txId, file);
 
       expect(res.attachment_id).toBe(aid);
-      expect(res.access_url).toContain('image/authenticated/');
+      expect(res.mime).toBe('image/jpeg');
+      expect(res.size_bytes).toBe(jpegBuffer.length);
+      expect(res.access_url).toContain('api.cloudinary.com/v1_1/');
+      expect(res.access_url).toContain('image/download');
       expect(res.expires_at).toBeInstanceOf(Date);
+
+      expect(cloudinary.upload).toHaveBeenCalledTimes(1);
+      expect(prisma.fileAttachment.create).toHaveBeenCalled();
       expect(prisma.transactionAudit.create).toHaveBeenCalledWith({
         data: expect.objectContaining({
           transaction_id: txId,
@@ -217,63 +153,169 @@ describe('TransactionAttachmentsService (TASK-049)', () => {
       });
     });
 
-    it('AC-4: confirm ke-4 saat sudah ada 3 lampiran -> 409 ATTACHMENT_LIMIT_EXCEEDED', async () => {
-      prisma.transaction.findFirst.mockResolvedValueOnce({ id: txId });
+    it('AC-3: file teks yang di-rename .jpg -> 422 INVALID_FILE_TYPE dan tidak ada request ke Cloudinary', async () => {
+      prisma.transaction.findFirst.mockResolvedValueOnce({
+        id: txId,
+        type: 'EXPENSE',
+      });
+      prisma.fileAttachment.count.mockResolvedValueOnce(0);
+
+      const fakeJpg = makeMulterFile(textBuffer, 'fake.jpg', 'image/jpeg');
+
+      await expect(service.upload(user, txId, fakeJpg)).rejects.toMatchObject({
+        response: { code: 'INVALID_FILE_TYPE' },
+      });
+
+      expect(cloudinary.upload).not.toHaveBeenCalled();
+      expect(prisma.fileAttachment.create).not.toHaveBeenCalled();
+    });
+
+    it('AC-4: file > 5 MB -> ditolak 422 FILE_TOO_LARGE sebelum dibaca ke Cloudinary', async () => {
+      const hugeBuffer = Buffer.alloc(5_242_881);
+      const file = makeMulterFile(hugeBuffer);
+
+      await expect(service.upload(user, txId, file)).rejects.toMatchObject({
+        response: { code: 'FILE_TOO_LARGE' },
+      });
+
+      expect(cloudinary.upload).not.toHaveBeenCalled();
+    });
+
+    it('AC-4: upload ke-4 saat sudah ada 3 lampiran -> 409 ATTACHMENT_LIMIT_EXCEEDED tanpa panggil Cloudinary', async () => {
+      prisma.transaction.findFirst.mockResolvedValueOnce({
+        id: txId,
+        type: 'EXPENSE',
+      });
       prisma.fileAttachment.count.mockResolvedValueOnce(3);
 
-      await expect(
-        service.confirm(user, txId, {
-          storage_key: validStorageKey,
-          mime: 'image/jpeg',
-          size_bytes: 200_000,
-          magic_bytes_base64: jpegMagicBase64,
-        }),
-      ).rejects.toMatchObject({
+      const file = makeMulterFile(jpegBuffer);
+
+      await expect(service.upload(user, txId, file)).rejects.toMatchObject({
         response: { code: 'ATTACHMENT_LIMIT_EXCEEDED' },
+      });
+
+      expect(cloudinary.upload).not.toHaveBeenCalled();
+    });
+
+    it('AC-5: panggil destroy(publicId) jika insert DB gagal setelah upload Cloudinary sukses', async () => {
+      prisma.transaction.findFirst.mockResolvedValueOnce({
+        id: txId,
+        type: 'EXPENSE',
+      });
+      prisma.fileAttachment.count.mockResolvedValueOnce(1);
+      prisma.$transaction.mockRejectedValueOnce(new Error('DB connection dead'));
+
+      const file = makeMulterFile(pngBuffer, 'receipt.png', 'image/png');
+
+      await expect(service.upload(user, txId, file)).rejects.toThrow(
+        'DB connection dead',
+      );
+
+      expect(cloudinary.upload).toHaveBeenCalledTimes(1);
+      expect(cloudinary.destroy).toHaveBeenCalledTimes(1);
+      const destroyedKey = cloudinary.destroy.mock.calls[0][0];
+      expect(destroyedKey).toContain(`users/${user.userId}/tx/${txId}/`);
+    });
+
+    it('AC-6 (isolasi): upload pada transaksi milik user lain -> 404 TRANSACTION_NOT_FOUND', async () => {
+      prisma.transaction.findFirst.mockResolvedValueOnce(null);
+
+      const file = makeMulterFile(jpegBuffer);
+
+      await expect(
+        service.upload({ userId: 'other-user' }, txId, file),
+      ).rejects.toMatchObject({
+        response: { code: 'TRANSACTION_NOT_FOUND' },
+      });
+
+      expect(cloudinary.upload).not.toHaveBeenCalled();
+    });
+
+    it('AC-7: upload ke transaksi REVERSAL -> 409 ATTACHMENT_NOT_ALLOWED_ON_REVERSAL', async () => {
+      prisma.transaction.findFirst.mockResolvedValueOnce({
+        id: txId,
+        type: 'REVERSAL',
+      });
+
+      const file = makeMulterFile(jpegBuffer);
+
+      await expect(service.upload(user, txId, file)).rejects.toMatchObject({
+        response: { code: 'ATTACHMENT_NOT_ALLOWED_ON_REVERSAL' },
+      });
+
+      expect(cloudinary.upload).not.toHaveBeenCalled();
+    });
+
+    it('tolak 422 FILE_REQUIRED jika file tidak ada atau kosong', async () => {
+      await expect(
+        service.upload(user, txId, undefined as any),
+      ).rejects.toMatchObject({
+        response: { code: 'FILE_REQUIRED' },
+      });
+
+      await expect(
+        service.upload(user, txId, makeMulterFile(Buffer.alloc(0))),
+      ).rejects.toMatchObject({
+        response: { code: 'FILE_REQUIRED' },
       });
     });
 
-    it('tolak 422 INVALID_STORAGE_KEY jika prefix storage_key bukan milik user/transaksi', async () => {
-      prisma.transaction.findFirst.mockResolvedValueOnce({ id: txId });
+    it('meneruskan 502 FILE_STORAGE_UNAVAILABLE jika Cloudinary upload gagal', async () => {
+      prisma.transaction.findFirst.mockResolvedValueOnce({
+        id: txId,
+        type: 'EXPENSE',
+      });
+      prisma.fileAttachment.count.mockResolvedValueOnce(0);
+      cloudinary.upload.mockRejectedValueOnce(
+        new BadGatewayException({ code: 'FILE_STORAGE_UNAVAILABLE' }),
+      );
 
-      await expect(
-        service.confirm(user, txId, {
-          storage_key: 'users/other-user/tx/other-tx/file-1',
-          mime: 'image/jpeg',
-          size_bytes: 200_000,
-          magic_bytes_base64: jpegMagicBase64,
-        }),
-      ).rejects.toMatchObject({
-        response: { code: 'INVALID_STORAGE_KEY' },
+      const file = makeMulterFile(jpegBuffer);
+
+      await expect(service.upload(user, txId, file)).rejects.toMatchObject({
+        response: { code: 'FILE_STORAGE_UNAVAILABLE' },
       });
     });
   });
 
   describe('getSignedUrl', () => {
-    it('AC-5: mengembalikan signed URL dengan expires_at sekitar +3600 detik (1 jam)', async () => {
+    it('mengembalikan signed download URL 1 jam untuk lampiran', async () => {
       prisma.transaction.findFirst.mockResolvedValueOnce({ id: txId });
       prisma.fileAttachment.findFirst.mockResolvedValueOnce({
         id: aid,
         transaction_id: txId,
-        storage_key: `users/${user.userId}/tx/${txId}/file-1`,
-        mime: 'image/jpeg',
-        size_bytes: 100000n,
+        storage_key: `users/${user.userId}/tx/${txId}/pic-1`,
+        mime: 'image/png',
       });
 
       const before = Date.now();
       const res = await service.getSignedUrl(user, txId, aid);
       const after = Date.now();
 
-      expect(res.access_url).toContain('exp=');
-      expect(res.access_url).toContain('sig=');
-      const diffSeconds = (res.expires_at.getTime() - before) / 1000;
-      expect(diffSeconds).toBeGreaterThanOrEqual(3598);
+      expect(cloudinary.signedDownloadUrl).toHaveBeenCalledWith(
+        `users/${user.userId}/tx/${txId}/pic-1`,
+        'png',
+        3600,
+      );
+      expect(res.access_url).toContain('api.cloudinary.com/v1_1/');
+      const diffSec = (res.expires_at.getTime() - before) / 1000;
+      expect(diffSec).toBeGreaterThanOrEqual(3598);
       expect((res.expires_at.getTime() - after) / 1000).toBeLessThanOrEqual(
         3602,
       );
     });
 
-    it('melempar 404 ATTACHMENT_NOT_FOUND jika lampiran tidak ada', async () => {
+    it('AC-6 (isolasi): transaksi bukan milik user -> 404 TRANSACTION_NOT_FOUND', async () => {
+      prisma.transaction.findFirst.mockResolvedValueOnce(null);
+
+      await expect(
+        service.getSignedUrl({ userId: 'other-user' }, txId, aid),
+      ).rejects.toMatchObject({
+        response: { code: 'TRANSACTION_NOT_FOUND' },
+      });
+    });
+
+    it('lampiran tidak ditemukan -> 404 ATTACHMENT_NOT_FOUND', async () => {
       prisma.transaction.findFirst.mockResolvedValueOnce({ id: txId });
       prisma.fileAttachment.findFirst.mockResolvedValueOnce(null);
 
@@ -286,8 +328,8 @@ describe('TransactionAttachmentsService (TASK-049)', () => {
   });
 
   describe('remove', () => {
-    it('menghapus FileAttachment dan mencatat TransactionAudit', async () => {
-      const storageKey = `users/${user.userId}/tx/${txId}/file-1`;
+    it('AC-5: hapus FileAttachment, catat audit, dan panggil destroy di Cloudinary', async () => {
+      const storageKey = `users/${user.userId}/tx/${txId}/pic-1`;
       prisma.transaction.findFirst.mockResolvedValueOnce({ id: txId });
       prisma.fileAttachment.findFirst.mockResolvedValueOnce({
         id: aid,
@@ -310,6 +352,26 @@ describe('TransactionAttachmentsService (TASK-049)', () => {
           actor_user_id: user.userId,
         }),
       });
+      expect(cloudinary.destroy).toHaveBeenCalledWith(storageKey);
+    });
+
+    it('transaksi tidak ditemukan -> 404 TRANSACTION_NOT_FOUND', async () => {
+      prisma.transaction.findFirst.mockResolvedValueOnce(null);
+
+      await expect(service.remove(user, txId, aid)).rejects.toMatchObject({
+        response: { code: 'TRANSACTION_NOT_FOUND' },
+      });
+      expect(cloudinary.destroy).not.toHaveBeenCalled();
+    });
+
+    it('lampiran tidak ditemukan -> 404 ATTACHMENT_NOT_FOUND', async () => {
+      prisma.transaction.findFirst.mockResolvedValueOnce({ id: txId });
+      prisma.fileAttachment.findFirst.mockResolvedValueOnce(null);
+
+      await expect(service.remove(user, txId, aid)).rejects.toMatchObject({
+        response: { code: 'ATTACHMENT_NOT_FOUND' },
+      });
+      expect(cloudinary.destroy).not.toHaveBeenCalled();
     });
   });
 });

@@ -2911,24 +2911,41 @@ describe('Transactions E2E Test Suite (Supertest)', () => {
     });
   });
 
-  describe('TRANSACTION ATTACHMENTS (TASK-049)', () => {
-    const jpegHeaderBase64 = Buffer.from([
+  describe('TRANSACTION ATTACHMENTS (TASK-049 & TASK-090)', () => {
+    const originalFetch = global.fetch;
+
+    beforeAll(() => {
+      global.fetch = (async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ public_id: 'mock-public-id', result: 'ok' }),
+        text: async () =>
+          JSON.stringify({ public_id: 'mock-public-id', result: 'ok' }),
+      })) as any;
+    });
+
+    afterAll(() => {
+      global.fetch = originalFetch;
+    });
+
+    const jpegBuffer = Buffer.from([
       0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01,
-    ]).toString('base64');
+      ...Array(100).fill(0),
+    ]);
 
-    const pngHeaderBase64 = Buffer.from([
+    const pngBuffer = Buffer.from([
       0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
-    ]).toString('base64');
+      ...Array(100).fill(0),
+    ]);
 
-    const webpHeaderBase64 = Buffer.from([
+    const webpBuffer = Buffer.from([
       0x52, 0x49, 0x46, 0x46, 0x24, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50,
-    ]).toString('base64');
+      ...Array(100).fill(0),
+    ]);
 
-    const fakeTextBase64 = Buffer.from('Not an image content at all').toString(
-      'base64',
-    );
+    const textBuffer = Buffer.from('Not an image content at all');
 
-    it('AC-1 & AC-2: Presign valid (3 MB) -> 200 { upload_url, storage_key }; Presign > 5 MB -> 422 FILE_TOO_LARGE', async () => {
+    it('AC-4: Upload file > 5 MB -> 422 FILE_TOO_LARGE', async () => {
       const tx = await prisma.asSystem().transaction.create({
         data: {
           user_id: userAId,
@@ -2943,25 +2960,21 @@ describe('Transactions E2E Test Suite (Supertest)', () => {
         },
       });
 
-      const resOk = await request(app.getHttpServer())
-        .post(`/transactions/${tx.id}/attachments/presign`)
-        .set(userAHeaders)
-        .send({ mime: 'image/jpeg', size: 3_000_000 });
-
-      expect(resOk.status).toBe(200);
-      expect(resOk.body.upload_url).toBeDefined();
-      expect(resOk.body.storage_key).toContain(`users/${userAId}/tx/${tx.id}/`);
+      const largeBuffer = Buffer.alloc(6 * 1024 * 1024);
+      largeBuffer[0] = 0xff;
+      largeBuffer[1] = 0xd8;
+      largeBuffer[2] = 0xff;
 
       const resLarge = await request(app.getHttpServer())
-        .post(`/transactions/${tx.id}/attachments/presign`)
+        .post(`/transactions/${tx.id}/attachments`)
         .set(userAHeaders)
-        .send({ mime: 'image/jpeg', size: 6_000_000 });
+        .attach('file', largeBuffer, 'large.jpg');
 
-      expect(resLarge.status).toBe(422);
+      expect([413, 422]).toContain(resLarge.status);
       expect(resLarge.body.code).toBe('FILE_TOO_LARGE');
     });
 
-    it('AC-3: Confirm dengan mime image/jpeg tetapi magic_bytes_base64 berisi teks/PNG -> 422 INVALID_FILE_TYPE, baris tidak disimpan', async () => {
+    it('AC-3: Upload file teks yang di-rename .jpg -> 422 INVALID_FILE_TYPE, baris tidak disimpan', async () => {
       const tx = await prisma.asSystem().transaction.create({
         data: {
           user_id: userAId,
@@ -2976,36 +2989,13 @@ describe('Transactions E2E Test Suite (Supertest)', () => {
         },
       });
 
-      const presignRes = await request(app.getHttpServer())
-        .post(`/transactions/${tx.id}/attachments/presign`)
-        .set(userAHeaders)
-        .send({ mime: 'image/jpeg', size: 500_000 });
-
       const resText = await request(app.getHttpServer())
         .post(`/transactions/${tx.id}/attachments`)
         .set(userAHeaders)
-        .send({
-          storage_key: presignRes.body.storage_key,
-          mime: 'image/jpeg',
-          size_bytes: 500_000,
-          magic_bytes_base64: fakeTextBase64,
-        });
+        .attach('file', textBuffer, 'fake.jpg');
 
       expect(resText.status).toBe(422);
       expect(resText.body.code).toBe('INVALID_FILE_TYPE');
-
-      const resMismatch = await request(app.getHttpServer())
-        .post(`/transactions/${tx.id}/attachments`)
-        .set(userAHeaders)
-        .send({
-          storage_key: presignRes.body.storage_key,
-          mime: 'image/jpeg',
-          size_bytes: 500_000,
-          magic_bytes_base64: pngHeaderBase64,
-        });
-
-      expect(resMismatch.status).toBe(422);
-      expect(resMismatch.body.code).toBe('INVALID_FILE_TYPE');
 
       const count = await prisma.asSystem().fileAttachment.count({
         where: { transaction_id: tx.id },
@@ -3013,7 +3003,7 @@ describe('Transactions E2E Test Suite (Supertest)', () => {
       expect(count).toBe(0);
     });
 
-    it('AC-4 & AC-5: Confirm JPEG/PNG/WebP valid -> 201, ke-4 -> 409 ATTACHMENT_LIMIT_EXCEEDED, GET signed URL ~1 jam, DELETE -> 204', async () => {
+    it('AC-2, AC-4, AC-5: Upload JPEG/PNG/WebP valid -> 201, ke-4 -> 409 ATTACHMENT_LIMIT_EXCEEDED, GET signed URL ~1 jam, DELETE -> 204', async () => {
       if (throttlerStorage.storage) {
         throttlerStorage.storage.clear();
       }
@@ -3033,63 +3023,44 @@ describe('Transactions E2E Test Suite (Supertest)', () => {
       });
 
       const items = [
-        { mime: 'image/jpeg', magic: jpegHeaderBase64, size: 100_000 },
-        { mime: 'image/png', magic: pngHeaderBase64, size: 200_000 },
-        { mime: 'image/webp', magic: webpHeaderBase64, size: 150_000 },
+        { buf: jpegBuffer, name: 'receipt1.jpg' },
+        { buf: pngBuffer, name: 'receipt2.png' },
+        { buf: webpBuffer, name: 'receipt3.webp' },
       ];
 
       const confirmedIds: string[] = [];
 
       for (const item of items) {
-        const presign = await request(app.getHttpServer())
-          .post(`/transactions/${tx.id}/attachments/presign`)
-          .set(userAHeaders)
-          .send({ mime: item.mime, size: item.size });
-        expect(presign.status).toBe(200);
-
-        const confirm = await request(app.getHttpServer())
+        const uploadRes = await request(app.getHttpServer())
           .post(`/transactions/${tx.id}/attachments`)
           .set(userAHeaders)
-          .send({
-            storage_key: presign.body.storage_key,
-            mime: item.mime,
-            size_bytes: item.size,
-            magic_bytes_base64: item.magic,
-          });
-        expect(confirm.status).toBe(201);
-        expect(confirm.body.attachment_id).toBeDefined();
-        expect(confirm.body.access_url).toBeDefined();
-        confirmedIds.push(confirm.body.attachment_id);
+          .attach('file', item.buf, item.name);
+
+        expect(uploadRes.status).toBe(201);
+        expect(uploadRes.body.attachment_id).toBeDefined();
+        expect(uploadRes.body.access_url).toContain('api.cloudinary.com/v1_1/');
+        expect(uploadRes.body.access_url).toContain('image/download');
+        expect(uploadRes.body.expires_at).toBeDefined();
+        confirmedIds.push(uploadRes.body.attachment_id);
       }
 
-      // Presign ke-4 -> 409 ATTACHMENT_LIMIT_EXCEEDED
-      const presign4 = await request(app.getHttpServer())
-        .post(`/transactions/${tx.id}/attachments/presign`)
-        .set(userAHeaders)
-        .send({ mime: 'image/jpeg', size: 100_000 });
-      expect(presign4.status).toBe(409);
-      expect(presign4.body.code).toBe('ATTACHMENT_LIMIT_EXCEEDED');
-
-      // Confirm ke-4 -> 409 ATTACHMENT_LIMIT_EXCEEDED
-      const confirm4 = await request(app.getHttpServer())
+      // Upload ke-4 -> 409 ATTACHMENT_LIMIT_EXCEEDED
+      const upload4 = await request(app.getHttpServer())
         .post(`/transactions/${tx.id}/attachments`)
         .set(userAHeaders)
-        .send({
-          storage_key: `users/${userAId}/tx/${tx.id}/fourth-file`,
-          mime: 'image/jpeg',
-          size_bytes: 100_000,
-          magic_bytes_base64: jpegHeaderBase64,
-        });
-      expect(confirm4.status).toBe(409);
-      expect(confirm4.body.code).toBe('ATTACHMENT_LIMIT_EXCEEDED');
+        .attach('file', jpegBuffer, 'fourth.jpg');
 
-      // AC-5: GET signed URL 1 jam (+3600 detik)
+      expect(upload4.status).toBe(409);
+      expect(upload4.body.code).toBe('ATTACHMENT_LIMIT_EXCEEDED');
+
+      // AC-2 & AC-5: GET signed URL 1 jam (+3600 detik)
       const nowBefore = Date.now();
       const urlRes = await request(app.getHttpServer())
         .get(`/transactions/${tx.id}/attachments/${confirmedIds[0]}/url`)
         .set(userAHeaders);
       expect(urlRes.status).toBe(200);
-      expect(urlRes.body.access_url).toContain('image/authenticated/');
+      expect(urlRes.body.access_url).toContain('api.cloudinary.com/v1_1/');
+      expect(urlRes.body.access_url).toContain('image/download');
       const expiresMs = new Date(urlRes.body.expires_at).getTime();
       const diffSec = (expiresMs - nowBefore) / 1000;
       expect(diffSec).toBeGreaterThanOrEqual(3595);
@@ -3107,7 +3078,7 @@ describe('Transactions E2E Test Suite (Supertest)', () => {
       expect(remaining).toBe(2);
     });
 
-    it('AC-6 (isolasi): User B mengakses presign/confirm/get-url/delete pada transaksi User A -> 404', async () => {
+    it('AC-6 (isolasi): User B mengakses upload/get-url/delete pada transaksi User A -> 404', async () => {
       if (throttlerStorage.storage) {
         throttlerStorage.storage.clear();
       }
@@ -3136,22 +3107,11 @@ describe('Transactions E2E Test Suite (Supertest)', () => {
         },
       });
 
-      const resPresign = await request(app.getHttpServer())
-        .post(`/transactions/${tx.id}/attachments/presign`)
-        .set(userBHeaders)
-        .send({ mime: 'image/jpeg', size: 100_000 });
-      expect(resPresign.status).toBe(404);
-
-      const resConfirm = await request(app.getHttpServer())
+      const resOtherUpload = await request(app.getHttpServer())
         .post(`/transactions/${tx.id}/attachments`)
         .set(userBHeaders)
-        .send({
-          storage_key: `users/${userAId}/tx/${tx.id}/attempt`,
-          mime: 'image/jpeg',
-          size_bytes: 100_000,
-          magic_bytes_base64: jpegHeaderBase64,
-        });
-      expect(resConfirm.status).toBe(404);
+        .attach('file', jpegBuffer, 'attempt.jpg');
+      expect(resOtherUpload.status).toBe(404);
 
       const resUrl = await request(app.getHttpServer())
         .get(`/transactions/${tx.id}/attachments/${att.id}/url`)
@@ -3162,6 +3122,38 @@ describe('Transactions E2E Test Suite (Supertest)', () => {
         .delete(`/transactions/${tx.id}/attachments/${att.id}`)
         .set(userBHeaders);
       expect(resDel.status).toBe(404);
+    });
+
+    it('AC-7: Upload ke transaksi bertipe REVERSAL -> 409 ATTACHMENT_NOT_ALLOWED_ON_REVERSAL', async () => {
+      const revTx = await prisma.asSystem().transaction.create({
+        data: {
+          user_id: userAId,
+          financial_profile_id: profileAId,
+          account_id: userAAccount.id,
+          type: 'REVERSAL',
+          amount: 15000n,
+          date: new Date('2026-11-01T00:00:00.000Z'),
+          status: 'POSTED',
+          client_tx_id: generateTestUlid(),
+        },
+      });
+
+      const resRev = await request(app.getHttpServer())
+        .post(`/transactions/${revTx.id}/attachments`)
+        .set(userAHeaders)
+        .attach('file', jpegBuffer, 'reversal.jpg');
+
+      expect(resRev.status).toBe(409);
+      expect(resRev.body.code).toBe('ATTACHMENT_NOT_ALLOWED_ON_REVERSAL');
+    });
+
+    it('AC-9: Route presign sudah dihapus -> 404', async () => {
+      const resPresign = await request(app.getHttpServer())
+        .post(`/transactions/00000000-0000-0000-0000-000000000000/attachments/presign`)
+        .set(userAHeaders)
+        .send({});
+
+      expect(resPresign.status).toBe(404);
     });
   });
 

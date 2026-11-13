@@ -4,27 +4,27 @@ import {
   Get,
   Delete,
   Param,
-  Body,
   UseGuards,
+  UseInterceptors,
+  UploadedFile,
   HttpStatus,
   HttpCode,
   ParseUUIDPipe,
 } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
+import { memoryStorage } from 'multer';
 import {
   ApiTags,
   ApiOperation,
   ApiResponse,
   ApiCookieAuth,
+  ApiConsumes,
+  ApiBody,
 } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard.js';
 import { CurrentUser } from '../../common/decorators/current-user.decorator.js';
-import {
-  PresignAttachmentPipe,
-  type PresignAttachmentDto,
-  ConfirmAttachmentPipe,
-  type ConfirmAttachmentDto,
-} from './dto/transaction.dto.js';
+import { MAX_ATTACHMENT_SIZE_BYTES } from './dto/transaction.dto.js';
 import { TransactionAttachmentsService } from './transaction-attachments.service.js';
 
 @ApiTags('transaction-attachments')
@@ -37,34 +37,49 @@ export class TransactionAttachmentsController {
     private readonly attachmentsService: TransactionAttachmentsService,
   ) {}
 
-  @Post('presign')
-  @HttpCode(HttpStatus.OK)
-  @ApiOperation({ summary: 'Membuat presigned URL untuk upload lampiran transaksi' })
-  @ApiResponse({ status: 200, description: 'Presigned URL berhasil dibuat' })
-  @ApiResponse({ status: 404, description: 'Transaksi tidak ditemukan' })
-  @ApiResponse({ status: 409, description: 'Batas maksimal 3 lampiran terlampaui (ATTACHMENT_LIMIT_EXCEEDED)' })
-  @ApiResponse({ status: 422, description: 'Ukuran > 5 MB (FILE_TOO_LARGE) atau tipe file tidak valid (INVALID_FILE_TYPE)' })
-  async presign(
-    @CurrentUser() user: { userId: string; role?: string },
-    @Param('id', ParseUUIDPipe) id: string,
-    @Body(new PresignAttachmentPipe()) dto: PresignAttachmentDto,
-  ) {
-    return this.attachmentsService.presign(user, id, dto);
-  }
-
   @Post()
   @HttpCode(HttpStatus.CREATED)
-  @ApiOperation({ summary: 'Konfirmasi lampiran transaksi dan validasi magic bytes' })
-  @ApiResponse({ status: 201, description: 'Lampiran berhasil dikonfirmasi dan disimpan' })
+  @UseInterceptors(
+    FileInterceptor('file', {
+      storage: memoryStorage(),
+      limits: { fileSize: MAX_ATTACHMENT_SIZE_BYTES, files: 1 },
+    }),
+  )
+  @ApiOperation({ summary: 'Upload lampiran transaksi (multipart/form-data)' })
+  @ApiConsumes('multipart/form-data')
+  @ApiBody({
+    schema: {
+      type: 'object',
+      properties: {
+        file: {
+          type: 'string',
+          format: 'binary',
+        },
+      },
+    },
+  })
+  @ApiResponse({ status: 201, description: 'Lampiran berhasil diunggah' })
   @ApiResponse({ status: 404, description: 'Transaksi tidak ditemukan' })
-  @ApiResponse({ status: 409, description: 'Batas maksimal 3 lampiran terlampaui (ATTACHMENT_LIMIT_EXCEEDED)' })
-  @ApiResponse({ status: 422, description: 'Magic bytes tidak cocok (INVALID_FILE_TYPE) atau ukuran > 5 MB (FILE_TOO_LARGE)' })
-  async confirm(
+  @ApiResponse({
+    status: 409,
+    description:
+      'Batas maksimal 3 lampiran terlampaui (ATTACHMENT_LIMIT_EXCEEDED) atau reversal (ATTACHMENT_NOT_ALLOWED_ON_REVERSAL)',
+  })
+  @ApiResponse({
+    status: 422,
+    description:
+      'File wajib (FILE_REQUIRED), magic bytes tidak cocok (INVALID_FILE_TYPE), atau ukuran > 5 MB (FILE_TOO_LARGE)',
+  })
+  @ApiResponse({
+    status: 502,
+    description: 'Penyimpanan file sedang tidak tersedia (FILE_STORAGE_UNAVAILABLE)',
+  })
+  async upload(
     @CurrentUser() user: { userId: string; role?: string },
     @Param('id', ParseUUIDPipe) id: string,
-    @Body(new ConfirmAttachmentPipe()) dto: ConfirmAttachmentDto,
+    @UploadedFile() file: Express.Multer.File,
   ) {
-    return this.attachmentsService.confirm(user, id, dto);
+    return this.attachmentsService.upload(user, id, file);
   }
 
   @Get(':aid/url')

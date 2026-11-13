@@ -12,6 +12,7 @@ import {
 import { Prisma, TransactionStatus } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service.js';
 import { BudgetWarningService } from '../budgets/budget-warning.service.js';
+import { CloudinaryService } from '../files/cloudinary.service.js';
 import { todayInTz } from '../../common/utils/date.js';
 import { evaluateNegativeBalancePolicy } from './balance-policy.js';
 import {
@@ -167,6 +168,7 @@ export class TransactionsService {
   constructor(
     private readonly prisma: PrismaService,
     @Optional() private readonly budgetWarningService?: BudgetWarningService,
+    @Optional() private readonly cloudinaryService?: CloudinaryService,
   ) {}
 
   async create(
@@ -2111,9 +2113,10 @@ export class TransactionsService {
     resolveClientTxId(dto?.client_tx_id, headerIdempotencyKey);
 
     const now = new Date();
+    const deletedStorageKeys: string[] = [];
 
     try {
-      return await this.prisma.$transaction(async (tx) => {
+      const result = await this.prisma.$transaction(async (tx) => {
         let rows: Array<{
           id: string;
           status: string;
@@ -2184,6 +2187,7 @@ export class TransactionsService {
             where: { transaction_id: row.id },
           });
           if (attachments.length > 0) {
+            deletedStorageKeys.push(...attachments.map((a) => a.storage_key));
             await tx.fileAttachment.deleteMany({
               where: { transaction_id: row.id },
             });
@@ -2260,6 +2264,9 @@ export class TransactionsService {
                   where: { transaction_id: partner.id },
                 });
                 if (partnerAttachments.length > 0) {
+                  deletedStorageKeys.push(
+                    ...partnerAttachments.map((a) => a.storage_key),
+                  );
                   await tx.fileAttachment.deleteMany({
                     where: { transaction_id: partner.id },
                   });
@@ -2288,10 +2295,25 @@ export class TransactionsService {
 
         return {
           id: row.id,
-          status: 'CANCELLED',
+          status: 'CANCELLED' as const,
           cancelled_at: now,
         };
       });
+
+      if (this.cloudinaryService && deletedStorageKeys.length > 0) {
+        for (const key of deletedStorageKeys) {
+          try {
+            await this.cloudinaryService.destroy(key);
+          } catch (err) {
+            this.logger.warn(
+              `Failed to destroy Cloudinary file ${key} on transaction cancel:`,
+              err,
+            );
+          }
+        }
+      }
+
+      return result;
     } catch (err: any) {
       if (this.isLockNotAvailable(err)) {
         throw new ConflictException({

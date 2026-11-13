@@ -1,6 +1,7 @@
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit, Optional } from '@nestjs/common';
 import { createHash } from 'node:crypto';
 import { PrismaService } from '../../prisma/prisma.service.js';
+import { CloudinaryService } from '../files/cloudinary.service.js';
 
 export function redactNominalValues(value: unknown): unknown {
   if (value === null || value === undefined) {
@@ -27,7 +28,10 @@ export function redactNominalValues(value: unknown): unknown {
 export class HardDeleteService implements OnModuleInit {
   private readonly logger = new Logger(HardDeleteService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    @Optional() private readonly cloudinaryService?: CloudinaryService,
+  ) {}
 
   onModuleInit() {
     if (process.env.NODE_ENV === 'production' && !process.env.AUDIT_PSEUDONYM_SALT) {
@@ -52,6 +56,7 @@ export class HardDeleteService implements OnModuleInit {
     let errors = 0;
 
     for (const user of pendingUsers) {
+      let userStorageKeys: string[] = [];
       try {
         await this.prisma.asSystem().$transaction(async (tx) => {
           // 1. Anonimisasi audit_logs milik user
@@ -74,13 +79,33 @@ export class HardDeleteService implements OnModuleInit {
             });
           }
 
-          // shortcut: Cloudinary cleanup diintegrasikan pada TASK-090 FilesService
+          // Ambil semua storage_key milik user sebelum tx.user.delete
+          if (tx.fileAttachment) {
+            const attachments = await tx.fileAttachment.findMany({
+              where: { uploaded_by: user.id },
+              select: { storage_key: true },
+            });
+            userStorageKeys = attachments.map((a) => a.storage_key);
+          }
 
           // 3. Hapus baris User
           await tx.user.delete({
             where: { id: user.id },
           });
         });
+
+        if (this.cloudinaryService && userStorageKeys.length > 0) {
+          for (const key of userStorageKeys) {
+            try {
+              await this.cloudinaryService.destroy(key);
+            } catch (destroyErr) {
+              this.logger.warn(
+                `Failed to destroy Cloudinary file ${key} for user ${user.id}:`,
+                destroyErr,
+              );
+            }
+          }
+        }
 
         deletedCount++;
       } catch (err) {
