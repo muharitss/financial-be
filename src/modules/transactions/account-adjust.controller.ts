@@ -11,7 +11,6 @@ import {
   ParseUUIDPipe,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse, ApiCookieAuth } from '@nestjs/swagger';
-import { Throttle } from '@nestjs/throttler';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard.js';
 import { CurrentUser } from '../../common/decorators/current-user.decorator.js';
 import {
@@ -35,7 +34,6 @@ export class AccountAdjustController {
   @UseInterceptors(IdempotencyInterceptor)
   @Idempotent()
   @HttpCode(HttpStatus.CREATED)
-  @Throttle({ transaction: { limit: 60, ttl: 60000 } })
   @ApiOperation({ summary: 'Menyesuaikan saldo akun ke saldo target' })
   @ApiResponse({ status: 201, description: 'Saldo akun berhasil disesuaikan' })
   @ApiResponse({ status: 400, description: 'Data tidak valid atau id bukan UUID' })

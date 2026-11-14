@@ -9,6 +9,7 @@ import { HealthModule } from './modules/health/health.module.js';
 import { AuthModule } from './modules/auth/auth.module.js';
 import { UsersModule } from './modules/users/users.module.js';
 import { AccountsModule } from './modules/accounts/accounts.module.js';
+import { CategoriesModule } from './modules/categories/categories.module.js';
 import { TransactionsModule } from './modules/transactions/transactions.module.js';
 import { TagsModule } from './modules/tags/tags.module.js';
 import { BudgetsModule } from './modules/budgets/budgets.module.js';
@@ -36,6 +37,7 @@ export const { ObserveModule, ObserveInstrument } = createObserveModule();
     AuthModule,
     UsersModule,
     AccountsModule,
+    CategoriesModule,
     TransactionsModule,
     TagsModule,
     BudgetsModule,

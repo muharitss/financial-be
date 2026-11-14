@@ -90,7 +90,7 @@ export class UsersController {
 
   @Post('me/cancel-deletion')
   @HttpCode(HttpStatus.OK)
-  @Throttle({ auth: { limit: 10, ttl: 60000 } })
+  @Throttle({ default: { limit: 10, ttl: 60000 } })
   @ApiOperation({ summary: 'Membatalkan permintaan penghapusan akun' })
   @ApiResponse({ status: 200, description: 'Akun berhasil diaktifkan kembali' })
   @ApiResponse({ status: 401, description: 'Email atau password salah' })

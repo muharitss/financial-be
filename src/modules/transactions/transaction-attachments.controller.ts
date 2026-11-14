@@ -31,7 +31,7 @@ import { TransactionAttachmentsService } from './transaction-attachments.service
 @ApiCookieAuth('__Host-duitku_session')
 @Controller('transactions/:id/attachments')
 @UseGuards(JwtAuthGuard)
-@Throttle({ attachment: { limit: 20, ttl: 3600000 } })
+@Throttle({ default: { limit: 20, ttl: 3600000 } })
 export class TransactionAttachmentsController {
   constructor(
     private readonly attachmentsService: TransactionAttachmentsService,

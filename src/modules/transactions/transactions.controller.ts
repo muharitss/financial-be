@@ -14,7 +14,6 @@ import {
   ParseUUIDPipe,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse, ApiCookieAuth } from '@nestjs/swagger';
-import { Throttle } from '@nestjs/throttler';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard.js';
 import { CurrentUser } from '../../common/decorators/current-user.decorator.js';
 import {
@@ -49,7 +48,6 @@ export class TransactionsController {
   @UseInterceptors(IdempotencyInterceptor)
   @Idempotent()
   @HttpCode(HttpStatus.CREATED)
-  @Throttle({ transaction: { limit: 60, ttl: 60000 } })
   @ApiOperation({ summary: 'Membuat transaksi baru (INCOME, EXPENSE, TRANSFER, ADJUSTMENT)' })
   @ApiResponse({ status: 201, description: 'Transaksi berhasil dibuat' })
   @ApiResponse({ status: 400, description: 'Data tidak valid atau kategori salah tipe' })
@@ -69,7 +67,6 @@ export class TransactionsController {
   @UseInterceptors(IdempotencyInterceptor)
   @Idempotent()
   @HttpCode(HttpStatus.OK)
-  @Throttle({ transaction: { limit: 60, ttl: 60000 } })
   @ApiOperation({ summary: 'Mengubah transaksi dengan audit log' })
   @ApiResponse({ status: 200, description: 'Transaksi berhasil diubah' })
   @ApiResponse({ status: 400, description: 'Data tidak valid atau kategori salah tipe' })
@@ -90,7 +87,6 @@ export class TransactionsController {
   @UseInterceptors(IdempotencyInterceptor)
   @Idempotent()
   @HttpCode(HttpStatus.CREATED)
-  @Throttle({ transaction: { limit: 60, ttl: 60000 } })
   @ApiOperation({ summary: 'Membalik transaksi (reversal)' })
   @ApiResponse({ status: 201, description: 'Transaksi berhasil di-reverse' })
   @ApiResponse({ status: 400, description: 'Data tidak valid' })
@@ -115,7 +111,6 @@ export class TransactionsController {
   @UseInterceptors(IdempotencyInterceptor)
   @Idempotent()
   @HttpCode(HttpStatus.OK)
-  @Throttle({ transaction: { limit: 60, ttl: 60000 } })
   @ApiOperation({ summary: 'Membatalkan transaksi terjadwal (SCHEDULED)' })
   @ApiResponse({ status: 200, description: 'Transaksi terjadwal berhasil dibatalkan' })
   @ApiResponse({ status: 400, description: 'Data tidak valid' })

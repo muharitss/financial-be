@@ -153,6 +153,17 @@ export class AuthService {
     }
 
     if (existing.revoked_at !== null) {
+      // Grace window avoids revoking all mobile PWA sessions when two requests race on rotation
+      const withinGrace =
+        Boolean(existing.replaced_by_id) &&
+        Date.now() - existing.revoked_at.getTime() < 15_000;
+      if (withinGrace) {
+        throw new UnauthorizedException({
+          code: 'REFRESH_TOKEN_CONCURRENT',
+          message: 'Sesi sedang diperbarui, silakan coba lagi.',
+        });
+      }
+
       // Reuse detected: revoke all tokens for this user immediately
       await this.prisma.refreshToken.updateMany({
         where: { user_id: existing.user_id },
@@ -185,7 +196,7 @@ export class AuthService {
     // Rotate refresh token
     const newRawRefreshToken = randomBytes(32).toString('base64url');
     const newTokenHash = createHash('sha256').update(newRawRefreshToken).digest('hex');
-    const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+    const expiresAt = new Date(Date.now() + 180 * 24 * 60 * 60 * 1000);
 
     await this.prisma.asSystem().$transaction(async (tx) => {
       const created = await tx.refreshToken.create({
@@ -287,7 +298,7 @@ export class AuthService {
 
     const rawRefreshToken = randomBytes(32).toString('base64url');
     const tokenHash = createHash('sha256').update(rawRefreshToken).digest('hex');
-    const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+    const expiresAt = new Date(Date.now() + 180 * 24 * 60 * 60 * 1000);
 
     await this.prisma.refreshToken.create({
       data: {

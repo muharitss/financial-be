@@ -54,12 +54,8 @@ export class LoginCooldownTracker {
 export const loginCooldownTracker = new LoginCooldownTracker();
 
 export const throttlerConfig: ThrottlerModuleOptions = {
-  throttlers: [
-    { name: 'default', limit: 60, ttl: 60000 },
-    { name: 'auth', limit: 10, ttl: 60000 },
-    { name: 'transaction', limit: 60, ttl: 60000 },
-    { name: 'attachment', limit: 20, ttl: 3600000 },
-  ],
+  // Single global throttler so specialized limits (@Throttle) don't choke unrelated routes
+  throttlers: [{ name: 'default', limit: 120, ttl: 60000 }],
   errorMessage: 'Terlalu banyak permintaan. Silakan coba beberapa saat lagi.',
   getTracker: (req: Record<string, any>) => {
     const userId = req.user?.userId ?? req.user?.id;

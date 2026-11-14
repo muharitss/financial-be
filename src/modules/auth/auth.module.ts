@@ -13,7 +13,7 @@ import { AuthService } from './auth.service.js';
     PassportModule.register({ defaultStrategy: 'jwt' }),
     JwtModule.register({
       secret: process.env.JWT_SECRET ?? 'change-me-min-32-chars',
-      signOptions: { expiresIn: '15m', algorithm: 'HS256' },
+      signOptions: { expiresIn: '7d', algorithm: 'HS256' },
     }),
     TransactionsModule,
     BudgetsModule,

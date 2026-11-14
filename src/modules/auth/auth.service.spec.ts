@@ -235,6 +235,22 @@ describe('AuthService (Manual Auth)', () => {
       });
     });
 
+    it('tidak mencabut semua token jika token baru saja dirotasi dalam grace window (<15s)', async () => {
+      prisma.refreshToken.findUnique.mockResolvedValue({
+        id: 'rt-old',
+        user_id: 'user-uuid-1',
+        replaced_by_id: 'rt-new',
+        revoked_at: new Date(Date.now() - 2000),
+        expires_at: new Date(Date.now() + 100000),
+      });
+
+      await expect(
+        service.refresh('concurrentToken', 'csrf123', 'csrf123'),
+      ).rejects.toThrow(UnauthorizedException);
+
+      expect(prisma.refreshToken.updateMany).not.toHaveBeenCalled();
+    });
+
     it('berhasil merotasi refresh token dan session token jika valid', async () => {
       prisma.refreshToken.findUnique.mockResolvedValue({
         id: 'rt-old',

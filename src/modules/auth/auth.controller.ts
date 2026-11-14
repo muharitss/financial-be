@@ -10,7 +10,7 @@ import {
   HttpStatus,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse } from '@nestjs/swagger';
-import { SkipThrottle, Throttle } from '@nestjs/throttler';
+import { Throttle } from '@nestjs/throttler';
 import type { Request, Response } from 'express';
 import { AuthService } from './auth.service.js';
 import { registerSchema, loginSchema } from './dto/auth.dto.js';
@@ -32,8 +32,6 @@ function extractRefreshToken(req: Request): string | undefined {
   );
 }
 
-@SkipThrottle()
-@Throttle({ auth: { limit: 10, ttl: 60000 } })
 @ApiTags('auth')
 @Controller('auth')
 export class AuthController {
@@ -50,7 +48,7 @@ export class AuthController {
       secure: isProd,
       sameSite: 'lax',
       path: '/',
-      maxAge: 15 * 60 * 1000,
+      maxAge: 7 * 24 * 60 * 60 * 1000,
     });
 
     res.cookie(refresh, tokens.refreshToken, {
@@ -58,7 +56,7 @@ export class AuthController {
       secure: isProd,
       sameSite: 'lax',
       path: '/',
-      maxAge: 30 * 24 * 60 * 60 * 1000,
+      maxAge: 180 * 24 * 60 * 60 * 1000,
     });
 
     res.cookie(csrf, tokens.csrfToken, {
@@ -66,7 +64,7 @@ export class AuthController {
       secure: isProd,
       sameSite: 'lax',
       path: '/',
-      maxAge: 30 * 24 * 60 * 60 * 1000,
+      maxAge: 180 * 24 * 60 * 60 * 1000,
     });
   }
 
@@ -79,6 +77,7 @@ export class AuthController {
   }
 
   @Post('register')
+  @Throttle({ default: { limit: 10, ttl: 60000 } })
   @ApiOperation({ summary: 'Mendaftar akun baru dengan email dan password' })
   @ApiResponse({ status: 201, description: 'User berhasil didaftarkan' })
   async register(@Body() body: unknown, @Res({ passthrough: true }) res: Response) {
@@ -99,6 +98,7 @@ export class AuthController {
 
   @Post('login')
   @HttpCode(HttpStatus.OK)
+  @Throttle({ default: { limit: 10, ttl: 60000 } })
   @ApiOperation({ summary: 'Login menggunakan email dan password' })
   @ApiResponse({ status: 200, description: 'Login berhasil' })
   async login(
